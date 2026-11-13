@@ -1,0 +1,21 @@
+{
+  "id": "ep-00176",
+  "source": "https://clectw.com/ep/ep-00176",
+  "media_url": "https://drive.google.com/file/d/1n9dAdGk9PmCnKoIkwJB7sJLmo3soq6ci/view",
+  "expected_size": 20420171,
+  "model": "mlx-community/whisper-small-mlx-4bit",
+  "language": "zh",
+  "media_sha256": "806a6f5adb3810d45afa0770b78dab5a64a5aafe951c48820c3be68705469479",
+  "duration_seconds": 95.74000000000001,
+  "subtitle_last_end_seconds": 112.0,
+  "ratio": 1.1698,
+  "elapsed_seconds": 4.8,
+  "status": "suspected_hallucination_do_not_use",
+  "note": "文本为同一句话异常重复，且字幕结束时间超出视频时长；无法据此判断音频是否有语音。临时视频在发现异常前已删除，原视频可从 media_url 重新获取。 模型的无语音概率偏高，但不能证明全片无人声；需人工听录音确认。",
+  "temporary_media_deleted": true,
+  "reason": "",
+  "quality_issue": "repeated_line_and_duration_exceeded",
+  "model_no_speech_probability_median": 0.9605,
+  "second_model_test": "whisper-tiny-mlx-4bit 两次转写均重复单句，模型输出无语音概率中位数约0.954；不能证明全片无人声。",
+  "second_model_test_path": "collection/transcription-tests/ep-00176-tiny/ep-00176.json"
+}

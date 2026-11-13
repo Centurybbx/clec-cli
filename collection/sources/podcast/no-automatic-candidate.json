@@ -1,0 +1,55 @@
+[
+  {
+    "feed": "ximalaya-110339131.xml",
+    "title": "因為接下來有一些事（主要是旅行）我們暫停至11月9日週一恢復",
+    "published": "Tue, 13 Oct 2026 08:45:55 GMT",
+    "guid": "xmly_track_1023828791",
+    "enclosure_url": "https://jt.ximalaya.com//GKwRIUEOo7LLAA4ZpwTndaJO.m4a?channel=rss&album_id=110339131&track_id=1023828791&uid=30579658&jt=https://aod.cos.tx.xmcdn.com/storages/ab91-audiofreehighqps/95/1A/GKwRIUEOo7LLAA4ZpwTndaJO.m4a",
+    "identifier_candidates": [],
+    "possible_matches": [],
+    "status": "local_asr_created_unverified",
+    "duration_seconds": 113.0,
+    "local_asr": "collection/transcripts/podcast-asr/podcast-gap-1/podcast-gap-1.txt",
+    "note": "与另一来源的暂停公告标题、时长及自动转写内容相似；音频文件校验值不同，未证明字节相同。"
+  },
+  {
+    "feed": "ximalaya-110339131.xml",
+    "title": "CLEC 專題【為什麼非美國投資人，更應該用 UCITS ETF 投資納斯達克1",
+    "published": "Sun, 04 Jan 2026 12:54:39 GMT",
+    "guid": "xmly_track_946249733",
+    "enclosure_url": "https://jt.ximalaya.com//GKwRIMANMCYwAHO3NwRTCn9F.m4a?channel=rss&album_id=110339131&track_id=946249733&uid=30579658&jt=https://aod.cos.tx.xmcdn.com/storages/7a1f-audiofreehighqps/60/06/GKwRIMANMCYwAHO3NwRTCn9F.m4a",
+    "identifier_candidates": [],
+    "possible_matches": [],
+    "status": "local_asr_created_unverified",
+    "duration_seconds": 936.0,
+    "local_asr": "collection/transcripts/podcast-asr/podcast-gap-2/podcast-gap-2.txt"
+  },
+  {
+    "feed": "ximalaya-110339131.xml",
+    "title": "世界第九大奇市場持續上漲 JUN 13,2021",
+    "published": "Tue, 30 Dec 2025 08:11:51 GMT",
+    "guid": "xmly_track_944922857",
+    "enclosure_url": "https://jt.ximalaya.com//GKwRIRwNKUzIAbm5dQRP9FAa.m4a?channel=rss&album_id=110339131&track_id=944922857&uid=30579658&jt=https://aod.cos.tx.xmcdn.com/storages/cc11-audiofreehighqps/25/2A/GKwRIRwNKUzIAbm5dQRP9FAa.m4a",
+    "identifier_candidates": [],
+    "possible_matches": [],
+    "status": "local_asr_created_unverified",
+    "duration_seconds": 3576.0,
+    "local_asr": "collection/transcripts/podcast-asr/podcast-gap-3/podcast-gap-3.txt",
+    "possible_episode_id": "ep-00213",
+    "possible_transcript": "collection/web/clectw/transcripts/ep-00213.txt",
+    "note": "开头内容及具体市场数字与网站稿一致；时长不同，完整程度仍需核对。"
+  },
+  {
+    "feed": "james-talks.xml",
+    "title": "因為接下來有一些事（主要是旅行）我們暫停至11月9日週一恢復James 漫談",
+    "published": "Sun, 20 Sep 2026 22:21:56 GMT",
+    "guid": "5fbe4dca-3831-451d-9011-6ffa6c8d42b2",
+    "enclosure_url": "https://anchor.fm/s/115b2b324/podcast/play/126053098/https%3A%2F%2Fd3ctxlq1ktw2nl.cloudfront.net%2Fstaging%2F2026-8-20%2F8aab7ed2-477f-53be-8f21-73ee5ee3e5db.m4a",
+    "identifier_candidates": [],
+    "possible_matches": [],
+    "status": "local_asr_created_unverified",
+    "duration_seconds": 113.0,
+    "local_asr": "collection/transcripts/podcast-asr/podcast-gap-4/podcast-gap-4.txt",
+    "note": "与另一来源的暂停公告标题、时长及自动转写内容相似；音频文件校验值不同，未证明字节相同。"
+  }
+]

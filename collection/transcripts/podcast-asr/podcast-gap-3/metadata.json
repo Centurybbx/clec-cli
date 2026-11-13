@@ -1,0 +1,20 @@
+{
+  "id": "podcast-gap-3",
+  "source": "ximalaya-110339131.xml",
+  "source_title": "世界第九大奇市場持續上漲 JUN 13,2021",
+  "source_guid": "xmly_track_944922857",
+  "media_url": "https://jt.ximalaya.com//GKwRIRwNKUzIAbm5dQRP9FAa.m4a?channel=rss&album_id=110339131&track_id=944922857&uid=30579658&jt=https://aod.cos.tx.xmcdn.com/storages/cc11-audiofreehighqps/25/2A/GKwRIRwNKUzIAbm5dQRP9FAa.m4a",
+  "expected_size": 28948853,
+  "extension": ".m4a",
+  "model": "mlx-community/whisper-small-mlx-4bit",
+  "language": "zh",
+  "media_sha256": "de1c7205f0bf4838c29b861f49088a44368fa973e8c946682339b6da32da1223",
+  "duration_seconds": 3576.01,
+  "subtitle_last_end_seconds": 3575.18,
+  "ratio": 0.9998,
+  "elapsed_seconds": 90.4,
+  "status": "machine_unverified",
+  "note": "自动转写尚未校对，金融术语、数字和讲话人均需复核。",
+  "temporary_media_deleted": true,
+  "reason": ""
+}

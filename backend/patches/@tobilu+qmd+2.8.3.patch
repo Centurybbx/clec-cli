@@ -1,0 +1,654 @@
+diff --git a/node_modules/@tobilu/qmd/dist/index.js b/node_modules/@tobilu/qmd/dist/index.js
+--- a/node_modules/@tobilu/qmd/dist/index.js
++++ b/node_modules/@tobilu/qmd/dist/index.js
+@@ -16,13 +16,14 @@
+  *   const results = await store.search({ query: "how does auth work?" })
+  *   await store.close()
+  */
+-import { createStore as createStoreInternal, hybridQuery, structuredSearch, extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES, reindexCollection, generateEmbeddings, listCollections as storeListCollections, syncConfigToDb, getStoreCollections, getStoreCollection, getStoreGlobalContext, getStoreContexts, upsertStoreCollection, deleteStoreCollection, renameStoreCollection, updateStoreContext, removeStoreContext, setStoreGlobalContext, vacuumDatabase, cleanupOrphanedContent, cleanupOrphanedVectors, copyVectorsToNewCollections, deleteLLMCache, deleteInactiveDocuments, clearAllEmbeddings, } from "./store.js";
++import { createStore as createStoreInternal, hybridQuery, structuredSearch, extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES, reindexCollection, generateEmbeddings, generateEmbeddingWork, listCollections as storeListCollections, syncConfigToDb, getStoreCollections, getStoreCollection, getStoreGlobalContext, getStoreContexts, upsertStoreCollection, deleteStoreCollection, renameStoreCollection, updateStoreContext, removeStoreContext, setStoreGlobalContext, vacuumDatabase, cleanupOrphanedContent, cleanupOrphanedVectors, copyVectorsToNewCollections, deleteLLMCache, deleteInactiveDocuments, clearAllEmbeddings, } from "./store.js";
+ import { LlamaCpp, } from "./llm.js";
+ import { parseMetadataFilter, parseMetadataMatch, MetadataFilterError, } from "./metadata-filter.js";
+ import { listMetadata as storeListMetadata, MetadataBindingBudgetError, MetadataOptionError, } from "./metadata-store.js";
+ import { setConfigSource, loadConfig, addCollection as collectionsAddCollection, removeCollection as collectionsRemoveCollection, renameCollection as collectionsRenameCollection, addContext as collectionsAddContext, removeContext as collectionsRemoveContext, setGlobalContext as collectionsSetGlobalContext, } from "./collections.js";
+ export { parseMetadataFilter, parseMetadataMatch, MetadataFilterError };
+ export { MetadataBindingBudgetError, MetadataOptionError };
++export { EmbedWorkError } from "./store.js";
+ // Re-export utility functions and types used by frontends
+ export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
+ // Re-export getDefaultDbPath for CLI/MCP that need the default database location
+@@ -255,10 +256,12 @@
+                 collection: embedOpts?.collection,
+                 maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
+                 maxBatchBytes: embedOpts?.maxBatchBytes,
++                maxDurationMs: embedOpts?.maxDurationMs,
+                 chunkStrategy: embedOpts?.chunkStrategy,
+                 onProgress: embedOpts?.onProgress,
+             });
+         },
++        embedWork: async (options) => generateEmbeddingWork(internal, options),
+         // Index Health
+         getStatus: async () => internal.getStatus(),
+         getIndexHealth: async () => internal.getIndexHealth(),
+@@ -273,3 +276,5 @@
+     };
+     return store;
+ }
++
++export { getEmbeddingFingerprint } from "./store.js";
+diff --git a/node_modules/@tobilu/qmd/dist/index.d.ts b/node_modules/@tobilu/qmd/dist/index.d.ts
+--- a/node_modules/@tobilu/qmd/dist/index.d.ts
++++ b/node_modules/@tobilu/qmd/dist/index.d.ts
+@@ -231,9 +231,14 @@
+         collection?: string;
+         maxDocsPerBatch?: number;
+         maxBatchBytes?: number;
++        /** Whole-session wall-clock cap in milliseconds; <= 0 disables it. Default: 30 minutes.
++         * Expiration skips remaining work; it does not interrupt an in-flight native batch. */
++        maxDurationMs?: number;
+         chunkStrategy?: ChunkStrategy;
+         onProgress?: (info: EmbedProgress) => void;
+     }): Promise<EmbedResult>;
++    /** Complete one bounded prefix of pending distinct content hashes. */
++    embedWork(options: import("./store.js").EmbedWorkOptions): Promise<import("./store.js").EmbedWorkResult>;
+     /** Get index status (document counts, collections, embedding state) */
+     getStatus(): Promise<IndexStatus>;
+     /** Get index health info (stale embeddings, etc.) */
+@@ -267,3 +272,8 @@
+  * ```
+  */
+ export declare function createStore(options: StoreOptions): Promise<QMDStore>;
++
++export type { EmbedWorkOptions, EmbedWorkProgress, EmbedWorkResult } from "./store.js";
++export { EmbedWorkError } from "./store.js";
++
++export { getEmbeddingFingerprint } from "./store.js";
+diff --git a/node_modules/@tobilu/qmd/dist/store.js b/node_modules/@tobilu/qmd/dist/store.js
+--- a/node_modules/@tobilu/qmd/dist/store.js
++++ b/node_modules/@tobilu/qmd/dist/store.js
+@@ -304,11 +304,11 @@
+  * Core chunk algorithm that operates on precomputed break points and code fences.
+  * This is the shared implementation used by both regex-only and AST-aware chunking.
+  */
+-export function chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars = CHUNK_SIZE_CHARS, overlapChars = CHUNK_OVERLAP_CHARS, windowChars = CHUNK_WINDOW_CHARS) {
++function* iterateDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars = CHUNK_SIZE_CHARS, overlapChars = CHUNK_OVERLAP_CHARS, windowChars = CHUNK_WINDOW_CHARS) {
+     if (content.length <= maxChars) {
+-        return [{ text: content, pos: 0 }];
+-    }
+-    const chunks = [];
++        yield { text: content, pos: 0 };
++        return;
++    }
+     let charPos = 0;
+     while (charPos < content.length) {
+         const targetEndPos = Math.min(charPos + maxChars, content.length);
+@@ -326,18 +326,20 @@
+         // an unpaired surrogate in the chunk text breaks JSON serialization for
+         // remote embedding APIs.
+         endPos = adjustSurrogateBoundary(content, endPos, charPos);
+-        chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
++        yield { text: content.slice(charPos, endPos), pos: charPos };
++        const lastChunkPos = charPos;
+         if (endPos >= content.length) {
+             break;
+         }
+         charPos = endPos - overlapChars;
+-        const lastChunkPos = chunks.at(-1).pos;
+         if (charPos <= lastChunkPos) {
+             charPos = endPos;
+         }
+         charPos = adjustSurrogateBoundary(content, charPos, lastChunkPos);
+     }
+-    return chunks;
++}
++export function chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars = CHUNK_SIZE_CHARS, overlapChars = CHUNK_OVERLAP_CHARS, windowChars = CHUNK_WINDOW_CHARS) {
++    return [...iterateDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars)];
+ }
+ // Hybrid query: strong BM25 signal detection thresholds
+ // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
+@@ -1712,36 +1714,42 @@
+         }
+     }
+ }
++// One model/fingerprint/sequence predicate for selection, public counts and work verification.
++const COMPLETE_EMBEDDING_JOIN = `
++  LEFT JOIN (
++    SELECT hash, COUNT(*) AS chunk_count, MIN(total_chunks) AS expected_chunks,
++      MAX(total_chunks) AS max_expected, MIN(seq) AS first_seq, MAX(seq) AS last_seq,
++      SUM(CASE WHEN typeof(seq) != 'integer' OR seq < 0 THEN 1 ELSE 0 END) AS invalid_sequences,
++      MIN(model) AS min_model, MAX(model) AS max_model,
++      MIN(embed_fingerprint) AS min_fingerprint, MAX(embed_fingerprint) AS max_fingerprint
++    FROM content_vectors GROUP BY hash
++  ) v ON d.hash = v.hash
++`;
++const PENDING_EMBEDDING_PREDICATE = `(v.hash IS NULL OR v.expected_chunks < 1
++  OR v.chunk_count != v.expected_chunks OR v.max_expected != v.expected_chunks
++  OR v.invalid_sequences != 0 OR v.first_seq != 0 OR v.last_seq != v.expected_chunks - 1
++  OR v.min_model != ? OR v.max_model != ?
++  OR v.min_fingerprint != ? OR v.max_fingerprint != ? OR EXISTS (
++    SELECT 1 FROM content_vectors cv WHERE cv.hash = d.hash AND NOT EXISTS (
++      SELECT 1 FROM ${VEC_ROWS_TABLE} r JOIN ${VEC_COLLECTION_IDS_TABLE} c ON c.id = r.collection_id
++      WHERE r.hash = cv.hash AND r.seq = cv.seq AND c.name = d.collection
++    )
++  ))`;
++function pendingEmbeddingQuery(db, collection, model, tail, args = []) {
++    const fingerprint = getEmbeddingFingerprint(model);
++    return withLazyContentVectorMigration(db, () => db.prepare(`
++      SELECT ${tail.select} FROM documents d
++      ${tail.content ? "LEFT JOIN content c ON d.hash = c.hash" : ""}
++      ${COMPLETE_EMBEDDING_JOIN}
++      WHERE d.active = 1 AND ${PENDING_EMBEDDING_PREDICATE}
++      ${collection ? "AND d.collection = ?" : ""} ${tail.suffix ?? ""}
++    `)[tail.method](model, model, fingerprint, fingerprint, ...(collection ? [collection] : []), ...args));
++}
+ function getPendingEmbeddingDocs(db, collection, model = DEFAULT_EMBED_MODEL) {
+-    const collectionFilter = collection ? `AND d.collection = ?` : ``;
+-    const fingerprint = getEmbeddingFingerprint(model);
+-    return withLazyContentVectorMigration(db, () => {
+-        const stmt = db.prepare(`
+-      SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+-      FROM documents d
+-      JOIN content c ON d.hash = c.hash
+-      LEFT JOIN (
+-        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+-        FROM content_vectors
+-        WHERE model = ? AND embed_fingerprint = ?
+-        GROUP BY hash, model, embed_fingerprint
+-      ) v ON d.hash = v.hash
+-      WHERE d.active = 1
+-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+-        ${collectionFilter}
+-      GROUP BY d.hash
+-      ORDER BY MIN(d.path)
+-    `);
+-        // Large-result query (up to 9k docs): stream via iterate() instead of .all() to bound V8 heap
+-        const results = [];
+-        const iter = collection
+-            ? stmt.iterate(model, fingerprint, collection)
+-            : stmt.iterate(model, fingerprint);
+-        for (const row of iter) {
+-            results.push(row);
+-        }
+-        return results;
+-    });
++    return [...pendingEmbeddingQuery(db, collection, model, {
++        select: "d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes",
++        content: true, suffix: "GROUP BY d.hash ORDER BY MIN(d.path), d.hash", method: "iterate",
++    })];
+ }
+ function buildEmbeddingBatches(docs, maxDocsPerBatch, maxBatchBytes) {
+     const batches = [];
+@@ -1784,6 +1792,127 @@
+         body: bodyByHash.get(doc.hash) ?? "",
+     }));
+ }
++/** Strict bounded work errors never authorize the scheduler to retry. */
++export class EmbedWorkError extends Error {
++    constructor(code, message, options) {
++        super(message, options);
++        this.name = "EmbedWorkError";
++        this.code = code;
++    }
++}
++function workInteger(name, value, timer = false) {
++    if (!Number.isSafeInteger(value) || value <= 0 || (timer && value > 2147483647))
++        throw new EmbedWorkError("INVALID_OPTIONS", `${name} must be a positive safe integer within its supported range.`);
++}
++function selectedHashComplete(db, hash, model, fingerprint, expected) {
++    const rows = db.prepare(`SELECT seq, model, embed_fingerprint, total_chunks FROM content_vectors WHERE hash = ? ORDER BY seq`).all(hash);
++    if (!Number.isSafeInteger(expected) || expected < 1 || rows.length !== expected || rows.some((row, seq) =>
++        row.seq !== seq || row.total_chunks !== expected || row.model !== model || row.embed_fingerprint !== fingerprint)) return false;
++    const layout = vecLayout(db);
++    if (layout.kind !== "partitioned" || !vecTableReadable(db, layout)) return false;
++    // Registration integrity, using the same layout helpers as global health.
++    const missing = db.prepare(`SELECT 1 FROM documents d CROSS JOIN content_vectors cv
++      WHERE d.active = 1 AND d.hash = ? AND cv.hash = d.hash AND NOT EXISTS (
++        SELECT 1 FROM ${VEC_ROWS_TABLE} r JOIN ${VEC_COLLECTION_IDS_TABLE} c ON c.id = r.collection_id
++        WHERE r.hash = cv.hash AND r.seq = cv.seq AND c.name = d.collection
++      ) LIMIT 1`).get(hash);
++    return !missing;
++}
++function clearWorkHash(db, hash) {
++    db.transaction(() => {
++        deletePartitionRowsOfHash(db, hash);
++        db.prepare(`DELETE FROM content_vectors WHERE hash = ?`).run(hash);
++    }).immediate();
++}
++/** Bounded prefix of pending distinct hashes, one session, same embedding engine. */
++export async function generateEmbeddingWork(store, options) {
++    if (!options || typeof options.collection !== "string" || !options.collection.trim() || options.chunkStrategy !== "regex")
++        throw new EmbedWorkError("INVALID_OPTIONS", "embedWork requires a collection and regex chunking.");
++    for (const key of ["maxDocuments", "maxInputBytes", "maxDocumentBytes", "maxChunksPerDocument", "maxDurationMs"])
++        workInteger(key, options[key], key === "maxDurationMs");
++    if (options.maxDocuments === Number.MAX_SAFE_INTEGER || options.maxDocumentBytes > options.maxInputBytes)
++        throw new EmbedWorkError("INVALID_OPTIONS", "Document selection limits are inconsistent.");
++    const start = performance.now();
++    const db = store.db;
++    const model = getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL;
++    const fingerprint = getEmbeddingFingerprint(model);
++    const identity = { model, fingerprint, chunkStrategy: "regex" };
++    const controller = new AbortController();
++    const forwardAbort = () => controller.abort(options.signal.reason);
++    if (options.signal?.aborted) forwardAbort();
++    else options.signal?.addEventListener("abort", forwardAbort, { once: true });
++    const check = (session) => {
++        if (controller.signal.aborted) throw new EmbedWorkError("CANCELLED", "Embedding work cancelled.", { cause: controller.signal.reason });
++        if (performance.now() - start >= options.maxDurationMs || (session && !session.isValid))
++            throw new EmbedWorkError("TIMEOUT", "Embedding work lifetime expired.");
++    };
++    const selected = [];
++    const expected = new Map();
++    let selectedBytes = 0;
++    let primary;
++    try {
++        check();
++        if (!getStoreCollection(db, options.collection)) throw new EmbedWorkError("INVALID_OPTIONS", "Embedding collection is missing.");
++        // update() copies partitions before the scheduler snapshot. No hidden copy
++        // here may turn pendingBefore into a different scheduling baseline.
++        const pendingBefore = getHashesNeedingEmbedding(db, options.collection, model);
++        const iter = pendingEmbeddingQuery(db, options.collection, model, {
++            select: "d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes",
++            content: true, suffix: "GROUP BY d.hash ORDER BY MIN(d.path), d.hash LIMIT ?", method: "iterate",
++        }, [options.maxDocuments + 1]);
++        for (const doc of iter) {
++            check();
++            if (selected.length >= options.maxDocuments) break;
++            if (!Number.isSafeInteger(doc.bytes) || doc.bytes < 0) throw new EmbedWorkError("DOCUMENT_LIMIT", "Document body is missing.");
++            if (doc.bytes > options.maxDocumentBytes) {
++                if (selected.length) break;
++                throw new EmbedWorkError("DOCUMENT_LIMIT", "Document exceeds byte limit.");
++            }
++            if (selectedBytes + doc.bytes > options.maxInputBytes) break;
++            selected.push(doc);
++            selectedBytes += doc.bytes;
++        }
++        check();
++        if (pendingBefore > 0 && selected.length === 0) throw new EmbedWorkError("NO_PROGRESS", "No pending document fits this work unit.");
++        // Selected hashes are known pending under the shared strict predicate.
++        // Discard their partial/wrong-identity rows as whole documents.
++        for (const doc of selected) { check(); clearWorkHash(db, doc.hash); }
++        const result = selected.length ? await processEmbeddingDocuments(store, {
++            collection: options.collection, chunkStrategy: "regex", maxDurationMs: options.maxDurationMs,
++            maxDocsPerBatch: 32, maxBatchBytes: 1000000, onProgress: options.onProgress,
++        }, selected, model, new Date().toISOString(), 0, {
++            check, signal: controller.signal, expected, maxChunksPerDocument: options.maxChunksPerDocument,
++        }) : { chunksEmbedded: 0, chunksCopied: 0, errors: 0 };
++        check();
++        if (result.errors || selected.some(doc => !selectedHashComplete(db, doc.hash, model, fingerprint, expected.get(doc.hash))))
++            throw new EmbedWorkError("INCOMPLETE", "Selected embedding documents are incomplete.");
++        const remainingDocuments = getHashesNeedingEmbedding(db, options.collection, model);
++        if (pendingBefore - remainingDocuments !== selected.length) throw new EmbedWorkError("INCOMPLETE", "Embedding pending count changed inconsistently.");
++        check();
++        return { outcome: remainingDocuments === 0 ? "complete" : "bounded", identity, pendingBefore,
++            selectedDocuments: selected.length, selectedBytes, completedDocuments: selected.length, remainingDocuments,
++            chunksEmbedded: result.chunksEmbedded, chunksCopied: result.chunksCopied, durationMs: performance.now() - start };
++    } catch (error) {
++        try { check(); } catch (interruption) { error = interruption; }
++        primary = error instanceof EmbedWorkError ? error : new EmbedWorkError("WORK_FAILED", "Embedding work failed.", { cause: error });
++        // All native/tokenizer calls have settled before reaching cleanup.
++        // Keep complete documents; remove every partial selected hash atomically.
++        try {
++            for (const doc of selected) {
++                if (!selectedHashComplete(db, doc.hash, model, fingerprint, expected.get(doc.hash))) clearWorkHash(db, doc.hash);
++            }
++        } catch (cleanupError) {
++            primary.cleanupError = cleanupError;
++        }
++        throw primary;
++    } finally {
++        options.signal?.removeEventListener("abort", forwardAbort);
++        // LLMSession's anonymous listener is attached only to this short-lived
++        // relay, never to a caller signal shared across successful work units.
++        controller.abort();
++    }
++}
++
+ /**
+  * Generate vector embeddings for documents that need them.
+  * Pure function — no console output, no db lifecycle management.
+@@ -1793,10 +1922,7 @@
+     const db = store.db;
+     const llm = getLlm(store);
+     const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
+-    const fingerprint = getEmbeddingFingerprint(model);
+     const now = new Date().toISOString();
+-    const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
+-    const encoder = new TextEncoder();
+     if (options?.force) {
+         clearAllEmbeddings(db, options?.collection);
+     }
+@@ -1805,6 +1931,14 @@
+     if (docsToEmbed.length === 0) {
+         return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0 };
+     }
++    return processEmbeddingDocuments(store, options, docsToEmbed, model, now, chunksCopied);
++}
++async function processEmbeddingDocuments(store, options, docsToEmbed, model, now, chunksCopied, work) {
++    const db = store.db;
++    const llm = getLlm(store);
++    const fingerprint = getEmbeddingFingerprint(model);
++    const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
++    const encoder = new TextEncoder();
+     const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+     const totalDocs = docsToEmbed.length;
+     const startTime = Date.now();
+@@ -1812,6 +1946,8 @@
+     const embedModelUri = model;
+     // Create a session manager for this llm instance
+     const result = await withLLMSessionForLlm(llm, async (session) => {
++        const check = () => work?.check(session);
++        check();
+         let chunksEmbedded = 0;
+         let bytesProcessed = 0;
+         let totalChunks = 0;
+@@ -1847,9 +1983,13 @@
+             retryQueue.delete(key);
+         };
+         const tryEmbedChunk = async (chunk) => {
++            check();
++            let nativeSettled = false;
+             try {
+                 const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
+                 const result = await session.embed(text, { model });
++                nativeSettled = true;
++                check();
+                 if (!result) {
+                     recordFailure(chunk, "embedding returned no vector");
+                     return false;
+@@ -1861,11 +2001,14 @@
+                 return true;
+             }
+             catch (error) {
++                check();
++                if (error instanceof EmbedWorkError || (work && nativeSettled)) throw error;
+                 recordFailure(chunk, reasonFromError(error));
+                 return false;
+             }
+         };
+         const retryFailedChunks = async (force = false) => {
++            check();
+             if (!session.isValid || retryQueue.size === 0)
+                 return;
+             if (!force && successesSinceRetry < RETRY_AFTER_SUCCESSFUL_CHUNKS)
+@@ -1893,20 +2036,28 @@
+         };
+         const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
+         for (const batchMeta of batches) {
++            check();
+             // Abort early if session has been invalidated
+             if (!session.isValid) {
+                 console.warn(`⚠ Session expired — skipping remaining document batches`);
+                 break;
+             }
+             const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
++            check();
+             const batchChunks = [];
+             const expectedChunksByHash = new Map();
+             const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+             for (const doc of batchDocs) {
+-                if (!doc.body.trim())
++                check();
++                if (!doc.body.trim()) {
++                    if (work) throw new EmbedWorkError("DOCUMENT_LIMIT", "Document has no chunks.");
+                     continue;
++                }
+                 const title = extractTitle(doc.body, doc.path);
+-                const chunks = await chunkDocumentByTokensWithLlm(llm, doc.body, undefined, undefined, undefined, doc.path, options?.chunkStrategy, session.signal);
++                const chunks = await chunkDocumentByTokensWithLlm(llm, doc.body, undefined, undefined, undefined, doc.path, options?.chunkStrategy, session.signal, work ? { maxChunksPerDocument: work.maxChunksPerDocument, check } : undefined);
++                check();
++                if (work && chunks.length === 0) throw new EmbedWorkError("DOCUMENT_LIMIT", "Document has no chunks.");
++                work?.expected.set(doc.hash, chunks.length);
+                 for (let seq = 0; seq < chunks.length; seq++) {
+                     batchChunks.push({
+                         hash: doc.hash,
+@@ -1932,6 +2083,7 @@
+                 const firstChunk = batchChunks[0];
+                 const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
+                 const firstResult = await session.embed(firstText, { model });
++                check();
+                 if (!firstResult) {
+                     throw new Error("Failed to get embedding dimensions from first chunk");
+                 }
+@@ -1941,6 +2093,7 @@
+             const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+             let batchChunkBytesProcessed = 0;
+             for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
++                check();
+                 // Abort early if session has been invalidated (e.g. max duration exceeded)
+                 if (!session.isValid) {
+                     const remainingChunks = batchChunks.slice(batchStart);
+@@ -1961,8 +2114,11 @@
+                 const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
+                 const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+                 const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
++                let nativeSettled = false;
+                 try {
+                     const embeddings = await session.embedBatch(texts, { model });
++                    nativeSettled = true;
++                    check();
+                     // One IMMEDIATE transaction per batch: every chunk writes several
+                     // rows across three tables, and a kill mid-batch must not leave
+                     // them out of step. Failure bookkeeping runs after the commit.
+@@ -1992,6 +2148,8 @@
+                     await retryFailedChunks();
+                 }
+                 catch (error) {
++                    check();
++                    if (error instanceof EmbedWorkError || (work && nativeSettled)) throw error;
+                     // Batch failed — try individual embeddings as fallback. If an
+                     // individual retry succeeds, any prior failure for that chunk is
+                     // cleared, so the visible error count reflects outstanding failures.
+@@ -2009,6 +2167,7 @@
+                         }
+                     }
+                 }
++                check();
+                 const proportionalBytes = totalBatchChunkBytes === 0
+                     ? batchBytes
+                     : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
+@@ -2022,15 +2181,18 @@
+                 });
+             }
+             await retryFailedChunks(true);
+-            const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
++            const removedPartialChunks = work ? 0 : removeIncompleteEmbeddings(db, expectedChunksByHash, model);
+             if (removedPartialChunks > 0) {
+                 chunksEmbedded = Math.max(0, chunksEmbedded - removedPartialChunks);
+             }
++            check();
+             bytesProcessed += batchBytes;
+             options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors: activeErrorCount(), failures: failureList() });
+         }
++        check();
+         return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
+-    }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
++    }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings', signal: work?.signal });
++    work?.check();
+     return {
+         docsProcessed: totalDocs,
+         chunksEmbedded: result.chunksEmbedded,
+@@ -2213,25 +2375,9 @@
+   `).all(model, fingerprint, sampleSize);
+ }
+ export function getHashesNeedingEmbedding(db, collection, model = DEFAULT_EMBED_MODEL) {
+-    const collectionFilter = collection ? `AND d.collection = ?` : ``;
+-    const fingerprint = getEmbeddingFingerprint(model);
+-    return withLazyContentVectorMigration(db, () => {
+-        const stmt = db.prepare(`
+-      SELECT COUNT(DISTINCT d.hash) as count
+-      FROM documents d
+-      LEFT JOIN (
+-        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+-        FROM content_vectors
+-        WHERE model = ? AND embed_fingerprint = ?
+-        GROUP BY hash, model, embed_fingerprint
+-      ) v ON d.hash = v.hash
+-      WHERE d.active = 1
+-        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+-        ${collectionFilter}
+-    `);
+-        const result = (collection ? stmt.get(model, fingerprint, collection) : stmt.get(model, fingerprint));
+-        return result.count;
+-    });
++    return pendingEmbeddingQuery(db, collection, model, {
++        select: "COUNT(DISTINCT d.hash) as count", method: "get",
++    }).count;
+ }
+ export async function maybeAdoptLegacyEmbeddingFingerprint(store, model = DEFAULT_EMBED_MODEL) {
+     const db = store.db;
+@@ -2322,7 +2468,12 @@
+         const lastUpdate = new Date(mostRecent.latest);
+         daysStale = Math.floor((Date.now() - lastUpdate.getTime()) / (24 * 60 * 60 * 1000));
+     }
+-    return { needsEmbedding, totalDocs, daysStale };
++    // Partition coverage is independent of content/model/fingerprint coverage.
++    // null means the vector index cannot be inspected; never imply completeness.
++    const layout = vecLayout(db);
++    const missingVectorPartitions = layout.kind === "partitioned" && vecTableReadable(db, layout)
++        ? missingPartitionRows(db).length : null;
++    return { needsEmbedding, totalDocs, daysStale, missingVectorPartitions };
+ }
+ export function getCacheKey(url, body) {
+     const hash = createHash("sha256");
+@@ -2919,7 +3070,7 @@
+  * When filepath and chunkStrategy are provided, uses AST-aware break points
+  * for supported code files.
+  */
+-async function chunkDocumentByTokensWithLlm(llm, content, maxTokens = CHUNK_SIZE_TOKENS, overlapTokens = CHUNK_OVERLAP_TOKENS, windowTokens = CHUNK_WINDOW_TOKENS, filepath, chunkStrategy = "regex", signal) {
++async function chunkDocumentByTokensWithLlm(llm, content, maxTokens = CHUNK_SIZE_TOKENS, overlapTokens = CHUNK_OVERLAP_TOKENS, windowTokens = CHUNK_WINDOW_TOKENS, filepath, chunkStrategy = "regex", signal, work) {
+     // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
+     // If chunks exceed limit, they'll be re-split with actual ratio
+     const avgCharsPerToken = 3;
+@@ -2928,7 +3079,10 @@
+     const windowChars = windowTokens * avgCharsPerToken;
+     // Chunk in character space with conservative estimate
+     // Use AST-aware chunking for the first pass when filepath/strategy provided
+-    let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
++    const iterateChars = (text, size, overlap, window) => iterateDocumentWithBreakPoints(text, scanBreakPoints(text), findCodeFences(text), size, overlap, window);
++    const charChunks = work
++        ? iterateChars(content, maxChars, overlapChars, windowChars)
++        : await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+     // Tokenize and split any chunks that still exceed limit
+     const results = [];
+     const clampOverlapChars = (value, maxChars) => {
+@@ -2936,10 +3090,17 @@
+             return 0;
+         return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
+     };
++    const append = (chunk) => {
++        work?.check();
++        if (work && results.length >= work.maxChunksPerDocument) throw new EmbedWorkError("DOCUMENT_LIMIT", "Document exceeds chunk limit.");
++        results.push(chunk);
++    };
+     const pushChunkWithinTokenLimit = async (text, pos) => {
++        work?.check();
+         if (signal?.aborted)
+             return;
+         const tokens = await llm.tokenize(text);
++        work?.check();
+         if (tokens.length <= maxTokens || text.length <= 1) {
+             // Safety net: text.length <= 1 can only legitimately be a single
+             // BMP character (a well-formed astral character needs 2 code units),
+@@ -2947,7 +3108,7 @@
+             const safeText = stripUnpairedSurrogates(text);
+             if (safeText.length === 0)
+                 return;
+-            results.push({ text: safeText, pos, tokens: tokens.length });
++            append({ text: safeText, pos, tokens: tokens.length });
+             return;
+         }
+         const actualCharsPerToken = text.length / tokens.length;
+@@ -2958,18 +3119,21 @@
+         safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+         let nextOverlapChars = clampOverlapChars(overlapChars * actualCharsPerToken / 2, safeMaxChars);
+         let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+-        let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
++        let subChunks = () => iterateChars(text, safeMaxChars, nextOverlapChars, nextWindowChars);
++        const noProgress = () => {
++            const iter = subChunks();
++            const first = iter.next();
++            return first.done || first.value.text.length === text.length || iter.next().done;
++        };
+         // Pathological single-line blobs can produce no meaningful breakpoint progress.
+         // Fall back to a simple half split so every recursion step strictly shrinks.
+-        if (subChunks.length <= 1
+-            || subChunks[0]?.text.length === text.length) {
++        if (noProgress()) {
+             safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+             nextOverlapChars = 0;
+             nextWindowChars = 0;
+-            subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+-        }
+-        if (subChunks.length <= 1
+-            || subChunks[0]?.text.length === text.length) {
++            subChunks = () => iterateChars(text, safeMaxChars, nextOverlapChars, nextWindowChars);
++        }
++        if (noProgress()) {
+             const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+             // Safety net: detokenize() reconstructs text from raw token IDs, and
+             // a tokenizer can encode a single astral-plane character across
+@@ -2977,14 +3141,14 @@
+             const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
+             if (truncatedText.length === 0)
+                 return;
+-            results.push({
++            append({
+                 text: truncatedText,
+                 pos,
+                 tokens: fallbackTokens.length,
+             });
+             return;
+         }
+-        for (const subChunk of subChunks) {
++        for (const subChunk of subChunks()) {
+             await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+         }
+     };
+diff --git a/node_modules/@tobilu/qmd/dist/store.d.ts b/node_modules/@tobilu/qmd/dist/store.d.ts
+--- a/node_modules/@tobilu/qmd/dist/store.d.ts
++++ b/node_modules/@tobilu/qmd/dist/store.d.ts
+@@ -581,6 +581,8 @@
+ export declare function getEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize?: number): EmbeddingVectorSample[];
+ export declare function getHashesNeedingEmbedding(db: Database, collection?: string, model?: string): number;
+ export type IndexHealthInfo = {
++    /** Missing active (hash, chunk, collection) partition registrations; null if index unavailable. */
++    missingVectorPartitions: number | null;
+     needsEmbedding: number;
+     totalDocs: number;
+     daysStale: number | null;
+@@ -1203,3 +1205,35 @@
+  * domain-specific or nuanced queries.
+  */
+ export declare function structuredSearch(store: Store, searches: ExpandedQuery[], options?: StructuredSearchOptions): Promise<HybridQueryResult[]>;
++
++/** Bounded whole-document embedding; native calls settle before rejection. */
++export interface EmbedWorkOptions {
++    collection: string;
++    chunkStrategy: 'regex';
++    maxDocuments: number;
++    maxInputBytes: number;
++    maxDocumentBytes: number;
++    maxChunksPerDocument: number;
++    maxDurationMs: number;
++    signal?: AbortSignal;
++    onProgress?: (progress: EmbedWorkProgress) => void;
++}
++export type EmbedWorkProgress = EmbedProgress;
++export interface EmbedWorkResult {
++    outcome: 'complete' | 'bounded';
++    identity: { model: string; fingerprint: string; chunkStrategy: 'regex' };
++    pendingBefore: number;
++    selectedDocuments: number;
++    selectedBytes: number;
++    completedDocuments: number;
++    remainingDocuments: number;
++    chunksEmbedded: number;
++    chunksCopied: number;
++    durationMs: number;
++}
++export declare class EmbedWorkError extends Error {
++    readonly code: 'INVALID_OPTIONS' | 'DOCUMENT_LIMIT' | 'NO_PROGRESS' | 'CANCELLED' | 'TIMEOUT' | 'INCOMPLETE' | 'WORK_FAILED';
++    readonly cleanupError?: unknown;
++    constructor(code: EmbedWorkError['code'], message: string, options?: ErrorOptions);
++}
++export declare function generateEmbeddingWork(store: Store, options: EmbedWorkOptions): Promise<EmbedWorkResult>;

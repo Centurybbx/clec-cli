@@ -1,0 +1,225 @@
+--- a/backend/src/qa/resources.ts
++++ b/backend/src/qa/resources.ts
+@@ -8,7 +8,9 @@
+ {"kind":"answer","text":"one requested answer portion, including its conditions","evidenceIds":["issued current-run evidence handle"]}
+ {"kind":"context","text":"relevant source information that does not itself answer the request","evidenceIds":["issued current-run evidence handle"]}
+ {"kind":"gap","text":"explicit unanswered part, uncertainty or request for clarification"}
+-Answer/context require at least one issued evidence handle. Do not write citation markers in text. No model status field. With no answer blocks, include a gap; context does not promote answerability. A gap must never hide a factual assertion, corpus-wide absence claim or invented provenance. State what you cannot answer, not what all sources supposedly lack.
++Answer/context require at least one issued evidence handle. A gap has ONLY kind and text: evidenceIds is forbidden on gap, even when the IDs are valid. Do not write citation markers in text. No model status field. With no answer blocks, include a gap; context does not promote answerability.
++Use gap only for an unanswered part of the user's actual question or a clarification needed to answer it. If every requested part is answered, omit gap. Do not invent extra questions about tools, steps or other unrequested details merely to create a gap. State what you cannot answer, not what sources supposedly lack. A gap must never contain a factual assertion, including negative claims about source coverage, completeness or provenance. Answer/context may contain a positive or negative factual claim ONLY when current original evidence or explicit metadata actually supports that claim; do not move an unsupported absence claim into context to evade this rule.
++Legal context+gap shape example for a hypothetical question asking how to perform X: {"blocks":[{"kind":"context","text":"The passage describes the purpose of X.","evidenceIds":["PLACEHOLDER_CURRENT_RUN_HANDLE"]},{"kind":"gap","text":"I cannot answer how to perform X from the evidence available to me."}]}. PLACEHOLDER_CURRENT_RUN_HANDLE is an illustrative placeholder, never an authorized handle and MUST NOT be copied. Use this shape only when the actual current evidence supports the context and the actual user asked the unanswered question; do not copy the example's claims.
+ Do not invent quotes, details, speaker identity, provenance, recording/transcript completeness or verbatim status. Narrative form establishes none of these. Caveats and negative factual claims also need current original support or explicit metadata. The host renders recognized source-quality notes separately. An unrelated citation never supports a claim.
+ Limits: 16 blocks, 4096 UTF-16 units per text, 16384 total text units, 64 evidence-reference occurrences, 65536 raw UTF-8 JSON bytes. These are structural bounds; provider output remains capped separately. No retries or JSON repair are available.`;
+ export function evidenceResources(): ResourceLoader {
+--- a/backend/src/domain/answer.ts
++++ b/backend/src/domain/answer.ts
+@@ -7,43 +7,56 @@
+   | { kind: 'gap'; text: string };
+ export const ANSWER_LIMITS = Object.freeze({ rawUtf8Bytes: 65_536, blocks: 16, blockUtf16: 4096, textUtf16: 16_384, references: 64 });
+ export const NO_HITS_TEXT = '在目前索引中未找到可支持此問題的原始資料。這不代表整個資料庫或其他來源沒有答案；可以提供集號、原句或縮小問題。';
+-function protocol(condition: unknown): asserts condition {
+-  if (!condition) throw new ClecError('ANSWER_PROTOCOL', 'Answer did not satisfy the structured answer contract.');
++export type AnswerProtocolReason = 'INVALID_JSON' | 'STRUCTURE' | 'GAP_EXTRA_FIELDS' | 'TEXT_BOUND' |
++  'UNKNOWN_EVIDENCE' | 'REFERENCE_STRUCTURE' | 'MISSING_ANSWER_OR_GAP';
++/** Internal, content-free rejection; public code and messages remain unchanged. */
++export class AnswerProtocolError extends ClecError {
++  constructor(public readonly reason: AnswerProtocolReason) {
++    super('ANSWER_PROTOCOL', reason === 'INVALID_JSON' ? 'Model final answer was not valid JSON.' :
++      'Answer did not satisfy the structured answer contract.');
++  }
++}
++function protocol(condition: unknown, reason: AnswerProtocolReason): asserts condition {
++  if (!condition) throw new AnswerProtocolError(reason);
+ }
+ /** Pure structural validation; neither source entailment nor requested-part coverage is proved. */
+ export function validateBlocks(value: unknown, allowed: ReadonlySet<string>): AnswerBlock[] {
+-  protocol(Array.isArray(value) && value.length > 0 && value.length <= ANSWER_LIMITS.blocks);
++  protocol(Array.isArray(value) && value.length > 0 && value.length <= ANSWER_LIMITS.blocks, 'STRUCTURE');
+   let units = 0; let references = 0;
+   const blocks = value.map((item: unknown): AnswerBlock => {
+-    protocol(item !== null && typeof item === 'object' && !Array.isArray(item));
++    protocol(item !== null && typeof item === 'object' && !Array.isArray(item), 'STRUCTURE');
+     const block = item as Record<string, unknown>;
+-    protocol(['answer', 'context', 'gap'].includes(String(block.kind)));
+-    protocol(Object.keys(block).sort().join(',') === (block.kind === 'gap' ? 'kind,text' : 'evidenceIds,kind,text'));
+-    protocol(typeof block.text === 'string' && block.text.trim().length > 0 && block.text.length <= ANSWER_LIMITS.blockUtf16);
+-    protocol(!/\[(?:C[^\]]*|[0-9]+|[ER]:[^\]]*)\]/i.test(block.text));
++    protocol(block.kind === 'answer' || block.kind === 'context' || block.kind === 'gap', 'STRUCTURE');
++    const keys = Object.keys(block);
++    protocol(keys.sort().join(',') === (block.kind === 'gap' ? 'kind,text' : 'evidenceIds,kind,text'),
++      block.kind === 'gap' && keys.some(key => key !== 'kind' && key !== 'text') ? 'GAP_EXTRA_FIELDS' : 'STRUCTURE');
++    protocol(typeof block.text === 'string' && block.text.trim().length > 0 && block.text.length <= ANSWER_LIMITS.blockUtf16, 'TEXT_BOUND');
++    protocol(!/\[(?:C[^\]]*|[0-9]+|[ER]:[^\]]*)\]/i.test(block.text), 'REFERENCE_STRUCTURE');
+     units += block.text.length;
+     if (block.kind === 'gap') return { kind: 'gap', text: block.text };
+-    protocol(Array.isArray(block.evidenceIds) && block.evidenceIds.length > 0);
++    protocol(Array.isArray(block.evidenceIds) && block.evidenceIds.length > 0, 'REFERENCE_STRUCTURE');
+     references += block.evidenceIds.length;
+-    protocol(block.evidenceIds.every(id => typeof id === 'string' && allowed.has(id)));
+-    protocol(new Set(block.evidenceIds).size === block.evidenceIds.length);
++    protocol(block.evidenceIds.every(id => typeof id === 'string'), 'REFERENCE_STRUCTURE');
++    protocol(block.evidenceIds.every(id => allowed.has(id)), 'UNKNOWN_EVIDENCE');
++    protocol(new Set(block.evidenceIds).size === block.evidenceIds.length, 'REFERENCE_STRUCTURE');
+     return { kind: block.kind as 'answer' | 'context', text: block.text, evidenceIds: [...block.evidenceIds] as string[] };
+   });
+-  protocol(units <= ANSWER_LIMITS.textUtf16 && references <= ANSWER_LIMITS.references);
++  protocol(units <= ANSWER_LIMITS.textUtf16, 'TEXT_BOUND');
++  protocol(references <= ANSWER_LIMITS.references, 'REFERENCE_STRUCTURE');
+   deriveAnswerability(blocks);
+   return blocks;
+ }
+ export function parseModelAnswer(raw: string, allowed: ReadonlySet<string>): AnswerBlock[] {
+-  protocol(new TextEncoder().encode(raw).byteLength <= ANSWER_LIMITS.rawUtf8Bytes);
++  protocol(new TextEncoder().encode(raw).byteLength <= ANSWER_LIMITS.rawUtf8Bytes, 'TEXT_BOUND');
+   let value: unknown;
+-  try { value = JSON.parse(raw); } catch { throw new ClecError('ANSWER_PROTOCOL', 'Model final answer was not valid JSON.'); }
+-  protocol(value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).join(',') === 'blocks');
++  try { value = JSON.parse(raw); } catch { throw new AnswerProtocolError('INVALID_JSON'); }
++  protocol(value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).join(',') === 'blocks', 'STRUCTURE');
+   return validateBlocks((value as { blocks: unknown }).blocks, allowed);
+ }
+ export function deriveAnswerability(blocks: readonly AnswerBlock[]): Exclude<Answerability, 'no_hits'> {
+   const answer = blocks.some(block => block.kind === 'answer');
+   const gap = blocks.some(block => block.kind === 'gap');
+-  protocol(answer || gap);
++  protocol(answer || gap, 'MISSING_ANSWER_OR_GAP');
+   return answer ? gap ? 'partial' : 'supported' : 'insufficient_evidence';
+ }
+ /** Explicit quality labels only. Unknown metadata implies no note. */
+--- a/backend/src/qa/pi.ts
++++ b/backend/src/qa/pi.ts
+@@ -3,8 +3,8 @@
+ import { Type } from '@sinclair/typebox';
+ import type { AppConfig } from '../config.js';
+ import type { AnswerBlock } from '../domain/answer.js';
+-import { parseModelAnswer } from '../domain/answer.js';
+-import { failureReason, type DiagnosticSink } from '../diagnostics/contracts.js';
++import { AnswerProtocolError, parseModelAnswer } from '../domain/answer.js';
++import { failureReason, type AnswerProtocolDiagnosticReason, type DiagnosticSink } from '../diagnostics/contracts.js';
+ import type { EvidenceContext } from './evidence-context.js';
+ import { ClecError, checkAbort, publicError } from '../domain/errors.js';
+ import { evidenceResources } from './resources.js';
+@@ -19,6 +19,21 @@
+ export interface PiRun {
+   runId: string; generation: string; question: string; retrievalQuery: string;
+   manager: SessionManager; evidence: EvidenceContext; diagnostics: DiagnosticSink; reportMetrics(metrics: Record<string, number>): void;
++}
++
++/** Map only the local typed rejection to fixed diagnostic literals, never exception content. */
++function answerProtocolDiagnostic(error: unknown): AnswerProtocolDiagnosticReason | undefined {
++  if (!(error instanceof AnswerProtocolError)) return undefined;
++  switch (error.reason) {
++    case 'INVALID_JSON': return 'INVALID_JSON';
++    case 'STRUCTURE': return 'STRUCTURE';
++    case 'GAP_EXTRA_FIELDS': return 'GAP_EXTRA_FIELDS';
++    case 'TEXT_BOUND': return 'TEXT_BOUND';
++    case 'UNKNOWN_EVIDENCE': return 'UNKNOWN_EVIDENCE';
++    case 'REFERENCE_STRUCTURE': return 'REFERENCE_STRUCTURE';
++    case 'MISSING_ANSWER_OR_GAP': return 'MISSING_ANSWER_OR_GAP';
++    default: return undefined;
++  }
+ }
+ 
+ /** One Pi Agent, including every tool round, with no background/retry/compaction model work. */
+@@ -133,7 +148,9 @@
+     return { blocks: parseModelAnswer(session.getLastAssistantText() ?? '', run.evidence.issuedEvidenceIds), metrics: { ...budget.metrics(), toolCalls } };
+   } catch (error) {
+     hasPrimaryFailure = true;
+-    run.diagnostics.record({ runId: run.runId, stage: 'qa', code: 'FAILURE', reason: failureReason(error) });
++    const answerProtocolReason = answerProtocolDiagnostic(error);
++    run.diagnostics.record({ runId: run.runId, stage: 'qa', code: 'FAILURE', reason: failureReason(error),
++      ...(answerProtocolReason ? { answerProtocolReason } : {}) });
+     throw error;
+   } finally {
+     signal.removeEventListener('abort', onAbort);
+--- a/backend/src/diagnostics/contracts.ts
++++ b/backend/src/diagnostics/contracts.ts
+@@ -12,12 +12,16 @@
+     return FAILURE_REASONS.find(reason => reason === code) ?? 'UNKNOWN';
+   } catch { return 'UNKNOWN'; }
+ }
++/** Fixed diagnostic vocabulary; never serialize arbitrary error properties. */
++export const ANSWER_PROTOCOL_REASONS = ['INVALID_JSON', 'STRUCTURE', 'GAP_EXTRA_FIELDS', 'TEXT_BOUND',
++  'UNKNOWN_EVIDENCE', 'REFERENCE_STRUCTURE', 'MISSING_ANSWER_OR_GAP'] as const;
++export type AnswerProtocolDiagnosticReason = typeof ANSWER_PROTOCOL_REASONS[number];
+ export const COUNT_FIELDS = ['requestedUnits', 'contextBytes', 'systemBytes', 'messageBytes', 'toolBytes', 'outputReserve',
+   'reservedUnits', 'limitUnits', 'modelCalls', 'readAttempts', 'readCharacters', 'searches', 'searchResults', 'blocks', 'citations'] as const;
+ export type DiagnosticCounts = Partial<Record<typeof COUNT_FIELDS[number], number>>;
+ export interface DiagnosticRecord {
+   runId: string; requestOrdinal?: number; stage: DiagnosticStage; code: DiagnosticCode;
+-  reason?: FailureReason; counts?: DiagnosticCounts;
++  reason?: FailureReason; answerProtocolReason?: AnswerProtocolDiagnosticReason; counts?: DiagnosticCounts;
+ }
+ /** Implementations must never throw and must serialize only allowlisted fields. */
+ export interface DiagnosticSink { record(event: DiagnosticRecord): void; readonly dropped: number }
+--- a/backend/src/diagnostics/local.ts
++++ b/backend/src/diagnostics/local.ts
+@@ -1,6 +1,6 @@
+ import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+ import { dirname } from 'node:path';
+-import { COUNT_FIELDS, FAILURE_REASONS, type DiagnosticRecord, type DiagnosticSink } from './contracts.js';
++import { ANSWER_PROTOCOL_REASONS, COUNT_FIELDS, FAILURE_REASONS, type DiagnosticRecord, type DiagnosticSink } from './contracts.js';
+ 
+ const STAGES = new Set(['qa', 'admission', 'provider', 'scheduler', 'cleanup', 'http', 'cli']);
+ const CODES = new Set(['BEGIN', 'SUCCESS', 'FAILURE', 'CLEANUP_FAILURE', 'ADMITTED', 'REFUSED', 'HTTP_RESPONSE',
+@@ -25,7 +25,10 @@
+       const line = `${JSON.stringify({ sequence: ++this.sequence, timestamp: new Date().toISOString(), runId: event.runId,
+         ...(Number.isSafeInteger(event.requestOrdinal) && event.requestOrdinal! > 0 ? { requestOrdinal: event.requestOrdinal } : {}),
+         stage: event.stage, code: event.code,
+-        ...(event.reason && FAILURE_REASONS.includes(event.reason) ? { reason: event.reason } : {}), counts })}\n`;
++        ...(event.reason && FAILURE_REASONS.includes(event.reason) ? { reason: event.reason } : {}),
++        ...(event.stage === 'qa' && event.code === 'FAILURE' && event.reason === 'ANSWER_PROTOCOL' &&
++          event.answerProtocolReason && ANSWER_PROTOCOL_REASONS.includes(event.answerProtocolReason)
++          ? { answerProtocolReason: event.answerProtocolReason } : {}), counts })}\n`;
+       const bytes = Buffer.byteLength(line);
+       if (bytes > MAX_RECORD_BYTES) throw new Error();
+       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+--- a/backend/src/qa/budget.ts
++++ b/backend/src/qa/budget.ts
+@@ -1,6 +1,26 @@
+-import type { Usage } from '@earendil-works/pi-ai';
+-import type { DiagnosticSink } from '../diagnostics/contracts.js';
++import type { TranscriptContext, Usage } from '@earendil-works/pi-ai';
++import type { DiagnosticCounts, DiagnosticSink } from '../diagnostics/contracts.js';
+ import { ClecError } from '../domain/errors.js';
++
++const serializedBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
++/** Observed transcript components, not replayed active state or HTTP payload bytes.
++ * messageBytes includes system messages, so these measures deliberately overlap.
++ * Omit unavailable components rather than reporting a fabricated observed zero.
++ */
++function transcriptComponentBytes(context: TranscriptContext): DiagnosticCounts {
++  if (!Array.isArray(context.messages)) return {};
++  const counts: DiagnosticCounts = { messageBytes: serializedBytes(context.messages) };
++  for (const message of context.messages) {
++    if (message.role !== 'system') continue;
++    // Named sections include the actual preamble even when content is empty.
++    counts.systemBytes = (counts.systemBytes ?? 0) + serializedBytes(message.content) +
++      (message.sections === undefined ? 0 : serializedBytes(message.sections));
++    // Measure declarations/removals as observed, not a synthetic current tools array.
++    if (message.toolsAdded !== undefined) counts.toolBytes = (counts.toolBytes ?? 0) + serializedBytes(message.toolsAdded);
++    if (message.toolsRemoved !== undefined) counts.toolBytes = (counts.toolBytes ?? 0) + serializedBytes(message.toolsRemoved);
++  }
++  return counts;
++}
+ 
+ /** Conservative accounting units, NOT tokenizer tokens. Every request reserves output. */
+ export class ModelBudget {
+@@ -9,14 +29,11 @@
+   reservedUnits = 0;
+   readonly usages: Usage[] = [];
+   constructor(private readonly maxUnits: number, private readonly priced: boolean, private readonly diagnostics: DiagnosticSink, private readonly runId: string) {}
+-  admit(context: unknown): void {
++  admit(context: TranscriptContext): void {
+     this.attempts++;
+-    const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
+-    const components = context as { systemPrompt?: unknown; messages?: unknown; tools?: unknown } | null;
+-    const contextBytes = bytes(context);
++    const contextBytes = serializedBytes(context);
+     const units = contextBytes + 2048;
+-    const counts = { requestedUnits: units, contextBytes, systemBytes: bytes(components?.systemPrompt),
+-      messageBytes: bytes(components?.messages), toolBytes: bytes(components?.tools), outputReserve: 2048,
++    const counts = { requestedUnits: units, contextBytes, ...transcriptComponentBytes(context), outputReserve: 2048,
+       reservedUnits: this.reservedUnits, limitUnits: this.maxUnits, modelCalls: this.admitted };
+     if (this.admitted >= 4 || this.reservedUnits + units > this.maxUnits) {
+       this.diagnostics.record({ runId: this.runId, requestOrdinal: this.attempts, stage: 'admission', code: 'REFUSED', reason: 'MODEL_BUDGET', counts });

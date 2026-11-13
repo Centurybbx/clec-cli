@@ -1,0 +1,21 @@
+{
+  "id": "ep-00295",
+  "source": "https://clectw.com/ep/ep-00295",
+  "media_url": "https://drive.google.com/file/d/16oh0SbBR3zMx5rWfyUPbiJlQjQQLvNoI/view",
+  "expected_size": 259228579,
+  "model": "mlx-community/whisper-small-mlx-4bit",
+  "language": "zh",
+  "media_sha256": "580d4da5f286f98d3fb17f8e8853bf4cf0c8c1a69fb0ba8ca35add479c5b471a",
+  "duration_seconds": 547.78,
+  "subtitle_last_end_seconds": 542.0,
+  "ratio": 0.9894,
+  "elapsed_seconds": 10.3,
+  "status": "suspected_hallucination_do_not_use",
+  "note": "自动转写尚未校对，金融术语、数字和讲话人均需复核。 模型的无语音概率偏高，但不能证明全片无人声；需人工听录音确认。",
+  "temporary_media_deleted": false,
+  "reason": "suspected hallucination: repeated line or timestamp beyond source duration",
+  "visual_sample": "在视频约60、270、480秒抽取的三帧显示旅行风景，未作完整逐帧检查；无法据此认定全片无讲话。",
+  "model_no_speech_probability_median": 0.9724,
+  "second_model_test": "whisper-tiny-mlx-4bit 输出大量重复片段、模型无语音概率中位数约0.819；无法证明全片无人声。",
+  "second_model_test_path": "collection/transcription-tests/ep-00295-tiny/ep-00295.json"
+}

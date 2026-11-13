@@ -1,0 +1,61 @@
+[
+  {
+    "question": "00575 中，退休后质押借款时现金有什么作用？",
+    "query": "00575",
+    "source": "clectw:short-00575",
+    "retrieval_evidence_id": "4363f2a7918a298964e1ddeb",
+    "evidence_for_context": {
+      "來信內容": "4363f2a7918a298964e1ddeb",
+      "老師回覆": "4363f2a7918a298964e1ddeb",
+      "高過你的欠款": "4363f2a7918a298964e1ddeb"
+    },
+    "file_status": "verified",
+    "required_context_found": true
+  },
+  {
+    "question": "00318 对 54 岁来信者的回复有什么条件？",
+    "query": "00318",
+    "source": "clectw:short-00318",
+    "retrieval_evidence_id": "4cbd65ed6394d10f6ca59dae",
+    "evidence_for_context": {
+      "一半是美元放在香港": "4cbd65ed6394d10f6ca59dae",
+      "一半是臺幣": "4cbd65ed6394d10f6ca59dae",
+      "沒有稅務問題": "4cbd65ed6394d10f6ca59dae"
+    },
+    "file_status": "verified",
+    "required_context_found": true
+  },
+  {
+    "question": "00153 中的 2.6% 利率是谁提出的？",
+    "query": "00153",
+    "source": "clectw:short-00153",
+    "retrieval_evidence_id": "9a6da1005df09be33233702d",
+    "evidence_for_context": {
+      "email 來信分享": "a72cbef22ce119f8899f62c2",
+      "利息 2.6%": "a72cbef22ce119f8899f62c2"
+    },
+    "file_status": "verified",
+    "required_context_found": true
+  },
+  {
+    "test": "同名不同正文",
+    "pass": true
+  },
+  {
+    "test": "数字与单位间空格",
+    "pass": true
+  },
+  {
+    "test": "虚构名称关键词搜索",
+    "hits": 0,
+    "conclusion": "仅证明该检索词无命中，不证明资料库之外不存在"
+  },
+  {
+    "test": "真实摘要遗漏条件",
+    "status": "needs_review",
+    "warnings": [
+      "原文条件可能遗漏：如果您打算在台湾生活",
+      "原文限定或否定词可能遗漏：没有"
+    ]
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "id": "short-00639c",
+  "source": "https://clec168.com/video/short/00639c",
+  "media_url": "https://cdn.clec168.com/video/short/00639c.mp4",
+  "model": "mlx-community/whisper-small-mlx-4bit",
+  "language": "zh",
+  "media_sha256": "b3570b8286ca68c3d444b54169b6f380482ad40e9e2e573d9bef762b60c688f8",
+  "duration_seconds": 490.13,
+  "subtitle_last_end_seconds": 490.04,
+  "ratio": 0.9998,
+  "elapsed_seconds": 15.4,
+  "status": "machine_unverified",
+  "note": "自动转写尚未校对，金融术语、数字和讲话人均需复核。",
+  "temporary_media_deleted": true,
+  "reason": ""
+}

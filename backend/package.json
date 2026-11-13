@@ -1,0 +1,29 @@
+{
+  "name": "@clec/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.10.1",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck:installer",
+    "clec": "node dist/cli.js",
+    "postinstall": "node scripts/apply-qmd-patch.mts",
+    "typecheck:installer": "tsc -p tsconfig.installer.json"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@sinclair/typebox": "0.34.52",
+    "@tobilu/qmd": "git+https://github.com/tobi/qmd.git#86d2365d17fc682e491c2c53d1e4a884aee8682a",
+    "opencc-js": "1.0.5",
+    "patch-package": "8.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "25.5.0",
+    "typescript": "5.9.3"
+  }
+}

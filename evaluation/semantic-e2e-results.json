@@ -1,0 +1,82 @@
+[
+  {
+    "question": "退休后用股票借款，为什么还需要保留现金？",
+    "auto_keyword_query": "现金 借款",
+    "source": "clectw:special-00004",
+    "rank": 5,
+    "retrieval": {
+      "semantic_rank": 1
+    },
+    "file_status": "verified",
+    "evidence_for_context": {
+      "真正有風險的": "28364b0636ae63fc4d7549d2",
+      "退休": "da5e222e0a1037db10a91103",
+      "現金": "da5e222e0a1037db10a91103"
+    }
+  },
+  {
+    "question": "打算退休的54岁来信者，资金汇回台湾的前提是什么？",
+    "auto_keyword_query": "54岁 来信 台湾 汇回",
+    "source": "clectw:short-00318",
+    "rank": 3,
+    "retrieval": {
+      "lexical_rank": 1
+    },
+    "file_status": "verified",
+    "evidence_for_context": {
+      "一半是美元放在香港": "4cbd65ed6394d10f6ca59dae",
+      "沒有稅務問題": "4cbd65ed6394d10f6ca59dae"
+    }
+  },
+  {
+    "question": "来信者提到借钱利息2.6%，这是谁的计划？",
+    "auto_keyword_query": "2.6% 借钱 利息 来信",
+    "source": "clectw:short-00153",
+    "rank": 4,
+    "retrieval": {
+      "lexical_rank": 2
+    },
+    "file_status": "verified",
+    "evidence_for_context": {
+      "email 來信分享": "a72cbef22ce119f8899f62c2",
+      "利息 2.6%": "a72cbef22ce119f8899f62c2"
+    }
+  },
+  {
+    "question": "2022年关于股票抵押借款是否留现金是怎么说的？",
+    "auto_keyword_query": "2022年 现金 借款",
+    "source": "clectw:ep-00288",
+    "rank": 1,
+    "retrieval": {
+      "semantic_rank": 1,
+      "lexical_rank": 20
+    },
+    "file_status": "verified",
+    "evidence_for_context": {
+      "不應該留現金": "6575334c11bb8a3e0d45f4bf",
+      "Money Market": "bc1a3bab4100e039113f06d4"
+    }
+  },
+  {
+    "question": "有学员如何向亲朋好友分享投资理念？",
+    "auto_keyword_query": null,
+    "source": "clectw:short-00152",
+    "rank": 2,
+    "retrieval": {
+      "semantic_rank": 2
+    },
+    "file_status": "verified",
+    "evidence_for_context": {
+      "RC 留言分享": "3b00a2de8720cba4809840a7",
+      "親朋好友": "3b00a2de8720cba4809840a7",
+      "請他們吃飯": "3b00a2de8720cba4809840a7"
+    }
+  },
+  {
+    "question": "星际橙子独角兽基金何时发行？",
+    "semantic_candidates": 5,
+    "literal_hits": 0,
+    "answerability": "not_assessed",
+    "required_agent_behavior": "不将相似候选视为名称和发行日期的证据"
+  }
+]

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body { margin:0; font-family:var(--font-sans); color:var(--foreground); }
+#retrieval-flow { display:grid; gap:22px; margin:0; padding:8px 0; font-size:14px; line-height:1.6; }
+#retrieval-flow .lane { display:grid; grid-template-columns:76px 1fr; gap:14px; align-items:start; }
+#retrieval-flow .label { font-weight:500; padding-top:4px; }
+#retrieval-flow .steps { display:grid; grid-template-columns:1fr 20px 1fr 20px 1fr; align-items:center; gap:6px; }
+#retrieval-flow .step { padding:4px 0; }
+#retrieval-flow .detail { display:block; color:var(--muted-foreground); font-size:12px; }
+#retrieval-flow .arrow { color:var(--muted-foreground); text-align:center; }
+#retrieval-flow .repeat { margin:10px 0 0 90px; border-top:1px dashed var(--border); padding-top:8px; color:var(--muted-foreground); font-size:12px; }
+#retrieval-flow .divider { border:0; border-top:1px solid var(--border); margin:0; }
+@media(max-width:520px) {
+  #retrieval-flow .lane { grid-template-columns:1fr; gap:6px; }
+  #retrieval-flow .steps { grid-template-columns:1fr 16px 1fr 16px 1fr; gap:4px; }
+  #retrieval-flow .repeat { margin-left:0; }
+}
+</style>
+</head>
+<body>
+<figure id="retrieval-flow" aria-label="建议的 CLEC 架构：离线建立混合索引；在线检索候选证据；Agent 读原文并按需重复检索；最后带引用输出。">
+  <div class="lane">
+    <div class="label">离线准备</div>
+    <div class="steps">
+      <div class="step">原始资料<span class="detail">字幕、逐字稿、讲义</span></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="step">解析与分段<span class="detail">来源、日期、原文定位</span></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="step">两路索引<span class="detail">关键词＋语义向量</span></div>
+    </div>
+  </div>
+  <hr class="divider">
+  <div class="lane">
+    <div class="label">在线召回</div>
+    <div class="steps">
+      <div class="step">问题与子问题<span class="detail">改写、同义词、范围</span></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="step">混合检索<span class="detail">BM25 ∥ 向量检索</span></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="step">候选证据池<span class="detail">融合、去重、可选重排</span></div>
+    </div>
+  </div>
+  <hr class="divider">
+  <div>
+    <div class="lane">
+      <div class="label">Agent 循环</div>
+      <div class="steps">
+        <div class="step">读原文<span class="detail">上下文、篇内搜索</span></div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div class="step">整理证据<span class="detail">条件、归因、分歧、缺口</span></div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div class="step">带引用输出<span class="detail">逐项关联原文证据</span></div>
+      </div>
+    </div>
+    <div class="repeat">↶ 发现缺口：补充查询，回到在线召回；达到覆盖目标或预算后停止。</div>
+  </div>
+</figure>
+</body>
+</html>

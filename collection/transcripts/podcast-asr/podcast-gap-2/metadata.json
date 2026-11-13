@@ -1,0 +1,20 @@
+{
+  "id": "podcast-gap-2",
+  "source": "ximalaya-110339131.xml",
+  "source_title": "CLEC 專題【為什麼非美國投資人，更應該用 UCITS ETF 投資納斯達克1",
+  "source_guid": "xmly_track_946249733",
+  "media_url": "https://jt.ximalaya.com//GKwRIMANMCYwAHO3NwRTCn9F.m4a?channel=rss&album_id=110339131&track_id=946249733&uid=30579658&jt=https://aod.cos.tx.xmcdn.com/storages/7a1f-audiofreehighqps/60/06/GKwRIMANMCYwAHO3NwRTCn9F.m4a",
+  "expected_size": 7583543,
+  "extension": ".m4a",
+  "model": "mlx-community/whisper-small-mlx-4bit",
+  "language": "zh",
+  "media_sha256": "645291ba4df2c2a7c0de9b5ed5dd111970dcf069e7c642247f1d0eac7c610063",
+  "duration_seconds": 936.62,
+  "subtitle_last_end_seconds": 936.56,
+  "ratio": 0.9999,
+  "elapsed_seconds": 29.7,
+  "status": "machine_unverified",
+  "note": "自动转写尚未校对，金融术语、数字和讲话人均需复核。",
+  "temporary_media_deleted": true,
+  "reason": ""
+}
