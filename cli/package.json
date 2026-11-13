@@ -1,0 +1,12 @@
+{
+  "name": "@clec/cli",
+  "version": "0.1.0",
+  "description": "Offline CLEC evidence search and exact source reads",
+  "type": "module",
+  "bin": { "clec": "dist/cli.js" },
+  "engines": { "node": ">=22.19.0" },
+  "files": ["dist/cli.js", "dist/contracts.js", "dist/lexical.js", "dist/corpus.js", "dist/releases.js"],
+  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit", "build:corpus": "node dist/publisher.js" },
+  "dependencies": { "opencc-js": "1.0.5" },
+  "devDependencies": { "@types/node": "25.5.0", "typescript": "5.9.3" }
+}
