@@ -43,16 +43,9 @@ export const validDate = (value: string): boolean =>
   Number.isFinite(Date.parse(value)) &&
   new Date(value).toISOString().slice(0, 10) === value;
 export type SourceType =
-  | "document"
-  | "qa"
-  | "transcript"
-  | "curated"
-  | "metadata";
+  "document" | "qa" | "transcript" | "curated" | "metadata";
 export type IntakeStatus =
-  | "ready"
-  | "quarantined"
-  | "unsupported"
-  | "metadata_only";
+  "ready" | "quarantined" | "unsupported" | "metadata_only";
 export interface IntakeSource {
   path: string;
   title: string;
@@ -91,7 +84,7 @@ export interface Counts {
   inventory: number;
 }
 export interface Manifest {
-  formatRevision: 1;
+  formatRevision: 1 | 3;
   artifact: "corpus.sqlite";
   artifactUrl?: string;
   bytes: number;
@@ -247,12 +240,15 @@ export function parseManifest(value: unknown): Manifest {
   const m = object(value);
   const counts = object(m.counts);
   if (
-    m.formatRevision !== 1 ||
+    (m.formatRevision !== 1 && m.formatRevision !== 3) ||
     m.artifact !== "corpus.sqlite" ||
     typeof m.sha256 !== "string" ||
     !isHash(m.sha256)
   )
-    throw new ClecError("INVALID_PACKAGE", "Unsupported release manifest.");
+    throw new ClecError(
+      "INVALID_PACKAGE",
+      "Unsupported release manifest. Supported formats: 1 and 3; trial format 2 must be rebuilt with the BM25 publisher.",
+    );
   const artifactUrl =
     m.artifactUrl === undefined
       ? undefined
@@ -268,10 +264,14 @@ export function parseManifest(value: unknown): Manifest {
     }
   };
   return {
-    formatRevision: 1,
+    formatRevision: m.formatRevision,
     artifact: "corpus.sqlite",
     ...(artifactUrl === undefined ? {} : { artifactUrl }),
-    bytes: packageInteger(m.bytes, 1, MAX_ARTIFACT),
+    bytes: packageInteger(
+      m.bytes,
+      1,
+      MAX_ARTIFACT,
+    ),
     sha256: m.sha256,
     counts: {
       sources: packageInteger(counts.sources, 1, 1_000_000),

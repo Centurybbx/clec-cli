@@ -1,9 +1,10 @@
+import { rank } from "./retrieval.js";
+import { safeBoundary, type SubtitleCue } from "./source-extraction.js";
 import { DatabaseSync } from "node:sqlite";
 import {
   ClecError,
   hash,
   parseSource,
-  SEGMENTATION_REVISION,
   type Source,
   type Section,
   type Counts,
@@ -12,16 +13,8 @@ import {
 } from "./contracts.js";
 import { normalizeForSearch, queryTokens } from "./lexical.js";
 
-export const SCHEMA = `
-PRAGMA journal_mode=DELETE;
-CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-INSERT INTO metadata VALUES('formatRevision','1'),('segmentationRevision','${SEGMENTATION_REVISION}');
-CREATE TABLE sources(id TEXT PRIMARY KEY,version TEXT NOT NULL,record TEXT NOT NULL,original TEXT NOT NULL);
-CREATE TABLE sections(id TEXT UNIQUE NOT NULL,source_id TEXT NOT NULL REFERENCES sources(id),ordinal INTEGER NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,boundary TEXT NOT NULL);
-CREATE UNIQUE INDEX sections_source ON sections(source_id,ordinal);
-CREATE TABLE inventory(path TEXT PRIMARY KEY,status TEXT NOT NULL,reason TEXT NOT NULL,content_hash TEXT);
-CREATE VIRTUAL TABLE search USING fts5(title,tokens,content='',tokenize='ascii');
-`;
+import { validateCorpus } from "./corpus-format.js";
+export { SCHEMA } from "./corpus-format.js";
 export interface Paging {
   limit: number;
   offset: number;
@@ -72,6 +65,7 @@ export interface Context {
   section: Section;
   offsetUnit: "utf16";
   text: string;
+  cues?: SubtitleCue[];
 }
 export interface Evidence extends Context {
   release: string;
@@ -81,6 +75,8 @@ export interface Evidence extends Context {
   previous: string | null;
   next: string | null;
   warnings: string[];
+  metadata?: unknown;
+  cues?: SubtitleCue[];
 }
 export interface ReadResult {
   release: string;
@@ -128,16 +124,31 @@ export interface SearchPage {
   page: Page;
 }
 export class Corpus {
-  readonly db: DatabaseSync;
+  private readonly db: DatabaseSync;
   constructor(
     path: string,
     readonly release: string,
   ) {
     this.db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
     this.db.exec("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;");
+    const revision = this.revision();
+    if (revision !== 1 && revision !== 3) {
+      this.db.close();
+      throw new ClecError(
+        "INVALID_PACKAGE",
+        "Unsupported corpus format. Supported formats: 1 and 3; trial format 2 must be rebuilt with the BM25 publisher. Run clec sync --manifest PATH with a supported release.",
+      );
+    }
   }
-  close(): void {
+  async close(): Promise<void> {
     this.db.close();
+  }
+  revision(): number {
+    return Number(
+      this.db
+        .prepare("SELECT value FROM metadata WHERE key='formatRevision'")
+        .get()?.value,
+    );
   }
   counts(): Counts {
     const count = (table: string): number =>
@@ -231,11 +242,18 @@ export class Corpus {
           section: s,
           offsetUnit: "utf16",
           text: original.slice(s.start, s.end),
+          cues: this.cues(source.id, s.start, s.end),
         };
       }),
       previous: adjacent(section.order - 1),
       next: adjacent(section.order + 1),
       warnings: this.warnings(source),
+      ...(this.revision() === 3
+        ? {
+            metadata: this.metadata(source.id),
+            cues: this.cues(source.id, section.start, section.end),
+          }
+        : {}),
     };
   }
   readMany(refs: Reference[], context: number): ReadResult {
@@ -337,30 +355,163 @@ export class Corpus {
       page: page({ offset, limit }, rows.length > limit),
     };
   }
-  search(query: string, options: SearchOptions): SearchPage {
-    const tokens = queryTokens(query);
-    const terms = tokens.map((term) =>
-      Buffer.from(term.slice(1), "hex").toString("utf8"),
-    );
-    // MATERIALIZED computes bm25 in the FTS relation before the window function.
-    const rows = this.db
+  metadata(id: string): unknown {
+    const row = this.db
+      .prepare("SELECT record FROM source_metadata WHERE source_id=?")
+      .get(id);
+    return row ? JSON.parse(String(row.record)) : null;
+  }
+  cues(id: string, start: number, end: number): SubtitleCue[] {
+    if (this.revision() !== 3) return [];
+    return this.db
       .prepare(
-        `WITH scored AS MATERIALIZED (SELECT s.*,bm25(search,4.0,1.0) score FROM search JOIN sections s ON s.rowid=search.rowid JOIN sources o ON o.id=s.source_id WHERE search MATCH ? AND (? IS NULL OR s.source_id=?) AND (? IS NULL OR json_extract(o.record,'$.date')>=?) AND (? IS NULL OR json_extract(o.record,'$.date')<=?)), ranked AS (SELECT *,row_number() OVER (PARTITION BY source_id ORDER BY score,id) source_rank FROM scored) SELECT * FROM ranked WHERE source_rank<=? ORDER BY score,id LIMIT ? OFFSET ?`,
+        "SELECT record FROM cues WHERE source_id=? AND json_extract(record,'$.textEnd')>? AND json_extract(record,'$.textStart')<? ORDER BY ordinal",
       )
-      .all(
-        tokens
-          .map((t) => `"${t}"`)
-          .join(options.match === "all" ? " AND " : " OR "),
-        options.source ?? null,
-        options.source ?? null,
-        options.dateFrom ?? null,
-        options.dateFrom ?? null,
-        options.dateTo ?? null,
-        options.dateTo ?? null,
-        options.perSource,
-        options.limit + 1,
-        options.offset,
+      .all(id, start, end)
+      .map((row) => JSON.parse(String(row.record)));
+  }
+  coverage() {
+    return {
+      release: this.release,
+      formatRevision: this.revision(),
+      capabilities: ["bm25", "find", "read-range"],
+      counts: this.counts(),
+      inventory: this.db
+        .prepare(
+          "SELECT status,reason,count(*) count FROM inventory GROUP BY status,reason ORDER BY status,reason",
+        )
+        .all(),
+      extractionDiagnostics:
+        this.revision() === 3
+          ? {
+              sources: Number(
+                this.db
+                  .prepare(
+                    "SELECT count(*) n FROM source_metadata WHERE json_array_length(json_extract(record,'$.diagnostics'))>0",
+                  )
+                  .get()?.n,
+              ),
+              entries: Number(
+                this.db
+                  .prepare(
+                    "SELECT coalesce(sum(json_array_length(json_extract(record,'$.diagnostics'))),0) n FROM source_metadata",
+                  )
+                  .get()?.n,
+              ),
+              warning:
+                "Partial subtitle extraction retains original text and lexical search. Inspect read metadata diagnostics before relying on cue payloads.",
+            }
+          : null,
+      qualities: this.db
+        .prepare(
+          "SELECT json_extract(record,'$.quality') quality,count(*) count FROM sources GROUP BY quality ORDER BY quality",
+        )
+        .all(),
+      unknownDates: Number(
+        this.db
+          .prepare(
+            "SELECT count(*) count FROM sources WHERE json_extract(record,'$.date') IS NULL",
+          )
+          .get()?.count,
+      ),
+      warning:
+        "Coverage describes admitted inputs. Exhausting matching sections never proves that relevant evidence is absent. Editions and duplicate sources are not independent evidence.",
+    };
+  }
+  readRange(id: string, start: number, end: number) {
+    const source = this.sourceRecord(id);
+    const text = this.original(source);
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 0 ||
+      end <= start ||
+      end > text.length ||
+      end - start > 20000 ||
+      safeBoundary(text, start) !== start ||
+      safeBoundary(text, end) !== end
+    )
+      throw new ClecError(
+        "INVALID_ARGUMENT",
+        "Range must be an exact UTF-16 interval of 1..20000 units, within the source and without splitting surrogate pairs.",
       );
+    return {
+      release: this.release,
+      sourceRef: `${this.release}:${id}`,
+      source,
+      start,
+      end,
+      offsetUnit: "utf16",
+      text: text.slice(start, end),
+      cues: this.cues(id, start, end),
+      metadata: this.revision() === 3 ? this.metadata(id) : null,
+    };
+  }
+  find(query: string, options: Paging & { source?: string }) {
+    if (!query || query.length > 512 || query.includes("\0"))
+      throw new ClecError(
+        "INVALID_QUERY",
+        "Literal find needs 1..512 UTF-16 units without NUL.",
+      );
+    const hits: {
+      sourceRef: string;
+      source: Source;
+      start: number;
+      end: number;
+      sectionRefs: string[];
+    }[] = [];
+    let count = 0;
+    for (const row of this.db
+      .prepare(
+        "SELECT id,record,original FROM sources WHERE (? IS NULL OR id=?) ORDER BY id",
+      )
+      .iterate(options.source ?? null, options.source ?? null)) {
+      const text = String(row.original);
+      const source = this.sourceRecordFromJson(String(row.record));
+      for (
+        let at = text.indexOf(query);
+        at >= 0;
+        at = text.indexOf(query, at + 1)
+      ) {
+        if (count++ < options.offset) continue;
+        hits.push({
+          sourceRef: `${this.release}:${source.id}`,
+          source,
+          start: at,
+          end: at + query.length,
+          sectionRefs: this.db
+            .prepare(
+              "SELECT id FROM sections WHERE source_id=? AND end>? AND start<? ORDER BY ordinal",
+            )
+            .all(source.id, at, at + query.length)
+            .map((s) => `${this.release}:${String(s.id)}`),
+        });
+        if (hits.length > options.limit)
+          return {
+            release: this.release,
+            query,
+            normalization: "none",
+            offsetUnit: "utf16",
+            hits: hits.slice(0, options.limit),
+            page: page(options, true),
+          };
+      }
+    }
+    return {
+      release: this.release,
+      query,
+      normalization: "none",
+      offsetUnit: "utf16",
+      hits,
+      page: page(options, false),
+    };
+  }
+  async search(query: string, options: SearchOptions): Promise<SearchPage> {
+    const tokens = queryTokens(query);
+    const terms = tokens.map((t) =>
+      Buffer.from(t.slice(1), "hex").toString("utf8"),
+    );
+    const ranked = rank(this.db, query, options);
     return {
       release: this.release,
       query,
@@ -372,7 +523,10 @@ export class Corpus {
         dateTo: options.dateTo ?? null,
         perSource: options.perSource,
       },
-      hits: rows.slice(0, options.limit).map((row) => {
+      hits: ranked.candidates.map((candidate) => {
+        const row = this.db
+          .prepare("SELECT * FROM sections WHERE id=?")
+          .get(candidate.id)!;
         const source = this.sourceRecord(String(row.source_id));
         const section = this.section(row, source);
         const original = this.original(source);
@@ -381,145 +535,25 @@ export class Corpus {
           sourceRef: `${this.release}:${source.id}`,
           source,
           section,
-          score: Number(row.score),
-          ...preview(original.slice(section.start, section.end), [
-            query,
-            ...terms,
-          ]),
+          score: candidate.score,
+          metadata: this.revision() === 3 ? this.metadata(source.id) : null,
+          cues: this.cues(source.id, section.start, section.end),
+          ...preview(original.slice(section.start, section.end), [query, ...terms]),
           warnings: this.warnings(source),
         };
       }),
-      page: page(options, rows.length > options.limit),
+      page: page(options, ranked.more),
     };
   }
   validate(manifest: Manifest): void {
-    const schema = this.db
-      .prepare(
-        "SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
-      )
-      .all();
-    const expected = new DatabaseSync(":memory:");
     try {
-      expected.exec(SCHEMA);
-      const expectedSchema = expected
-        .prepare(
-          "SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
-        )
-        .all();
-      if (JSON.stringify(schema) !== JSON.stringify(expectedSchema))
-        throw new ClecError("INVALID_PACKAGE", "Unexpected database schema.");
-    } finally {
-      expected.close();
-    }
-    if (
-      this.db.prepare("PRAGMA integrity_check").get()?.integrity_check !== "ok"
-    )
-      throw new ClecError("INVALID_PACKAGE", "SQLite integrity failed.");
-    const metadata = this.db
-      .prepare("SELECT key,value FROM metadata ORDER BY key")
-      .all();
-    if (
-      JSON.stringify(metadata) !==
-      JSON.stringify([
-        { key: "formatRevision", value: "1" },
-        { key: "segmentationRevision", value: SEGMENTATION_REVISION },
-      ])
-    )
-      throw new ClecError("INVALID_PACKAGE", "Unsupported corpus metadata.");
-    if (JSON.stringify(this.counts()) !== JSON.stringify(manifest.counts))
-      throw new ClecError("INVALID_PACKAGE", "Release counts mismatch.");
-    if (
-      this.db
-        .prepare(
-          "SELECT 1 FROM sources WHERE length(CAST(original AS BLOB))>100000000 OR length(CAST(record AS BLOB))>65536 LIMIT 1",
-        )
-        .get()
-    )
+      validateCorpus(this.db, manifest);
+    } catch (error) {
+      if (error instanceof ClecError) throw error;
       throw new ClecError(
         "INVALID_PACKAGE",
-        "Source exceeds admitted size bounds.",
+        `Corpus validation failed. ${error instanceof Error ? error.message : String(error)}`,
       );
-    if (
-      this.db
-        .prepare(
-          "SELECT 1 FROM inventory WHERE length(path)>4096 OR length(status)>64 OR length(reason)>4096 LIMIT 1",
-        )
-        .get()
-    )
-      throw new ClecError(
-        "INVALID_PACKAGE",
-        "Inventory exceeds metadata bounds.",
-      );
-    if (
-      this.db
-        .prepare(
-          "SELECT 1 FROM sources s LEFT JOIN inventory i ON i.path=json_extract(s.record,'$.path') WHERE i.path IS NULL OR i.status!='indexed' OR i.content_hash IS NULL OR i.content_hash!=json_extract(s.record,'$.contentHash') LIMIT 1",
-        )
-        .get() ||
-      Number(
-        this.db
-          .prepare("SELECT count(*) n FROM inventory WHERE status='indexed'")
-          .get()?.n,
-      ) !== manifest.counts.sources
-    )
-      throw new ClecError("INVALID_PACKAGE", "Inventory admission mismatch.");
-    let seenSections = 0;
-    for (const row of this.db
-      .prepare("SELECT * FROM sources ORDER BY id")
-      .iterate()) {
-      const source = parseSource(JSON.parse(String(row.record)));
-      const original = String(row.original);
-      if (
-        row.id !== source.id ||
-        row.version !== source.version ||
-        hash(Buffer.from(original, "utf8")) !== source.contentHash ||
-        !original.trim() ||
-        original.includes("\0")
-      )
-        throw new ClecError(
-          "INVALID_PACKAGE",
-          "Source hash or identity mismatch.",
-        );
-      let end = 0;
-      let order = 0;
-      for (const raw of this.db
-        .prepare(
-          "SELECT rowid,* FROM sections WHERE source_id=? ORDER BY ordinal",
-        )
-        .iterate(source.id)) {
-        const s = this.section(raw, source);
-        if (
-          s.order !== order++ ||
-          s.start !== end ||
-          !Number.isSafeInteger(s.end) ||
-          s.end <= s.start ||
-          s.end - s.start > 5000 ||
-          s.end > original.length ||
-          s.id !==
-            hash(
-              `${source.version}:${s.start}:${s.end}:${SEGMENTATION_REVISION}`,
-            )
-        )
-          throw new ClecError(
-            "INVALID_PACKAGE",
-            "Invalid exact section spans.",
-          );
-        end = s.end;
-        seenSections++;
-        const indexed = this.db
-          .prepare("SELECT rowid FROM search WHERE rowid=?")
-          .get(Number(raw.rowid));
-        if (!indexed)
-          throw new ClecError("INVALID_PACKAGE", "Missing FTS row.");
-      }
-      if (!order || end !== original.length)
-        throw new ClecError("INVALID_PACKAGE", "Incomplete original coverage.");
     }
-    if (
-      seenSections !== manifest.counts.sections ||
-      Number(this.db.prepare("SELECT count(*) n FROM search").get()?.n) !==
-        seenSections
-    )
-      throw new ClecError("INVALID_PACKAGE", "Orphan section or FTS rows.");
   }
 }

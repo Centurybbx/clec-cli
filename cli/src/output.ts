@@ -1,4 +1,5 @@
 import { ClecError, type ErrorCode } from "./contracts.js";
+import type { Corpus } from "./corpus.js";
 import type { CommandName, Format } from "./commands.js";
 import { help } from "./commands.js";
 import type {
@@ -11,6 +12,10 @@ import type {
 } from "./corpus.js";
 import type { StatusResult, SyncResult } from "./releases.js";
 export type CommandResult =
+  | { command: "guide"; data: { text: string } }
+  | { command: "coverage"; data: ReturnType<Corpus["coverage"]> }
+  | { command: "find"; data: ReturnType<Corpus["find"]> }
+  | { command: "read-range"; data: ReturnType<Corpus["readRange"]> }
   | { command: "help"; data: ReturnType<typeof help> }
   | { command: "version"; data: { version: string } }
   | { command: "sync"; data: SyncResult }
@@ -235,6 +240,12 @@ export function render(result: CommandResult, format: Format): string {
 }
 function renderText(result: CommandResult): string {
   switch (result.command) {
+    case "guide":
+      return result.data.text + "\n";
+    case "coverage":
+    case "find":
+    case "read-range":
+      return JSON.stringify(result.data, null, 2) + "\n";
     case "help":
       return (
         [

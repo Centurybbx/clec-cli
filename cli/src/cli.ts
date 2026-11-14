@@ -90,6 +90,16 @@ async function execute(invocation: Invocation): Promise<CommandResult> {
       );
     return { command: "version", data: { version: metadata.version } };
   }
+  if (command.kind === "guide")
+    return {
+      command: "guide",
+      data: {
+        text: await readFile(
+          new URL("../docs/agent-guide.md", import.meta.url),
+          "utf8",
+        ),
+      },
+    };
   const { sync, status, openCurrent } = await import("./releases.js");
   if (command.kind === "sync")
     return {
@@ -106,18 +116,32 @@ async function execute(invocation: Invocation): Promise<CommandResult> {
       : [];
   const parsedRefs = checkedRefs(refs);
   const expected =
-    command.kind === "source"
+    command.kind === "source" || command.kind === "read-range"
       ? command.ref.release
       : command.kind === "read"
         ? parsedRefs[0]?.release
-        : command.release;
+        : command.kind === "coverage"
+          ? undefined
+          : command.release;
   const corpus = await openCurrent(invocation.directory, expected);
   try {
     switch (command.kind) {
+      case "coverage":
+        return { command: "coverage", data: corpus.coverage() };
+      case "find":
+        return {
+          command: "find",
+          data: corpus.find(command.query, command.options),
+        };
+      case "read-range":
+        return {
+          command: "read-range",
+          data: corpus.readRange(command.ref.id, command.start, command.end),
+        };
       case "search":
         return {
           command: "search",
-          data: corpus.search(command.query, command.options),
+          data: await corpus.search(command.query, command.options),
         };
       case "sources":
         return {
@@ -144,7 +168,7 @@ async function execute(invocation: Invocation): Promise<CommandResult> {
       }
     }
   } finally {
-    corpus.close();
+    await corpus.close();
   }
 }
 const isPipeClosed = (error: unknown): boolean =>

@@ -1,90 +1,78 @@
-# CLEC CLI
+# CLEC offline evidence search
 
-Installable offline search and exact, original-backed reads for publisher-prepared CLEC evidence. Requires Node.js **22.19.0 or later**. No model, API key or running server is required.
+The CLI searches CLEC evidence with BM25 and reads exact original text. The host agent plans follow-up queries, compares sources, and writes the answer. Node.js 22.19.0 or later is required.
 
-## Install
+## Install and start
 
-Install the [0.2.0 trial package](https://github.com/Centurybbx/clec-cli/releases/tag/v0.2.0):
+Install the release tarball. This package is not published to the npm registry. Installation requires network access for npm dependencies or a prepared npm cache. After installation and corpus sync, search and reads run offline without Python, an API key, or a server.
 
 ```sh
-npm install --global https://github.com/Centurybbx/clec-cli/releases/download/v0.2.0/clec-cli-0.2.0.tgz
-clec --help
-clec status
+npm install --prefix /tmp/clec https://github.com/Centurybbx/clec-cli/releases/download/v0.3.0/clec-cli-0.3.0.tgz
+/tmp/clec/node_modules/.bin/clec --help
+/tmp/clec/node_modules/.bin/clec sync --manifest /absolute/path/to/release/manifest.json
+/tmp/clec/node_modules/.bin/clec guide research
 ```
 
-To build from source instead:
+No public corpus manifest endpoint is supplied. Obtain a publisher manifest separately. Choose a corpus directory with `--data-dir PATH` or `CLEC_DATA_DIR`; the default is `~/.local/share/clec`. Repeat `clec sync` to use the last successful origin.
 
 ```sh
-git clone https://github.com/Centurybbx/clec-cli.git
-cd clec-cli
-npm ci
-npm link
-clec version
-clec help
+clec coverage --format json
+clec sources '退休' --format json
+clec search '退休 生活費' --format json
+clec search '退休 現金' --match all --format json
+clec source 'RELEASE:SOURCE' --limit 20 --format json
+clec read 'RELEASE:SECTION' --context 1 --format json
+clec find '每年提領' --format json
+clec read-range 'RELEASE:SOURCE' --start 0 --end 200 --format json
 ```
 
-`npm ci` also builds through the package's `prepare` script. A publisher-provided `.tgz` package can instead be installed with `npm install --global /path/to/clec-cli-0.2.0.tgz`. The public repository supplies CLI code; **it does not supply a corpus or a public manifest endpoint**. Obtain a release manifest from your corpus publisher. No npm registry publication is implied.
+Copy real references from returned results. A reference binds a section or source to the active release SHA-256. Updating the corpus makes old references unavailable. Restart discovery and pagination after `VERSION_UNAVAILABLE`.
 
-The installed executable selectively suppresses Node's experimental-feature warning using `--disable-warning=ExperimentalWarning`. When invoking JavaScript directly, use `node --disable-warning=ExperimentalWarning dist/cli.js ...` to keep machine stderr clean. The normal supported entry point is `clec`. Platform coverage is recorded by the release checks; do not assume untested platforms work.
+## Search and read contracts
 
-## Set up and explore
+Search normalizes traditional and simplified characters and uses SQLite FTS5 BM25 with title weight 4 and section text weight 1. Source and date filters apply to all matching sections. Each source contributes at most `--per-source` sections, default two, selected by BM25. Results sort by ascending SQLite BM25 score, then section ID; lower scores rank first. Pagination follows this per-source cap across the complete filtered match set. This preserves the 0.2 BM25 ranking and pagination behavior.
 
-```sh
-clec status
-clec sync --manifest /path/to/release/manifest.json
-clec sync                         # reuse the last successful origin
-clec sources '退休'
-clec search '退休 提領' --limit 8
-clec search '退休 現金' --match all --per-source 2
-clec source 'RELEASE:SOURCE' --limit 20
-clec read 'RELEASE:SECTION' --context 1
-clec help search
-```
+A null `page.nextOffset` exhausts the matches allowed by these options; it does not establish that no other relevant evidence exists. There is no fixed candidate limit. Repeat identical options with `--release HASH` when paging. Date filters exclude unknown dates. `coverage` reports admission outcomes, quality labels, extraction diagnostics, and unknown dates.
 
-Use actual `ref` and `sourceRef` values returned by discovery/search. Every command accepts `--data-dir PATH` before or after the command. The default is `~/.local/share/clec`, overridable with `CLEC_DATA_DIR`. `status` succeeds before setup and shows the next command. `sync` remembers an explicit local absolute path or validated URL only after success. If saving the origin fails after activation, its error names the active release; fix the filesystem and repeat explicit sync.
+`--match any` uses token OR; `--match all` uses token AND. Neither is phrase matching. Queries allow 1..512 UTF-16 units and at most 64 distinct tokens. Search uses literal token overlap and cannot discover evidence solely through conceptual similarity. Vary terminology and follow source references across multiple rounds. There is no search mode option. Existing format 1 corpora remain searchable; new publications use format 3. Trial format 2 is rejected explicitly and must be rebuilt.
 
-Search uses traditional/simplified normalization and lexical tokens. `any` is token OR; `all` requires every generated token in a section's indexed title/body, **not an exact phrase**. Query limits fail explicitly: 1..512 UTF-16 units and at most 64 lexical tokens. `--source` accepts a raw source ID or a full source ref. Date filters (`--date-from`, `--date-to`) are inclusive and exclude sources with unknown dates.
+`find` uses exact original substrings without normalization. It reports original UTF-16 offsets and overlapping section references. `read-range` accepts a source reference and an interval of 1..20000 UTF-16 units. It rejects intervals that split a surrogate pair.
 
-`sources [QUERY]` searches existing titles and full paths with all normalized whitespace terms as literal substrings. It keeps edition rows separate. Source metadata includes date basis, stored quality and section count. Search defaults to at most two sections per source, applied across the full ranked result before pagination. Change `--per-source 1..50` when needed.
+`read` returns exact originals and up to two neighboring sections on each side. Each context section carries its own reference. Subtitle originals retain timestamps and markup. Cue metadata reports subtitle-file times and original text offsets; these times are not verified video seek locations. Partial cue extraction retains the whole original for search and reads, with diagnostics in read metadata and coverage.
 
-`search`, `sources` and `source` accept `--limit 1..50` and `--offset 0..10000000`. Defaults are 8 search hits or 20 source/section entries. Repeat identical options and the returned release (`--release HASH` for search/sources) with `page.nextOffset`; a null next offset marks the end. Source refs already pin their release. Updates replace the active release, so old refs and page guards fail with `VERSION_UNAVAILABLE`; discover again and restart paging.
+Source metadata distinguishes unverified transcripts, mixed summary pages, and introductions with comments. Source type and quality labels never establish who spoke. Repeated editions and pages describing one episode are not independent witnesses. Search previews help navigation; cite text actually read.
 
-## Compose with an agent or shell
+## Output and lifecycle
 
-Text is the deterministic default, including when piped. Request JSON explicitly:
+Text is the default, including in pipes. Explicit JSON produces one stdout document with `{schemaVersion:1,ok:true,command,data}`. Errors leave stdout empty and write `{schemaVersion:1,ok:false,command,error}` to stderr. Single and batch `read` results always use `data.items`. A batch preserves input order and duplicates and fails atomically.
 
 ```sh
-clec search '退休 提領' --format json |
+clec search '退休 提領' --limit 3 --format json |
   jq -r '.data.hits[].ref' |
-  clec read --stdin --context 1 --format json
-
-clec sources '退休' --format json | jq '.data.items[] | {title,path,sourceRef}'
+  clec read --stdin --format json
 ```
 
-JSON success is one newline-terminated document: `{schemaVersion:1,ok:true,command,data}`. Errors leave stdout empty and write `{schemaVersion:1,ok:false,command,error:{code,message,remedy}}` to stderr in JSON mode. Text errors expose the same code, message and recovery action. Errors may add zero-based `inputIndex` or an activated `release` when relevant.
+Handle an empty hit list before calling `read --stdin`. Stdin accepts 1..50 newline references and at most 64 KiB. `clec help COMMAND` lists bounds and options. Run `clec guide research` for the packaged multi-round evidence workflow.
 
-`read` always returns `data.items`, even for one ref. It preserves order and duplicates and verifies the whole batch before writing any result. Supply 1..50 positional refs **or** `--stdin`, never both. Explicit stdin accepts at most 64 KiB of UTF-8 newline refs, ignores blank lines, and rejects interactive input, malformed refs and mixed releases. Empty search/discovery results succeed; a pipe without any hits needs to handle the resulting empty ref list before invoking `read`.
+Sync verifies one SQLite artifact, including its exact schema, source identities and hashes, complete section coverage, and format 3 extraction metadata/cues, before atomically activating it. Failed transfer or validation retains the previous active release. Artifacts are capped at 2 GiB. Incoming transfer requires its bytes plus 5 GiB reserve. The CLI keeps only the current corpus and does not promise archival reference retention.
 
-Exit statuses: 0 success (including zero hits and a downstream closed pipe); 2 invalid usage/input; 3 unavailable evidence/release or missing setup; 4 lock/transfer/filesystem failure; 5 package/integrity failure; 1 unexpected internal error; 130 interruption.
+Exit codes are 0 for success, 2 for invalid input, 3 for unavailable data, 4 for transfer or filesystem failures, 5 for package integrity failures, 1 for unexpected errors, and 130 for interruption.
 
-Version 0.2 changes the 0.1 wire interface: text is now the default, JSON fields live under `data`, and single reads use `data.items[0]`. The corpus schema and release-qualified reference encoding are unchanged.
+## Build a publisher release
 
-## Cite evidence
-
-Read results preserve exact original text, UTF-16 start/end spans and content hashes. Context defaults to one neighboring section on each side (`--context 0..2`), each separately cited with its own ref and span. Context never silently expands the requested section. Search previews center on an original literal match when safely located; otherwise `previewKind: "leading"` labels a leading excerpt. Previews are navigation, not answers.
-
-Preserve source date, quality, speaker attribution and qualifying conditions. Keep episode identifiers when refining queries; discover their source, inspect sections, then search within that source. Empty results do not establish that a topic is absent. See the [agent guide](docs/agent-guide.md) for the complete navigation workflow.
-
-Only sync accesses the network. Manifests use explicit local paths or HTTPS (HTTP only for loopback); credentials, fragments and protocol downgrades are rejected. Downloads verify length, SHA-256, schema and original spans before activation. Failed transfers retain the previous active release. Storage keeps one active corpus plus a bounded incoming candidate, caps artifacts at 2 GiB, and requires another 5 GiB free before transfer. Original corpus files are not included in this package.
-
-## Development
+From the repository root:
 
 ```sh
-npm ci
-npm run typecheck
-npm run build
-npm test
-npm pack
+npm ci --prefix cli
+npm run typecheck --prefix cli
+npm test --prefix cli
+node cli/dist/publisher.js \
+  --workspace "$PWD" \
+  --intake /absolute/path/to/intake.json \
+  --output /absolute/path/to/new-release
+npm pack ./cli
 ```
 
-Smoke checks publish a tiny authored fixture and run real CLI processes. The publisher is available as `npm run build:corpus`; normal users consume an existing release and need no local corpus build. The CLI provides evidence retrieval, not an automated answering service.
+The publisher requires a new output directory and an intake with `schemaVersion: 1` and a `sources` array. Each source records `path`, `title`, `type`, `quality`, and `status`; known dates require `date` and `dateBasis`. It admits ready UTF-8 `.md`, `.txt`, `.srt`, `.str`, and `.vtt` sources. Subtitle files need at least one usable cue. Unsupported formats require upstream text extraction. Quarantine, missing files, unsupported encodings, empty sources, and metadata-only records remain visible in inventory rather than silently becoming evidence. Optional `--artifact-url URL` sets the manifest download URL.
+
+Tests use tiny authored fixtures to verify build, sync, search, exact reads, subtitle diagnostics, rollback, and format compatibility. They do not establish full-corpus retrieval quality or support for untested platforms.

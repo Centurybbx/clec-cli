@@ -67,9 +67,12 @@ export async function driveDocuments(ctx: CatalogueContext): Promise<void> {
 
 export async function clectw(ctx: CatalogueContext): Promise<void> {
   const file = 'collection/web/clectw/episode-inventory.jsonl';
+  const episodeTitles = new Map<string, string>();
   await ctx.metadata(file, 'clectw-metadata');
   for (const { data: row, reference } of await ctx.records(file)) {
     if (!ctx.require(row, ['url', 'episode_id', 'status', 'transcript_status'], reference)) continue;
+    const episodeTitle = string(row.title);
+    if (episodeTitle) episodeTitles.set(string(row.url)!, episodeTitle);
     const path = string(row.transcript);
     const entry = await ctx.add({ family: 'clectw-transcripts', reference, record: row,
       ...(path ? { path } : {}), title: string(row.title) ?? string(row.episode_id)!, type: 'transcript',
@@ -78,8 +81,7 @@ export async function clectw(ctx: CatalogueContext): Promise<void> {
     ctx.relate(entry, string(row.url)!, 'extracted_from', 'episode inventory transcript path, not mentions_transcript heuristic');
     if (string(row.html)) ctx.relate(entry, string(row.html)!, 'extracted_from', `saved HTML; declared SHA-256 ${String(row.html_sha256 ?? 'unknown')}`);
   }
-  // Page extracts include AI summaries and navigation, so never substitute them for transcripts.
-  await webManifest(ctx, 'clectw');
+  await webManifest(ctx, 'clectw', episodeTitles);
   const audit = 'collection/web/clectw/transcript-quality-audit.jsonl';
   await ctx.metadata(audit, 'clectw-metadata');
   for (const { data: row, reference } of await ctx.records(audit)) {
@@ -92,7 +94,7 @@ export async function clectw(ctx: CatalogueContext): Promise<void> {
   }
 }
 
-export async function webManifest(ctx: CatalogueContext, site: 'clec168' | 'cfnavi' | 'clectw'): Promise<void> {
+export async function webManifest(ctx: CatalogueContext, site: 'clec168' | 'cfnavi' | 'clectw', episodeTitles?: ReadonlyMap<string, string>): Promise<void> {
   const file = `collection/web/${site}/manifest.jsonl`;
   await ctx.metadata(file, `${site}-metadata`);
   for (const { data: row, reference } of await ctx.records(file)) {
@@ -101,11 +103,13 @@ export async function webManifest(ctx: CatalogueContext, site: 'clec168' | 'cfna
     let pathname: string;
     try { pathname = new URL(url).pathname; }
     catch { ctx.issue(file, 'invalid_url', url, reference.record); continue; }
-    const listing = site === 'clectw' || /\/(?:page|category)(?:\/|$)/.test(pathname) || !/^\/(?:blog|docs|database|video)\/.+/.test(pathname) && site === 'clec168';
+    const episodePage = site === 'clectw' && /^\/ep\/[^/]+\/?$/.test(pathname);
+    const listing = site === 'clectw' && !episodePage || /\/(?:page|category)(?:\/|$)/.test(pathname) || !/^\/(?:blog|docs|database|video)\/.+/.test(pathname) && site === 'clec168';
     const video = site === 'clec168' && pathname.startsWith('/video/');
-    const family = listing ? `${site}-metadata` : video ? 'clec168-video-introductions-comments' : site === 'cfnavi' ? 'cfnavi-curated' : 'clec168-body-extracts';
-    let title = string(row.title) ?? url;
-    if (!string(row.title) && !listing && string(row.text)) {
+    const family = listing ? `${site}-metadata` : episodePage ? 'clectw-mixed-episode-pages' : video ? 'clec168-video-introductions-comments' : site === 'cfnavi' ? 'cfnavi-curated' : 'clec168-body-extracts';
+    const episodeTitle = episodePage ? episodeTitles?.get(url) : undefined;
+    let title = string(row.title) ?? episodeTitle ?? url;
+    if (!string(row.title) && !episodeTitle && !listing && string(row.text)) {
       try {
         const lines = (await ctx.text(string(row.text)!)).split(/\r?\n/).map(line => line.trim())
           .filter(line => line && !/^(?:来源|來源|采集时间|採集時間)\s*[:：]/.test(line) && !/^\[[\w-]+\]$/.test(line));
@@ -113,10 +117,10 @@ export async function webManifest(ctx: CatalogueContext, site: 'clec168' | 'cfna
         if (first) title = (/^\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2}$/.test(first) ? lines.slice(0, 2).join(' ') : first).slice(0, 1000);
       } catch { /* ctx.add below records missing/read/encoding failures against this record. */ }
     }
-    const entry = await ctx.add({ family, reference, record: { ...row, catalogue_title_basis: title === url ? 'url_fallback' : string(row.title) ? 'manifest_title' : 'saved_body_heading' }, ...(string(row.text) ? { path: string(row.text)! } : {}),
-      title, type: listing || video ? 'metadata' : 'curated',
-      quality: video ? 'video_introduction_and_comments_not_transcript' : site === 'cfnavi' ? 'third_party_course_summary_unverified' : 'website_body_extract_unverified_may_include_comments',
-      origin: url, ...(listing || video ? { category: 'metadata_only' as const, reason: video ? 'intro_comments_not_transcript' : 'listing_or_mixed_page_not_transcript' } : {}), ...state(row) });
+    const entry = await ctx.add({ family, reference, record: { ...row, catalogue_title_basis: title === url ? 'url_fallback' : string(row.title) ? 'manifest_title' : episodeTitle ? 'episode_inventory_title' : 'saved_body_heading' }, ...(string(row.text) ? { path: string(row.text)! } : {}),
+      title, type: listing ? 'metadata' : 'curated',
+      quality: episodePage ? 'mixed_episode_page_ai_summary_navigation_not_verified_speech' : video ? 'video_introduction_and_comments_not_transcript' : site === 'cfnavi' ? 'third_party_course_summary_unverified' : 'website_body_extract_unverified_may_include_comments',
+      origin: url, ...(listing ? { category: 'metadata_only' as const, reason: 'listing_not_evidence_body' } : {}), ...state(row) });
     ctx.relate(entry, url, 'extracted_from', 'collection web manifest; page body may include comments');
     if (string(row.html)) {
       ctx.relate(entry, string(row.html)!, 'extracted_from', 'saved original HTML path');
@@ -180,9 +184,14 @@ export async function machineExtractions(ctx: CatalogueContext): Promise<void> {
         ...state(row), ...(group === 'quarantine' ? { category: 'quarantined' as const, reason: 'quarantine_do_not_use' } : {}) });
       ctx.relate(entry, origin, 'extracted_from', 'metadata media URL and checksum; TXT has no inferred timestamps');
       for (const sibling of files.filter(n => n.startsWith(`${id}.`) && n !== `${id}.txt`).sort(compare)) {
-        await ctx.add({ family: group, reference, record: row, path: `${dir}/${sibling}`, title: sibling, type: 'metadata', quality: 'machine_output_sidecar_unverified', origin,
-          category: group === 'quarantine' || quarantined(row.status) ? 'quarantined' : /\.(srt|str|vtt)$/.test(sibling) ? 'unsupported' : 'metadata_only',
-          reason: /\.(srt|str|vtt)$/.test(sibling) ? 'subtitle_locator_interface_required' : 'machine_output_sidecar' });
+        const subtitle = /\.(srt|str|vtt)$/i.test(sibling);
+        await ctx.add({ family: group, reference, record: row, path: `${dir}/${sibling}`, title: sibling,
+          type: subtitle ? 'transcript' : 'metadata',
+          quality: subtitle ? 'local_machine_subtitle_unverified_no_verified_speakers' : 'machine_output_sidecar_unverified', origin,
+          ...(subtitle ? { reason: 'subtitle_requires_publisher_cue_validation', ...state(row) }
+            : { category: 'metadata_only' as const, reason: 'machine_output_sidecar' }),
+          ...(group === 'quarantine' || quarantined(row.status)
+            ? { category: 'quarantined' as const, reason: 'quarantine_do_not_use' } : {}) });
       }
     }
   }

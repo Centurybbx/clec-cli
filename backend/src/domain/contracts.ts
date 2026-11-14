@@ -4,7 +4,11 @@ export interface IntakeSource {
   path: string; title: string; type: SourceType; quality: string; status: IntakeStatus;
   date?: string; dateBasis?: string; origin?: string;
 }
-export interface IntakeManifest { schemaVersion: 1; sources: IntakeSource[] }
+export interface IntakeManifest {
+  schemaVersion: 1;
+  sources: IntakeSource[];
+  inventory?: { path: string; status: string; reason: string }[];
+}
 export interface Source extends Omit<IntakeSource, 'date' | 'dateBasis'> {
   id: string; version: string; contentHash: string; date: string | undefined;
   dateBasis: string | undefined;

@@ -10,6 +10,26 @@ import {
 } from "./contracts.js";
 export type Format = "text" | "json";
 export const descriptors = {
+  guide: {
+    usage: "guide research",
+    summary: "Read the packaged multi-round research guide.",
+    options: [],
+  },
+  coverage: {
+    usage: "coverage",
+    summary: "Report input admission, source roles and unknown dates.",
+    options: [],
+  },
+  find: {
+    usage: "find LITERAL [OPTIONS]",
+    summary: "Exact original-text literal search without normalization.",
+    options: ["source", "limit", "offset", "release"],
+  },
+  "read-range": {
+    usage: "read-range SOURCE_REF --start N --end N",
+    summary: "Read an exact UTF-16 original interval.",
+    options: ["start", "end"],
+  },
   help: {
     usage: "help [COMMAND]",
     summary: "Describe commands and options.",
@@ -73,6 +93,20 @@ export const isCommand = (value: string): value is CommandName =>
   Object.hasOwn(descriptors, value);
 import type { Paging, SearchOptions } from "./corpus.js";
 type Command =
+  | { kind: "guide" }
+  | { kind: "coverage" }
+  | {
+      kind: "find";
+      query: string;
+      options: Paging & { source?: string };
+      release?: string;
+    }
+  | {
+      kind: "read-range";
+      ref: ReturnType<typeof reference>;
+      start: number;
+      end: number;
+    }
   | { kind: "help"; topic?: CommandName }
   | { kind: "version" }
   | { kind: "status" }
@@ -91,6 +125,8 @@ export interface Invocation {
   directory: string;
 }
 const optionHelp: Record<string, string> = {
+  start: "inclusive UTF-16 offset",
+  end: "exclusive UTF-16 offset (at most 20000 units)",
   manifest: "PATH|URL (no default public manifest; saved after success)",
   match: "any|all (default any)",
   limit: "1..50 (search 8; sources/source 20)",
@@ -129,7 +165,7 @@ export function help(topic?: CommandName) {
       "Repeat identical query/options and the returned --release with page.nextOffset. Empty results do not establish corpus absence.",
     runtime: "Node >=22.19.0",
     migration:
-      "0.2: explicit --format json uses schemaVersion 1 and data; read always returns data.items.",
+      "0.3: BM25 search supports format 1 and 3 corpora. Run clec guide research. JSON remains schemaVersion 1; reads use data.items.",
   };
 }
 export function requestedFormat(argv: string[]): Format {
@@ -251,6 +287,44 @@ export function parseInvocation(argv: string[]): Invocation {
   if (release !== undefined && !isHash(release))
     throw new ClecError("INVALID_ARGUMENT", "--release requires a SHA-256.");
   switch (name) {
+    case "guide":
+      count(1);
+      if (args[0] !== "research")
+        throw new ClecError("INVALID_ARGUMENT", "Use clec guide research.");
+      return finish({ kind: "guide" });
+    case "coverage":
+      count(0);
+      return finish({ kind: "coverage" });
+    case "read-range":
+      count(1);
+      return finish({
+        kind: "read-range",
+        ref: reference(args[0] ?? ""),
+        start: numeric("start", -1, 0, 100_000_000),
+        end: numeric("end", -1, 1, 100_000_000),
+      });
+    case "find": {
+      count(1);
+      const rawSource = string("source");
+      let source = rawSource;
+      let pinned = release;
+      if (rawSource?.includes(":")) {
+        const ref = reference(rawSource);
+        source = ref.id;
+        if (pinned && pinned !== ref.release)
+          throw new ClecError("INVALID_ARGUMENT", "Source/release mismatch.");
+        pinned = ref.release;
+      }
+      if (source && !isHash(source))
+        throw new ClecError("INVALID_ARGUMENT", "Invalid source reference.");
+      return finish({
+        kind: "find",
+        query: args[0] ?? "",
+        options: { ...paging(20), ...(source ? { source } : {}) },
+        ...(pinned ? { release: pinned } : {}),
+      });
+    }
+
     case "help": {
       count(0, 1);
       const topic = args[0];

@@ -78,11 +78,14 @@ export async function catalogueCorpus(workspaceRoot: string): Promise<CorpusCata
     const family = families[entry.family] ??= emptyCoverage();
     count(family, entry); count(total, entry);
   }
-  return { schemaVersion: 1, manifest: { schemaVersion: 1, sources }, entries: ctx.entries,
+  const inventory = ctx.entries.filter(entry => entry.selected && entry.path !== undefined)
+    .flatMap(entry => entry.path === undefined ? [] : [{ path: entry.path, status: entry.category, reason: entry.reason }]);
+  return { schemaVersion: 1, manifest: { schemaVersion: 1, sources, inventory }, entries: ctx.entries,
     relationships: ctx.relationships, coverage: { families, total, complete: false }, issues: ctx.issues,
     limitations: [
       'Coverage is of explicit collected manifests and curated knowledge, not the entire web or every original local asset. Counts are records/representations, not independent episodes.',
-      'Only available UTF-8 TXT/MD are searchable. SRT/STR/VTT, binaries, remote media and metadata require additional core extraction/locator interfaces.',
+      'Available UTF-8 TXT/MD and SRT/STR/VTT are eligible for publishing. Subtitle syntax and cue mappings require publisher validation; ready is not proof of indexing. Binaries, remote media and metadata listings remain outside evidence text.',
+      'Episode page extracts and video introductions/comments are searchable as explicitly labelled secondary or mixed material, never substituted for verified teacher speech.',
       'No content-equivalence deduplication is performed. Archive formats and candidate episode/title relationships remain distinct.',
       'Unambiguous source-title dates use source_title; declared manifest and curated frontmatter dates retain their own basis. These are not verified recording dates. Collection and modification times are never publication dates; absent or ambiguous dates remain unknown.',
       'Automatic transcripts, OCR, extracted documents, website bodies and third-party curated interpretations have not been independently verified.',

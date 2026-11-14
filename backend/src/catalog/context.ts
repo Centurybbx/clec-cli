@@ -152,8 +152,8 @@ export class CatalogueContext {
         entry.category = 'error'; entry.reason = 'manifest_hash_mismatch';
         this.issue(reference.file, 'hash_mismatch', path, reference.record);
       } else if (entry.category === 'ready') {
-        if (!['.txt', '.md'].includes(extname(path).toLowerCase())) {
-          entry.category = 'unsupported'; entry.reason = 'core_accepts_txt_md_only';
+        if (!['.txt', '.md', '.srt', '.str', '.vtt'].includes(extname(path).toLowerCase())) {
+          entry.category = 'unsupported'; entry.reason = 'text_or_subtitle_extraction_required';
         } else {
           const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
           if (!text.trim()) { entry.category = 'empty'; entry.reason = 'empty_text'; }

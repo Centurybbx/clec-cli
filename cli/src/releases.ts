@@ -239,9 +239,11 @@ async function acquire(directory: string): Promise<() => Promise<void>> {
         await rm(path, { force: true });
       };
     } catch (error) {
-      if (
-        !(error instanceof Error && "code" in error && error.code === "EEXIST")
-      )
+      if (!(
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "EEXIST"
+      ))
         throw error;
       const recoveryPath = join(directory, ".sync.recovery");
       let recovery;
@@ -369,7 +371,7 @@ export async function status(directory: string): Promise<StatusResult> {
         managedBytes: await managedBytes(directory),
       };
     } finally {
-      corpus.close();
+      await corpus.close();
     }
   } catch (error) {
     if (!(error instanceof ClecError && error.code === "NO_DATA")) throw error;
@@ -482,6 +484,11 @@ export async function sync(
           if (digest.digest("hex") === active) {
             const corpus = new Corpus(local, active);
             try {
+              if (corpus.revision() !== manifest.formatRevision)
+                throw new ClecError(
+                  "INVALID_PACKAGE",
+                  "Manifest format does not match the installed corpus.",
+                );
               const counts = corpus.counts();
               if (JSON.stringify(counts) !== JSON.stringify(manifest.counts))
                 throw new ClecError(
@@ -495,7 +502,7 @@ export async function sync(
                 reused: true,
               });
             } finally {
-              corpus.close();
+              await corpus.close();
             }
           }
         }
@@ -532,7 +539,7 @@ export async function sync(
     try {
       corpus.validate(manifest);
     } finally {
-      corpus.close();
+      await corpus.close();
     }
     if (active === manifest.sha256) {
       await rename(candidate, join(directory, `${active}.sqlite`));
