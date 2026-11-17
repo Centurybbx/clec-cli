@@ -44,3 +44,13 @@ All checks below ran against committed clean code head `39a12b77e6c8398a7d153621
 - HTTP manifest/artifact bootstrap (Phase 4), SAG2 synthesis (Phase 5), and cross-OS Linux/Windows verification (Phase 6) remain unimplemented and out of scope.
 - `evaluation/clec-v1/verify_phase1.py` pins `clec-native-v1` schema strings and uncollapsed `00318`/`00575` counts from Phase 1; Phase 1 behavioral regressions are verified under `clec-native-v2` by `native/` unit tests and `evaluation/clec-v1/phase2/verify_phase2.py`.
 - Independent Astra acceptance review of the final committed head is pending parent-thread coordination.
+
+## Post-review corrections (`f4d04a7` audit)
+
+Independent review of head `f4d04a7` confirmed three defects in the Phase 2 build and reporting record:
+
+1. **Deleted `a409...` capacity artifacts and unproved table-content claim.** The `.sqlite` and `.sqlite.zst` artifacts produced during the `a4091fa6...` run (`39a12b7`) were removed after capture, leaving only `capacity-report.json` and the `/usr/bin/time -l` logs. Because those artifacts are absent and only aggregate counts were compared, the prior claim that all table row contents matched `5b14` is unproved.
+2. **Scoped component estimate vs. full filesystem upper bound.** The `3,001,600,396` B figure covers only `sqliteBytes`, `compressedZstBytes`, two `PostingBuckets` sets, and a `65,536` B allowance. It excludes SQLite rollback/WAL/SHM journals, SQLite temp sort files, filesystem block-allocation slack, and OS temp buffers. The `50` ms directory poll captures a sampled lower bound on transient disk usage, not a mathematical upper bound.
+3. **Non-deterministic `source_canonical_map` insertion order.** `native/src/snapshot.rs` iterated a `HashMap` of equivalence groups before inserting rows into `source_canonical_map`, producing distinct `corpus.sqlite` and `corpus.sqlite.zst` SHA-256 digests across identical runs.
+
+Fixes, retained deterministic full-corpus artifacts, and a streaming semantic digest comparison against the preserved `5b14` snapshot are tracked in `docs/agent-work/clec-native/phase2-issues.md`.
