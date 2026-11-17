@@ -766,15 +766,16 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                 ));
             }
             let prepared = prepare_search_request(args)?;
-            let min_bytes =
-                minimum_search_envelope_bytes(cli.sag2, &prepared, use_json, max_bytes)?;
-            if max_bytes < min_bytes {
-                return Err(ClecError::new(
-                    ErrorCode::OutputBudgetTooSmall,
-                    format!(
-                        "Output requires at least {min_bytes} UTF-8 bytes, exceeding --max-bytes {max_bytes}."
-                    ),
-                ));
+            if cli.sag2 {
+                let min_bytes = minimum_sag2_search_envelope_bytes(&prepared, use_json, max_bytes)?;
+                if max_bytes < min_bytes {
+                    return Err(ClecError::new(
+                        ErrorCode::OutputBudgetTooSmall,
+                        format!(
+                            "Output requires at least {min_bytes} UTF-8 bytes, exceeding --max-bytes {max_bytes}."
+                        ),
+                    ));
+                }
             }
             let mode = authorize_search_mode(cli, args)?;
             let mut store = ensure_current_store(
@@ -968,39 +969,16 @@ where
     ))
 }
 
-fn minimum_search_envelope_bytes(
-    sag2: bool,
+fn minimum_sag2_search_envelope_bytes(
     prepared: &PreparedSearch,
     use_json: bool,
     max_bytes: usize,
 ) -> Result<usize, ClecError> {
-    if sag2 {
-        let min_data = minimum_sag2_search_data(prepared, max_bytes);
-        if use_json {
-            Ok(serialize_envelope("search", &SearchOutputRef::Sag2(&min_data))?.len())
-        } else {
-            Ok(format_sag2_search_text(&min_data).len())
-        }
+    let min_data = minimum_sag2_search_data(prepared, max_bytes);
+    if use_json {
+        Ok(serialize_envelope("search", &SearchOutputRef::Sag2(&min_data))?.len())
     } else {
-        let min_release = ReleaseHash::parse(&"0".repeat(64))?;
-        let min_data = SearchData {
-            release: min_release,
-            match_mode: prepared.match_mode,
-            queries: prepared.queries.clone(),
-            total_candidates: 0,
-            hits: Vec::new(),
-            budget: BudgetReport {
-                max_bytes,
-                used_bytes: 0,
-                omitted_count: 0,
-                omitted_ids: Vec::new(),
-            },
-        };
-        if use_json {
-            Ok(serialize_envelope("search", &SearchOutputRef::Local(&min_data))?.len())
-        } else {
-            Ok(format_search_text(&min_data).len())
-        }
+        Ok(format_sag2_search_text(&min_data).len())
     }
 }
 
@@ -2012,19 +1990,6 @@ mod tests {
         let err_sag2 = dispatch(&sag2_cli, true, &RuntimeOptions::shipped()).unwrap_err();
         assert_eq!(err_sag2.code, ErrorCode::OutputBudgetTooSmall);
         assert!(err_sag2.sag2_stage.is_none());
-
-        let local_cli = Cli::try_parse_from([
-            "clec",
-            "--data-dir",
-            &dir_arg,
-            "--max-bytes",
-            "1",
-            "search",
-            "anchor",
-        ])
-        .unwrap();
-        let err_local = dispatch(&local_cli, true, &RuntimeOptions::shipped()).unwrap_err();
-        assert_eq!(err_local.code, ErrorCode::OutputBudgetTooSmall);
         assert!(!cold_dir.exists());
     }
 
@@ -2045,46 +2010,39 @@ mod tests {
         })
         .unwrap();
 
-        for sag2 in [false, true] {
-            for use_json in [false, true] {
-                let min_b =
-                    minimum_search_envelope_bytes(sag2, &prepared, use_json, DEFAULT_MAX_BYTES)
-                        .unwrap();
-                let at_min =
-                    minimum_search_envelope_bytes(sag2, &prepared, use_json, min_b).unwrap();
-                assert!(at_min <= min_b, "sag2={sag2} use_json={use_json}");
+        for use_json in [false, true] {
+            let min_b =
+                minimum_sag2_search_envelope_bytes(&prepared, use_json, DEFAULT_MAX_BYTES).unwrap();
+            let at_min = minimum_sag2_search_envelope_bytes(&prepared, use_json, min_b).unwrap();
+            assert!(at_min <= min_b, "use_json={use_json}");
 
-                let tmp = tempfile::tempdir().unwrap();
-                let cold = tmp.path().join("cold_bound");
-                let mut argv = vec![
-                    "clec".to_owned(),
-                    "--data-dir".to_owned(),
-                    cold.display().to_string(),
-                    "--max-bytes".to_owned(),
-                    (at_min - 1).to_string(),
-                    "search".to_owned(),
-                    "anchor".to_owned(),
-                ];
-                if sag2 {
-                    argv.push("--sag2".to_owned());
-                    argv.push("--key-file".to_owned());
-                    argv.push(tmp.path().join("missing.key").display().to_string());
-                }
-                let cli_under = Cli::try_parse_from(&argv).unwrap();
-                let err_under =
-                    dispatch(&cli_under, use_json, &RuntimeOptions::shipped()).unwrap_err();
-                assert_eq!(err_under.code, ErrorCode::OutputBudgetTooSmall);
-                assert!(!cold.exists());
+            let tmp = tempfile::tempdir().unwrap();
+            let cold = tmp.path().join("cold_bound");
+            let mut argv = vec![
+                "clec".to_owned(),
+                "--data-dir".to_owned(),
+                cold.display().to_string(),
+                "--max-bytes".to_owned(),
+                (at_min - 1).to_string(),
+                "search".to_owned(),
+                "anchor".to_owned(),
+                "--sag2".to_owned(),
+                "--key-file".to_owned(),
+                tmp.path().join("missing.key").display().to_string(),
+            ];
+            let cli_under = Cli::try_parse_from(&argv).unwrap();
+            let err_under = dispatch(&cli_under, use_json, &RuntimeOptions::shipped()).unwrap_err();
+            assert_eq!(err_under.code, ErrorCode::OutputBudgetTooSmall);
+            assert!(!cold.exists());
 
-                argv[4] = at_min.to_string();
-                let cli_at = Cli::try_parse_from(&argv).unwrap();
-                let err_at = dispatch(&cli_at, use_json, &RuntimeOptions::shipped()).unwrap_err();
-                assert_ne!(
-                    err_at.code,
-                    ErrorCode::OutputBudgetTooSmall,
-                    "at exact lower bound, pre-I/O admission must allow proceeding"
-                );
-            }
+            argv[4] = at_min.to_string();
+            let cli_at = Cli::try_parse_from(&argv).unwrap();
+            let err_at = dispatch(&cli_at, use_json, &RuntimeOptions::shipped()).unwrap_err();
+            assert_ne!(
+                err_at.code,
+                ErrorCode::OutputBudgetTooSmall,
+                "at exact lower bound, pre-I/O admission must allow proceeding"
+            );
         }
     }
 }

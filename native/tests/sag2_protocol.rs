@@ -876,26 +876,9 @@ fn group1_tiny_positive_max_bytes_rejected_before_io() {
         }
     }
 
-    let local_cold = assert_err_json(
-        &run_clec(
-            &[
-                "--data-dir",
-                &cold_s,
-                "--max-bytes",
-                "1",
-                "search",
-                "星雲指南",
-            ],
-            &[],
-        ),
-        2,
-        Some("OUTPUT_BUDGET_TOO_SMALL"),
-    );
-    assert!(local_cold["error"]["sag2Stage"].is_null());
-
     assert!(
         !cold_dir.exists(),
-        "tiny --max-bytes must not create cold --data-dir"
+        "tiny --max-bytes on --sag2 must not create cold --data-dir"
     );
     assert!(
         srv.logs().is_empty(),
@@ -2355,6 +2338,611 @@ fn group7_dpp_varied_frequency_determinism_across_processes() {
 }
 
 #[test]
+fn group7_filters_seen_id_round_robin_term_ties_and_four_query_fusion() {
+    let works = vec![
+        ("w_keep", "Keep Work"),
+        ("w_other", "Other Work"),
+        ("w_seen", "Seen Work"),
+    ];
+    let mut owned_sources: Vec<(String, String, String, String, String, Option<String>)> = vec![
+        (
+            "w_keep".to_owned(),
+            "seed.txt".to_owned(),
+            "Keep Seed".to_owned(),
+            "document".to_owned(),
+            "qalpha qbeta qgamma qdelta bridgeterm".to_owned(),
+            Some("2025-05-15".to_owned()),
+        ),
+        (
+            "w_keep".to_owned(),
+            "exp_match.txt".to_owned(),
+            "Keep Expansion Match".to_owned(),
+            "document".to_owned(),
+            "bridgeterm allowed_expansion_target".to_owned(),
+            Some("2025-05-20".to_owned()),
+        ),
+        (
+            "w_keep".to_owned(),
+            "exp_too_late.txt".to_owned(),
+            "Keep Expansion Too Late".to_owned(),
+            "document".to_owned(),
+            "bridgeterm excluded_after_dateto".to_owned(),
+            Some("2025-06-01".to_owned()),
+        ),
+        (
+            "w_keep".to_owned(),
+            "exp_no_date.txt".to_owned(),
+            "Keep Expansion No Date".to_owned(),
+            "document".to_owned(),
+            "bridgeterm excluded_null_date".to_owned(),
+            None,
+        ),
+        (
+            "w_keep".to_owned(),
+            "exp_wrong_role.txt".to_owned(),
+            "Keep Expansion Wrong Role".to_owned(),
+            "summary".to_owned(),
+            "bridgeterm excluded_wrong_role".to_owned(),
+            Some("2025-05-18".to_owned()),
+        ),
+        (
+            "w_other".to_owned(),
+            "exp_wrong_work.txt".to_owned(),
+            "Other Work Expansion".to_owned(),
+            "document".to_owned(),
+            "bridgeterm excluded_wrong_work".to_owned(),
+            Some("2025-05-18".to_owned()),
+        ),
+    ];
+
+    for i in 0..14usize {
+        owned_sources.push((
+            "w_seen".to_owned(),
+            format!("seen_{i:02}.txt"),
+            format!("Seen {i:02}"),
+            "document".to_owned(),
+            if i == 13 {
+                "qalpha bridgeterm bridgeterm bridgeterm excluded_already_seen_r0".to_owned()
+            } else {
+                format!("qalpha qbeta qgamma unique_seen_{i:02}")
+            },
+            Some("2025-05-10".to_owned()),
+        ));
+    }
+
+    let sources: Vec<SourceSpec<'_>> = owned_sources
+        .iter()
+        .map(|(w, p, t, r, b, d)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                r.as_str(),
+                b.as_str(),
+                d.as_deref(),
+            )
+        })
+        .collect();
+    let corpus = publish_and_sync_corpus(&works, &sources);
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let srcs = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "--offline", "sources"],
+        &[],
+    ));
+    let src_items = srcs["data"]["items"].as_array().unwrap();
+    let keep_work_id = src_items.iter().find(|s| s["workKey"] == "w_keep").unwrap()["workId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let keep_seed_sid = src_items
+        .iter()
+        .find(|s| s["title"] == "Keep Seed")
+        .unwrap()["sourceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| {
+            let mut answers = serde_json::Map::new();
+            for (k, q) in req["questions"].as_object().unwrap() {
+                let p = q["instructions"]["candidate_passage"].as_str().unwrap();
+                let s = if p.contains("qdelta") {
+                    0.95
+                } else if p.contains("allowed_expansion_target") {
+                    0.99
+                } else if p.contains("excluded_already_seen_r0") {
+                    0.01
+                } else {
+                    0.40
+                };
+                answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": s}));
+            }
+            MockReply::Json {
+                status: 200,
+                body: serde_json::json!({"model": "m", "answers": answers}),
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let url = srv.url("/decisions");
+
+    let filtered_res = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "search",
+            "qalpha",
+            "qbeta",
+            "qgamma",
+            "qdelta",
+            "--sag2",
+            "--work",
+            &keep_work_id,
+            "--role",
+            "document",
+            "--date-from",
+            "2025-05-01",
+            "--date-to",
+            "2025-05-25",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(filtered_res["data"]["queries"].as_array().unwrap().len(), 4);
+    assert!(
+        filtered_res["data"]["calls"]["sqlCandidateQueries"]
+            .as_u64()
+            .unwrap()
+            >= 5
+    );
+    let f_logs = srv.logs();
+    assert_eq!(f_logs.len(), 2);
+    let r1_passages: Vec<&str> = f_logs[1]
+        .candidate_passages
+        .values()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        r1_passages
+            .iter()
+            .any(|p| p.contains("allowed_expansion_target")),
+        "matching expansion candidate must be submitted in Round 1"
+    );
+    for forbidden in [
+        "excluded_after_dateto",
+        "excluded_null_date",
+        "excluded_wrong_role",
+        "excluded_wrong_work",
+    ] {
+        assert!(
+            r1_passages.iter().all(|p| !p.contains(forbidden)),
+            "Round 1 request log must not submit candidate failing work/role/date-to filter: {forbidden}"
+        );
+    }
+
+    srv.clear_logs();
+    let src_only = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "search",
+            "qalpha",
+            "--sag2",
+            "--source",
+            &keep_seed_sid,
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(src_only["data"]["stopReason"], "no_expansion_candidates");
+    assert_eq!(srv.logs().len(), 1);
+    assert!(
+        !srv.logs()[0]
+            .candidate_passages
+            .values()
+            .any(|p| p.contains("allowed_expansion_target")),
+        "--source filter must exclude other sources from Round 1 expansion"
+    );
+
+    srv.clear_logs();
+    let seen_res = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "search",
+            "qalpha",
+            "qbeta",
+            "qgamma",
+            "qdelta",
+            "--sag2",
+            "--limit",
+            "5",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    let s_logs = srv.logs();
+    let mut r0_passages_all = Vec::new();
+    let mut r1_passages_all = Vec::new();
+    for l in &s_logs {
+        let state_str = l.parsed_json.as_ref().unwrap()["state"].as_str().unwrap();
+        let state_val: Value = serde_json::from_str(state_str).unwrap();
+        let is_r0 = state_val["previously_retrieved_evidence"]
+            .as_array()
+            .unwrap()
+            .is_empty();
+        for p in l.candidate_passages.values() {
+            if is_r0 {
+                r0_passages_all.push(p.as_str());
+            } else {
+                r1_passages_all.push(p.as_str());
+            }
+        }
+    }
+    assert!(!r0_passages_all.is_empty() && !r1_passages_all.is_empty());
+    let r0_has_seen13 = r0_passages_all
+        .iter()
+        .any(|p| p.contains("excluded_already_seen_r0"));
+    assert!(r0_has_seen13, "non-seed Round 0 candidate must be in pool0");
+    assert!(
+        r1_passages_all
+            .iter()
+            .all(|p| !p.contains("excluded_already_seen_r0")),
+        "seen-ID SQL exclusion must omit non-carried Round 0 candidate from Round 1"
+    );
+    let seed_hit = seen_res["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["source"]["title"] == "Keep Seed")
+        .unwrap();
+    assert_eq!(
+        seed_hit["matchedQueries"],
+        serde_json::json!(["qalpha", "qbeta", "qgamma", "qdelta"])
+    );
+
+    let mut tie_works = vec![("wt_seed", "Tie Seed")];
+    let mut tie_owned: Vec<(String, String, String, String)> = Vec::new();
+    let seed_terms: String = (1..=22usize)
+        .map(|k| format!("tk{k:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    tie_owned.push((
+        "wt_seed".to_owned(),
+        "seed.txt".to_owned(),
+        "Tie Seed".to_owned(),
+        format!("tieanchor {seed_terms}"),
+    ));
+    for k in 1..=22usize {
+        let w = format!("wt_{k:02}");
+        tie_works.push((
+            Box::leak(w.clone().into_boxed_str()),
+            Box::leak(format!("TW {k:02}").into_boxed_str()),
+        ));
+        tie_owned.push((
+            w,
+            format!("t_{k:02}.txt"),
+            format!("Doc {k:02}"),
+            format!("tk{k:02} expmark_{k:02}"),
+        ));
+    }
+    let tie_srcs: Vec<SourceSpec<'_>> = tie_owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let tie_corpus = publish_and_sync_corpus(&tie_works, &tie_srcs);
+    let tie_dir_s = tie_corpus.data_dir.display().to_string();
+    srv.clear_logs();
+    let tie_res = assert_ok_json(&run_clec(
+        &["--data-dir", &tie_dir_s, "search", "tieanchor", "--sag2"],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(
+        tie_res["data"]["candidateCounts"]["expansionTermsSelected"],
+        20
+    );
+    let tie_r1: Vec<String> = srv
+        .logs()
+        .iter()
+        .skip(1)
+        .flat_map(|l| l.candidate_passages.values().cloned())
+        .collect();
+    for k in 1..=20usize {
+        let mark = format!("expmark_{k:02}");
+        assert!(
+            tie_r1.iter().any(|p| p.contains(&mark)),
+            "authored lexical tie-break must include {mark}"
+        );
+    }
+    for k in 21..=22usize {
+        let mark = format!("expmark_{k:02}");
+        assert!(
+            tie_r1.iter().all(|p| !p.contains(&mark)),
+            "authored lexical tie-break must exclude {mark} beyond 20-term cap"
+        );
+    }
+
+    let mut rr_works = vec![("wrr_seed", "RR Seed")];
+    let mut rr_owned: Vec<(String, String, String, String)> = vec![(
+        "wrr_seed".to_owned(),
+        "seed.txt".to_owned(),
+        "RR Seed".to_owned(),
+        "rranchor rrterma rrtermb".to_owned(),
+    )];
+    for i in 0..60usize {
+        let wa = format!("wrr_a_{i:02}");
+        let wb = format!("wrr_b_{i:02}");
+        rr_works.push((
+            Box::leak(wa.clone().into_boxed_str()),
+            Box::leak(format!("A {i:02}").into_boxed_str()),
+        ));
+        rr_works.push((
+            Box::leak(wb.clone().into_boxed_str()),
+            Box::leak(format!("B {i:02}").into_boxed_str()),
+        ));
+        let pad_a = "的 ".repeat(i + 1);
+        let pad_b = "的 ".repeat(i + 1);
+        rr_owned.push((
+            wa,
+            format!("a_{i:02}.txt"),
+            format!("RA {i:02}"),
+            format!("rrterma {pad_a} taga{i:02}"),
+        ));
+        rr_owned.push((
+            wb,
+            format!("b_{i:02}.txt"),
+            format!("RB {i:02}"),
+            format!("rrtermb {pad_b} tagb{i:02}"),
+        ));
+    }
+    let rr_srcs: Vec<SourceSpec<'_>> = rr_owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let rr_corpus = publish_and_sync_corpus(&rr_works, &rr_srcs);
+    let rr_dir_s = rr_corpus.data_dir.display().to_string();
+    let rr_srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| {
+            let mut answers = serde_json::Map::new();
+            for (k, q) in req["questions"].as_object().unwrap() {
+                let p = q["instructions"]["candidate_passage"].as_str().unwrap();
+                let s = if p.contains("taga00")
+                    || p.contains("tagb00")
+                    || p.contains("taga01")
+                    || p.contains("tagb01")
+                {
+                    0.95
+                } else {
+                    0.40
+                };
+                answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": s}));
+            }
+            MockReply::Json {
+                status: 200,
+                body: serde_json::json!({"model": "m", "answers": answers}),
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let rr_res = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &rr_dir_s,
+            "search",
+            "rranchor",
+            "--sag2",
+            "--limit",
+            "4",
+        ],
+        &[
+            ("JEV_BASE_URL", &rr_srv.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(
+        rr_res["data"]["candidateCounts"]["expansionNewCandidates"],
+        100
+    );
+    let rr_logs = rr_srv.logs();
+    let mut r1_a_count = 0usize;
+    let mut r1_b_count = 0usize;
+    for l in rr_logs.iter().skip(1) {
+        for p in l.candidate_passages.values() {
+            if p.contains("taga") {
+                r1_a_count += 1;
+            }
+            if p.contains("tagb") {
+                r1_b_count += 1;
+            }
+        }
+    }
+    assert_eq!(r1_a_count, 50, "round-robin must admit 50 from term A");
+    assert_eq!(r1_b_count, 50, "round-robin must admit 50 from term B");
+    let rr_hit_works: Vec<&str> = rr_res["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["work"]["workKey"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        rr_hit_works,
+        vec!["wrr_a_00", "wrr_b_00", "wrr_a_01", "wrr_b_01"],
+        "authored round-robin merge + UTF-8 term tie order must interleave term A and B"
+    );
+
+    let dpp_edge_corpus = publish_and_sync_corpus(
+        &[("wd1", "D1"), ("wd2", "D2"), ("wd3", "D3"), ("wd4", "D4")],
+        &[
+            (
+                "wd1",
+                "1.txt",
+                "D1",
+                "document",
+                "edgeanchor alpha beta",
+                None,
+            ),
+            (
+                "wd2",
+                "2.txt",
+                "D2",
+                "document",
+                "edgeanchor alpha beta",
+                None,
+            ),
+            (
+                "wd3",
+                "3.txt",
+                "D3",
+                "document",
+                "edgeanchor 的 是 了",
+                None,
+            ),
+            ("wd4", "4.txt", "D4", "document", "edgeanchor gamma", None),
+        ],
+    );
+    let dpp_edge_dir = dpp_edge_corpus.data_dir.display().to_string();
+    let zero_srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.0, "m"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let edge_res = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dpp_edge_dir,
+            "search",
+            "edgeanchor",
+            "--sag2",
+        ],
+        &[
+            ("JEV_BASE_URL", &zero_srv.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    let edge_hits = edge_res["data"]["hits"].as_array().unwrap();
+    assert_eq!(edge_hits.len(), 4);
+    assert!(edge_hits.iter().all(|h| h["dppOrder"].as_u64().is_some()));
+}
+
+#[test]
+fn group7_default_local_baseline_parity_with_pre_sag2_release() {
+    let pre_sag2_bin = PathBuf::from(
+        "/Users/century/.t3/worktrees/clec/t3-c4c9bebd-0d1d9b692d1e433e/native/target/release/clec",
+    );
+    if !pre_sag2_bin.is_file() {
+        return;
+    }
+
+    let corpus = publish_and_sync_corpus(
+        &[("w1", "ETF 0050"), ("w2", "US QQQ"), ("w3", "Legacy")],
+        &[
+            (
+                "w1",
+                "a.txt",
+                "Doc A",
+                "document",
+                "台灣0050指數配置與4%提領原則說明。",
+                Some("2025-01-10"),
+            ),
+            (
+                "w1",
+                "b.txt",
+                "Doc B",
+                "document",
+                "0050長期資產配置第二部分。",
+                Some("2025-01-20"),
+            ),
+            (
+                "w2",
+                "c.txt",
+                "Doc C",
+                "summary",
+                "美股QQQ與4%法則摘要對比。",
+                Some("2025-02-05"),
+            ),
+            (
+                "w3",
+                "d.txt",
+                "Doc D",
+                "document",
+                "台灣0050舊版檔案。",
+                Some("2024-05-01"),
+            ),
+        ],
+    );
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let run_bin = |bin: &PathBuf, args: &[&str]| -> Value {
+        let out = Command::new(bin)
+            .args(args)
+            .env_remove("JEV_BASE_URL")
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("JEV_API_KEY")
+            .output()
+            .expect("run clec binary");
+        assert_ok_json(&out)
+    };
+
+    let queries: &[&[&str]] = &[
+        &["--data-dir", &dir_s, "--offline", "search", "0050", "4%"],
+        &[
+            "--data-dir",
+            &dir_s,
+            "--offline",
+            "search",
+            "資產配置",
+            "--role",
+            "document",
+            "--date-from",
+            "2025-01-01",
+            "--date-to",
+            "2025-12-31",
+            "--per-work",
+            "1",
+            "--limit",
+            "3",
+        ],
+    ];
+
+    for qargs in queries {
+        let mut old_val = run_bin(&pre_sag2_bin, qargs);
+        let mut new_val = run_bin(&clec_bin(), qargs);
+        assert_eq!(new_val["data"]["mode"], "local");
+        assert!(old_val["data"].get("mode").is_none());
+
+        new_val["data"].as_object_mut().unwrap().remove("mode");
+        old_val["data"]["budget"]["usedBytes"] = Value::Null;
+        new_val["data"]["budget"]["usedBytes"] = Value::Null;
+        assert_eq!(
+            new_val, old_val,
+            "default local search output must match pre-SAG2 release except additive mode & usedBytes"
+        );
+    }
+}
+
+#[test]
 fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
     let mut sources: Vec<OwnedSourceSpec<'_>> = Vec::new();
     for i in 0..35usize {
@@ -2491,6 +3079,7 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
     assert_eq!(trimmed_json["data"]["budget"]["omittedCount"], 1);
     assert_eq!(trimmed_json["data"]["hits"].as_array().unwrap().len(), 2);
 
+    srv.clear_logs();
     let tiny = run_clec(
         &[
             "--data-dir",
@@ -2506,8 +3095,26 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
         &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
     );
     let tiny_err = assert_err_json(&tiny, 2, Some("OUTPUT_BUDGET_TOO_SMALL"));
+    assert!(tiny_err["error"]["sag2Stage"].is_null());
+    assert!(srv.logs().is_empty());
+
+    let post_sag2_tight = run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--max-bytes",
+            "1800",
+            "search",
+            "星海批次回合",
+            "--sag2",
+            "--limit",
+            "3",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    );
+    let post_tight_err = assert_err_json(&post_sag2_tight, 2, Some("OUTPUT_BUDGET_TOO_SMALL"));
     assert_eq!(
-        tiny_err["error"]["sag2Stage"]["completedStage"],
+        post_tight_err["error"]["sag2Stage"]["completedStage"],
         "output_budget"
     );
 
@@ -2888,6 +3495,323 @@ srv.serve_forever()
 }
 
 #[test]
+fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
+    let srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.8, "m"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let url = srv.url("/decisions");
+
+    let make_body_with_q_tokens = |base_tokens_target: usize| -> String {
+        let probe_corpus = publish_and_sync_corpus(
+            &[("wp", "Probe")],
+            &[("wp", "p.txt", "T", "document", "tokprobe", None)],
+        );
+        let p_dir = probe_corpus.data_dir.display().to_string();
+        srv.clear_logs();
+        let probe_res = assert_ok_json(&run_clec(
+            &["--data-dir", &p_dir, "search", "tokprobe", "--sag2"],
+            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        ));
+        let base_est = probe_res["data"]["consumption"]["estimatedTokenUnits"]
+            .as_u64()
+            .unwrap() as usize;
+        let diff_bytes = (base_tokens_target - base_est) / 2;
+        let num_soh = diff_bytes / 6;
+        let num_a = diff_bytes - num_soh * 6;
+        format!(
+            "tokprobe{}{}",
+            "\u{0001}".repeat(num_soh),
+            "a".repeat(num_a)
+        )
+    };
+
+    let exact_q_body = make_body_with_q_tokens(32_000);
+    let q_exact_corpus = publish_and_sync_corpus(
+        &[("wq", "WQ")],
+        &[("wq", "q.txt", "T", "document", &exact_q_body, None)],
+    );
+    srv.clear_logs();
+    let q_ok = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &q_exact_corpus.data_dir.display().to_string(),
+            "search",
+            "tokprobe",
+            "--sag2",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(q_ok["data"]["consumption"]["estimatedTokenUnits"], 32_000);
+    assert_eq!(srv.logs().len(), 1);
+
+    let over_q_body = format!("{exact_q_body}b");
+    let q_over_corpus = publish_and_sync_corpus(
+        &[("wq", "WQ")],
+        &[("wq", "q.txt", "T", "document", &over_q_body, None)],
+    );
+    srv.clear_logs();
+    let q_err = assert_err_json(
+        &run_clec(
+            &[
+                "--data-dir",
+                &q_over_corpus.data_dir.display().to_string(),
+                "search",
+                "tokprobe",
+                "--sag2",
+            ],
+            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        ),
+        2,
+        Some("SAG2_BUDGET_EXHAUSTED"),
+    );
+    assert_eq!(q_err["error"]["sag2Stage"]["httpAttempts"], 0);
+    assert!(srv.logs().is_empty());
+
+    let b_q21334 = make_body_with_q_tokens(21_334);
+    let b_q21332 = make_body_with_q_tokens(21_332);
+    let b_exact_corpus = publish_and_sync_corpus(
+        &[("wb1", "B1"), ("wb2", "B2"), ("wb3", "B3")],
+        &[
+            ("wb1", "1.txt", "T", "document", &b_q21334, None),
+            ("wb2", "2.txt", "T", "document", &b_q21334, None),
+            ("wb3", "3.txt", "T", "document", &b_q21332, None),
+        ],
+    );
+    srv.clear_logs();
+    let b_ok = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &b_exact_corpus.data_dir.display().to_string(),
+            "search",
+            "tokprobe",
+            "--sag2",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(b_ok["data"]["calls"]["httpAttempts"], 1);
+    assert_eq!(b_ok["data"]["consumption"]["estimatedTokenUnits"], 64_000);
+
+    let b_over_corpus = publish_and_sync_corpus(
+        &[("wb1", "B1"), ("wb2", "B2"), ("wb3", "B3")],
+        &[
+            ("wb1", "1.txt", "T", "document", &b_q21334, None),
+            ("wb2", "2.txt", "T", "document", &b_q21334, None),
+            ("wb3", "3.txt", "T", "document", &b_q21334, None),
+        ],
+    );
+    srv.clear_logs();
+    let b_split = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &b_over_corpus.data_dir.display().to_string(),
+            "search",
+            "tokprobe",
+            "--sag2",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(
+        b_split["data"]["calls"]["httpAttempts"], 2,
+        "64,002 batch estimate must split into 2 batches"
+    );
+
+    let mut att32_works: Vec<(&str, &str)> = Vec::new();
+    let mut att32_owned: Vec<(String, String, String, String)> = Vec::new();
+    let stop_pad = "的".repeat(1950);
+    for i in 0..64usize {
+        let w = format!("wa_{i:02}");
+        att32_works.push((
+            Box::leak(w.clone().into_boxed_str()),
+            Box::leak(format!("WA {i:02}").into_boxed_str()),
+        ));
+        att32_owned.push((
+            w,
+            format!("a_{i:02}.txt"),
+            format!("Doc {i:02}"),
+            format!("att32anchor {stop_pad}"),
+        ));
+    }
+    let att32_srcs: Vec<SourceSpec<'_>> = att32_owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let att32_corpus = publish_and_sync_corpus(&att32_works, &att32_srcs);
+    srv.clear_logs();
+    let att32_ok = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &att32_corpus.data_dir.display().to_string(),
+            "search",
+            "att32anchor",
+            "--sag2",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(att32_ok["data"]["calls"]["httpAttempts"], 32);
+    assert_eq!(srv.logs().len(), 32);
+
+    let make_3letter_token = |idx: usize| -> String {
+        const PREFIXES: &[u8] = b"bcgjkmpqvxz";
+        let p = PREFIXES[idx / (26 * 26)] as char;
+        let m = (b'a' + ((idx / 26) % 26) as u8) as char;
+        let l = (b'a' + (idx % 26) as u8) as char;
+        format!("{p}{m}{l}")
+    };
+    let mut df_works: Vec<(&str, &str)> = Vec::new();
+    let mut df_owned: Vec<(String, String, String, String)> = Vec::new();
+    let mut tok_idx = 0usize;
+    for s_idx in 0..10usize {
+        let count = if s_idx < 9 { 410 } else { 405 };
+        let mut toks = Vec::with_capacity(count + 1);
+        toks.push("dfanchor".to_owned());
+        for _ in 0..count {
+            toks.push(make_3letter_token(tok_idx));
+            tok_idx += 1;
+        }
+        let w = format!("wdf_{s_idx}");
+        df_works.push((
+            Box::leak(w.clone().into_boxed_str()),
+            Box::leak(format!("DF {s_idx}").into_boxed_str()),
+        ));
+        df_owned.push((
+            w,
+            format!("df_{s_idx}.txt"),
+            format!("DF {s_idx}"),
+            toks.join(" "),
+        ));
+    }
+    assert_eq!(tok_idx, 4095);
+    let df_exact_srcs: Vec<SourceSpec<'_>> = df_owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let df_exact_corpus = publish_and_sync_corpus(&df_works, &df_exact_srcs);
+    srv.clear_logs();
+    let df_ok = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &df_exact_corpus.data_dir.display().to_string(),
+            "search",
+            "dfanchor",
+            "--sag2",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(df_ok["data"]["calls"]["dfLookupsDistinct"], 4096);
+
+    df_owned[9]
+        .3
+        .push_str(&format!(" {}", make_3letter_token(4095)));
+    let df_over_srcs: Vec<SourceSpec<'_>> = df_owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let df_over_corpus = publish_and_sync_corpus(&df_works, &df_over_srcs);
+    srv.clear_logs();
+    let df_over_err = assert_err_json(
+        &run_clec(
+            &[
+                "--data-dir",
+                &df_over_corpus.data_dir.display().to_string(),
+                "search",
+                "dfanchor",
+                "--sag2",
+            ],
+            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        ),
+        2,
+        Some("SAG2_BUDGET_EXHAUSTED"),
+    );
+    assert_eq!(df_over_err["error"]["sag2Stage"]["dfLookupsDistinct"], 4096);
+
+    let mut sql_works = vec![("wsql_seed", "SQL Seed")];
+    let sql_terms: String = (1..=20usize)
+        .map(|k| format!("sq{k:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut sql_owned: Vec<(String, String, String, String)> = vec![(
+        "wsql_seed".to_owned(),
+        "seed.txt".to_owned(),
+        "SQL Seed".to_owned(),
+        format!("qone qtwo qthree qfour {sql_terms}"),
+    )];
+    for k in 1..=20usize {
+        let w = format!("wsql_{k:02}");
+        sql_works.push((
+            Box::leak(w.clone().into_boxed_str()),
+            Box::leak(format!("SQ {k:02}").into_boxed_str()),
+        ));
+        sql_owned.push((
+            w,
+            format!("s_{k:02}.txt"),
+            format!("SQ {k:02}"),
+            format!("sq{k:02}"),
+        ));
+    }
+    let sql_srcs: Vec<SourceSpec<'_>> = sql_owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let sql_corpus = publish_and_sync_corpus(&sql_works, &sql_srcs);
+    srv.clear_logs();
+    let sql24_ok = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &sql_corpus.data_dir.display().to_string(),
+            "search",
+            "qone",
+            "qtwo",
+            "qthree",
+            "qfour",
+            "--sag2",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    assert_eq!(sql24_ok["data"]["calls"]["sqlCandidateQueries"], 24);
+}
+
+#[test]
 fn group9_kill_waiting_cli_sends_zero_later_requests() {
     let corpus = publish_and_sync_corpus(
         &[("w1", "W1")],
@@ -2943,77 +3867,58 @@ fn group9_kill_waiting_cli_sends_zero_later_requests() {
 
 #[test]
 fn group10_negative_controls_fail_for_predicted_reasons() {
+    fn assert_exact_request_count(logs: &[LoggedRequest], expected: usize) {
+        assert_eq!(
+            logs.len(),
+            expected,
+            "expected exactly {expected} HTTP requests, observed {}",
+            logs.len()
+        );
+    }
+
     let corpus = publish_and_sync_corpus(
-        &[("w1", "W1"), ("w2", "W2"), ("w3", "W3")],
+        &[("w_seed", "Seed"), ("w_x", "Exp X"), ("w_y", "Exp Y")],
         &[
             (
-                "w1",
-                "a.txt",
-                "Alpha",
+                "w_seed".to_owned().as_str(),
+                "seed.txt",
+                "Seed",
                 "document",
-                "對照組基準詞彙 第一號候選。",
+                "negctrlanchor bridgekw",
                 None,
             ),
             (
-                "w2",
-                "b.txt",
-                "Beta",
+                "w_x",
+                "x.txt",
+                "Exp X",
                 "document",
-                "對照組基準詞彙 第二號候選。",
+                "bridgekw candidate_x_marker",
                 None,
             ),
             (
-                "w3",
-                "c.txt",
-                "Gamma",
+                "w_y",
+                "y.txt",
+                "Exp Y",
                 "document",
-                "完全不相干的第三號候選。",
+                "bridgekw candidate_y_marker",
                 None,
             ),
         ],
     );
     let dir_s = corpus.data_dir.display().to_string();
 
-    let srv_forward = MockJevServer::start(
+    let srv_x = MockJevServer::start(
         SENTINEL_KEY,
-        Arc::new(|_, _, req| {
+        Arc::new(|seq, _, req| {
             let mut answers = serde_json::Map::new();
             for (k, q) in req["questions"].as_object().unwrap() {
                 let p = q["instructions"]["candidate_passage"].as_str().unwrap();
-                let s = if p.contains("第一號候選") {
-                    0.9
-                } else {
-                    0.2
-                };
-                answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": s}));
-            }
-            MockReply::Json {
-                status: 200,
-                body: serde_json::json!({"model": "m", "answers": answers}),
-                delay: Duration::ZERO,
-            }
-        }),
-    );
-    let fwd = assert_ok_json(&run_clec(
-        &["--data-dir", &dir_s, "search", "對照組基準詞彙", "--sag2"],
-        &[
-            ("JEV_BASE_URL", &srv_forward.url("/decisions")),
-            ("JEV_API_KEY", SENTINEL_KEY),
-        ],
-    ));
-    let fwd_top = fwd["data"]["hits"][0]["work"]["workKey"].as_str().unwrap();
-    assert_eq!(fwd_top, "w1");
-
-    let srv_reverse = MockJevServer::start(
-        SENTINEL_KEY,
-        Arc::new(|_, _, req| {
-            let mut answers = serde_json::Map::new();
-            for (k, q) in req["questions"].as_object().unwrap() {
-                let p = q["instructions"]["candidate_passage"].as_str().unwrap();
-                let s = if p.contains("第二號候選") {
+                let s = if seq == 1 {
+                    0.90
+                } else if p.contains("candidate_x_marker") {
                     0.95
                 } else {
-                    0.1
+                    0.10
                 };
                 answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": s}));
             }
@@ -3024,19 +3929,140 @@ fn group10_negative_controls_fail_for_predicted_reasons() {
             }
         }),
     );
-    let rev = assert_ok_json(&run_clec(
-        &["--data-dir", &dir_s, "search", "對照組基準詞彙", "--sag2"],
+    let res_x = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "negctrlanchor", "--sag2"],
         &[
-            ("JEV_BASE_URL", &srv_reverse.url("/decisions")),
+            ("JEV_BASE_URL", &srv_x.url("/decisions")),
             ("JEV_API_KEY", SENTINEL_KEY),
         ],
     ));
-    let rev_top = rev["data"]["hits"][0]["work"]["workKey"].as_str().unwrap();
-    assert_eq!(rev_top, "w2");
+    let x_logs = srv_x.logs();
+    assert_exact_request_count(&x_logs, 2);
+    let top_x = res_x["data"]["hits"][0]["work"]["workKey"]
+        .as_str()
+        .unwrap();
+    assert_eq!(top_x, "w_x");
+
+    let srv_y = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut answers = serde_json::Map::new();
+            for (k, q) in req["questions"].as_object().unwrap() {
+                let p = q["instructions"]["candidate_passage"].as_str().unwrap();
+                let s = if seq == 1 {
+                    0.90
+                } else if p.contains("candidate_y_marker") {
+                    0.95
+                } else {
+                    0.10
+                };
+                answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": s}));
+            }
+            MockReply::Json {
+                status: 200,
+                body: serde_json::json!({"model": "m", "answers": answers}),
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let res_y = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "negctrlanchor", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &srv_y.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    let y_logs = srv_y.logs();
+    assert_exact_request_count(&y_logs, 2);
+    let top_y = res_y["data"]["hits"][0]["work"]["workKey"]
+        .as_str()
+        .unwrap();
+    assert_eq!(top_y, "w_y");
     assert_ne!(
-        fwd_top, rev_top,
-        "reversing Jev scores must reverse top hit, proving Jev scores are not ignored"
+        top_x, top_y,
+        "isolated Round 1 score reversal with fixed Round 0 scores must reverse top hit"
     );
 
-    assert_ne!(srv_reverse.logs().len(), 99);
+    let extra_res = run_clec(
+        &["--data-dir", &dir_s, "search", "negctrlanchor", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &srv_y.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    );
+    assert_ok_json(&extra_res);
+    let combined_logs = srv_y.logs();
+    let extra_panic = std::panic::catch_unwind(|| {
+        assert_exact_request_count(&combined_logs, 2);
+    })
+    .unwrap_err();
+    let panic_msg = extra_panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| extra_panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        panic_msg.contains("expected exactly 2 HTTP requests, observed 4"),
+        "exact-count assertion must fail with predicted mismatch, got: {panic_msg}"
+    );
+
+    let srcs = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "--offline", "sources"],
+        &[],
+    ));
+    let y_sid = srcs["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["workKey"] == "w_y")
+        .unwrap()["sourceId"]
+        .as_str()
+        .unwrap();
+    let y_ov = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "--offline", "read", y_sid],
+        &[],
+    ));
+    let forged_pid = y_ov["data"]["items"][0]["passageIds"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let forged_key = format!("candidate_{forged_pid}");
+    let srv_forged = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(move |_, _, _| MockReply::Json {
+            status: 200,
+            body: serde_json::json!({
+                "model": "m",
+                "answers": { forged_key.clone(): {"type": "noul", "noul": 0.99} }
+            }),
+            delay: Duration::ZERO,
+        }),
+    );
+    assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "negctrlanchor", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_forged.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("JEV_INVALID_RESPONSE"),
+    );
+
+    let conn = rusqlite::Connection::open(&corpus.db_path).unwrap();
+    conn.execute_batch("UPDATE blobs SET raw_bytes = X'616263'")
+        .unwrap();
+    drop(conn);
+    assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "negctrlanchor", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_x.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("INTEGRITY_MISMATCH"),
+    );
 }
