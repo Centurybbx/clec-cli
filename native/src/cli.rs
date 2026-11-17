@@ -8,8 +8,10 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    CORPUS_FORMAT, ClecError, DEFAULT_MAX_BYTES, DateYmd, ErrorCode, ErrorEnvelope, PassageId,
-    ReleaseHash, SCHEMA_VERSION, SEGMENTATION_REVISION, SourceId, SourceRole, TypedRef, WorkId,
+    CORPUS_FORMAT, ClecError, DEFAULT_MAX_BYTES, DICTIONARY_REVISION, DateYmd,
+    EQUIVALENCE_REVISION, ErrorCode, ErrorEnvelope, NORMALIZATION_REVISION, PassageId, ReleaseHash,
+    SCHEMA_VERSION, SEGMENTATION_REVISION, SourceId, SourceRole, TOKENIZATION_REVISION, TypedRef,
+    WorkId,
 };
 use crate::retrieval::{
     BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, MatchMode, SearchData, SearchRequest,
@@ -36,7 +38,7 @@ struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Enforce offline execution (always offline in Phase 1)
+    /// Enforce offline execution (always offline in Phase 2)
     #[arg(long, global = true)]
     pub offline: bool,
 
@@ -44,7 +46,7 @@ struct Cli {
     #[arg(long, global = true, default_value_t = DEFAULT_MAX_BYTES, value_name = "N")]
     pub max_bytes: usize,
 
-    /// Unsupported Phase 1 flag (explicitly rejected)
+    /// Unsupported flag (explicitly rejected)
     #[arg(long, global = true, hide = true)]
     pub sag2: bool,
 
@@ -185,6 +187,10 @@ struct SourcesArgs {
     #[arg(long, value_enum)]
     pub role: Option<RoleArg>,
 
+    /// Return only canonical indexed sources (exclude collapsed duplicates)
+    #[arg(long)]
+    pub canonical_only: bool,
+
     /// Maximum sources returned (1..=100)
     #[arg(long, default_value_t = 50, value_name = "N")]
     pub limit: usize,
@@ -279,6 +285,10 @@ struct SchemaData {
     pub version: String,
     pub corpus_format: String,
     pub segmentation_revision: String,
+    pub tokenization_revision: String,
+    pub normalization_revision: String,
+    pub dictionary_revision: String,
+    pub equivalence_revision: String,
     pub global_options: Vec<SchemaArgSpec>,
     pub commands: Vec<SchemaCommandSpec>,
     pub unsupported_features: Vec<UnsupportedFeatureSpec>,
@@ -478,8 +488,12 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
             let store = open_current_store(&data_dir, None)?;
             let work_filter = args.work.as_deref().map(WorkId::parse).transpose()?;
             let role_filter = args.role.map(Into::into);
-            let matched =
-                store.list_sources(args.query.as_deref(), work_filter.as_ref(), role_filter)?;
+            let matched = store.list_sources(
+                args.query.as_deref(),
+                work_filter.as_ref(),
+                role_filter,
+                args.canonical_only,
+            )?;
             let total_matched = matched.len();
             let paged: Vec<SourceListEntry> = matched
                 .into_iter()
@@ -776,28 +790,27 @@ fn build_schema_data() -> SchemaData {
     });
 
     SchemaData {
-        phase: "phase1".to_owned(),
+        phase: "phase2".to_owned(),
         binary: cmd.get_name().to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         corpus_format: CORPUS_FORMAT.to_owned(),
         segmentation_revision: SEGMENTATION_REVISION.to_owned(),
+        tokenization_revision: TOKENIZATION_REVISION.to_owned(),
+        normalization_revision: NORMALIZATION_REVISION.to_owned(),
+        dictionary_revision: DICTIONARY_REVISION.to_owned(),
+        equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
         global_options,
         commands,
         unsupported_features: vec![
             UnsupportedFeatureSpec {
                 name: "sag2".to_owned(),
                 supported: false,
-                reason: "LLM/SAG2 retrieval is unsupported in Phase 1; no external API calls are made.".to_owned(),
+                reason: "LLM/SAG2 retrieval is unsupported in Phase 2; no external API calls are made.".to_owned(),
             },
             UnsupportedFeatureSpec {
                 name: "http_bootstrap".to_owned(),
                 supported: false,
                 reason: "Remote HTTP manifest/artifact bootstrap is deferred to a later phase; use local `sync --manifest FILE`.".to_owned(),
-            },
-            UnsupportedFeatureSpec {
-                name: "cross_format_dedup".to_owned(),
-                supported: false,
-                reason: "Phase 1 performs conservative exact-content blob sharing only.".to_owned(),
             },
         ],
         envelopes,
@@ -844,8 +857,8 @@ fn format_status_text(d: &StatusData) -> String {
     ];
     if let Some(c) = &d.counts {
         lines.push(format!(
-            "Counts: works={}, sources={}, blobs={}, passages={}, cues={}, inventory={}",
-            c.works, c.sources, c.blobs, c.passages, c.cues, c.inventory
+            "Counts: works={}, sources={}, canonicalSources={}, blobs={}, passages={}, cues={}, inventory={}",
+            c.works, c.sources, c.canonical_sources, c.blobs, c.passages, c.cues, c.inventory
         ));
     }
     lines.join("\n") + "\n"
@@ -853,8 +866,14 @@ fn format_status_text(d: &StatusData) -> String {
 
 fn format_sync_text(d: &SyncData) -> String {
     format!(
-        "Release: {}\nFormat: {}\nReused: {}\nWorks: {}, Sources: {}, Passages: {}\n",
-        d.release, d.corpus_format, d.reused, d.counts.works, d.counts.sources, d.counts.passages
+        "Release: {}\nFormat: {}\nReused: {}\nWorks: {}, Sources: {}, Canonical: {}, Passages: {}\n",
+        d.release,
+        d.corpus_format,
+        d.reused,
+        d.counts.works,
+        d.counts.sources,
+        d.counts.canonical_sources,
+        d.counts.passages
     )
 }
 
@@ -1005,7 +1024,7 @@ mod tests {
 
     #[test]
     fn budget_used_bytes_converges_to_exact_stdout_len_across_decimal_and_escaping_boundaries() {
-        use crate::domain::{Attribution, ByteSpan};
+        use crate::domain::{Attribution, ByteSpan, EquivalenceBasis, ProjectionKind};
         use crate::retrieval::{SearchHit, SearchQueryTerms};
         use crate::store::WorkRecord;
 
@@ -1035,6 +1054,10 @@ mod tests {
                     date: None,
                     date_basis: None,
                     content_hash: "b".repeat(64),
+                    canonical_source_id: sid.clone(),
+                    is_canonical: true,
+                    equivalence_basis: EquivalenceBasis::UniqueInWorkRole,
+                    equivalent_count: 1,
                     passage_count: 1,
                     diagnostics_count: 0,
                 }],
@@ -1086,6 +1109,10 @@ mod tests {
                 date_basis: None,
                 origin: None,
                 content_hash: "c".repeat(64),
+                canonical_source_id: sid.clone(),
+                equivalence_basis: EquivalenceBasis::UniqueInWorkRole,
+                projection_kind: ProjectionKind::PlainText,
+                equivalence_hash: "d".repeat(64),
             },
             ordinal: 0,
             spans: vec![ByteSpan::new(0, 10, None).unwrap()],

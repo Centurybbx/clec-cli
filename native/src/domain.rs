@@ -5,8 +5,12 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const CORPUS_FORMAT: &str = "clec-native-v1";
+pub const CORPUS_FORMAT: &str = "clec-native-v2";
 pub const SEGMENTATION_REVISION: &str = "utf8-scalar-1000-2000-v1";
+pub const TOKENIZATION_REVISION: &str = "jieba-rs-0.11-alnum-pct-v1";
+pub const NORMALIZATION_REVISION: &str = "opencc-tw2s-nfkc-lower-v1";
+pub const DICTIONARY_REVISION: &str = "jieba-rs-builtin-0.11.0+ferrous-opencc-0.4.0-tw2s";
+pub const EQUIVALENCE_REVISION: &str = "ws-fold-cue-or-archive-md-v1";
 pub const SCHEMA_VERSION: u32 = 1;
 pub(crate) const DEFAULT_MAX_BYTES: usize = 65_536;
 
@@ -182,7 +186,8 @@ impl SourceId {
         let date_str = date.map_or("", DateYmd::as_str);
         let basis_str = date_basis.unwrap_or("");
         let material = format!(
-            "source:{}:{}:{}:{}:{}:{}:{}",
+            "source:{}:{}:{}:{}:{}:{}:{}:{}",
+            CORPUS_FORMAT,
             work_id.as_str(),
             path,
             role.as_str(),
@@ -404,7 +409,9 @@ impl SourceRole {
 #[serde(rename_all = "snake_case")]
 pub enum Attribution {
     MachineUnverified,
+    AutomaticUnverified,
     UnverifiedTranscript,
+    OriginalUnknown,
     PublisherVerified,
     AuthoredFixture,
 }
@@ -413,7 +420,9 @@ impl Attribution {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MachineUnverified => "machine_unverified",
+            Self::AutomaticUnverified => "automatic_unverified",
             Self::UnverifiedTranscript => "unverified_transcript",
+            Self::OriginalUnknown => "original_unknown",
             Self::PublisherVerified => "publisher_verified",
             Self::AuthoredFixture => "authored_fixture",
         }
@@ -422,15 +431,139 @@ impl Attribution {
     pub fn parse(raw: &str) -> Result<Self, ClecError> {
         match raw {
             "machine_unverified" => Ok(Self::MachineUnverified),
+            "automatic_unverified" => Ok(Self::AutomaticUnverified),
             "unverified_transcript" => Ok(Self::UnverifiedTranscript),
+            "original_unknown" => Ok(Self::OriginalUnknown),
             "publisher_verified" => Ok(Self::PublisherVerified),
             "authored_fixture" => Ok(Self::AuthoredFixture),
             _ => Err(ClecError::new(
                 ErrorCode::InvalidManifest,
-                "Attribution must be machine_unverified, unverified_transcript, publisher_verified, or authored_fixture.",
+                "Attribution must be machine_unverified, automatic_unverified, unverified_transcript, original_unknown, publisher_verified, or authored_fixture.",
             )),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionKind {
+    SubtitleCuePayload,
+    ArchiveVoiceNoteMd,
+    PlainText,
+}
+
+impl ProjectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubtitleCuePayload => "subtitle_cue_payload",
+            Self::ArchiveVoiceNoteMd => "archive_voice_note_md",
+            Self::PlainText => "plain_text",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, ClecError> {
+        match raw {
+            "subtitle_cue_payload" => Ok(Self::SubtitleCuePayload),
+            "archive_voice_note_md" => Ok(Self::ArchiveVoiceNoteMd),
+            "plain_text" => Ok(Self::PlainText),
+            _ => Err(ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Invalid projection_kind in corpus.",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EquivalenceBasis {
+    UniqueInWorkRole,
+    CanonicalByTimingAndFormat,
+    CollapsedToCanonical,
+}
+
+impl EquivalenceBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UniqueInWorkRole => "unique_in_work_role",
+            Self::CanonicalByTimingAndFormat => "canonical_by_timing_and_format",
+            Self::CollapsedToCanonical => "collapsed_to_canonical",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, ClecError> {
+        match raw {
+            "unique_in_work_role" => Ok(Self::UniqueInWorkRole),
+            "canonical_by_timing_and_format" => Ok(Self::CanonicalByTimingAndFormat),
+            "collapsed_to_canonical" => Ok(Self::CollapsedToCanonical),
+            _ => Err(ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Invalid equivalence_basis in corpus.",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalCandidate<'a> {
+    pub source_id: &'a SourceId,
+    pub path: &'a str,
+    pub attribution: Attribution,
+    pub is_subtitle: bool,
+    pub has_cues: bool,
+    pub diagnostics_count: usize,
+}
+
+fn extension_priority(path: &str) -> u8 {
+    let ext = path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "srt" => 0,
+        "str" => 1,
+        "vtt" => 2,
+        "txt" => 3,
+        "md" => 4,
+        _ => 5,
+    }
+}
+
+fn attribution_priority(attr: Attribution) -> u8 {
+    match attr {
+        Attribution::PublisherVerified => 0,
+        Attribution::AuthoredFixture => 1,
+        Attribution::AutomaticUnverified => 2,
+        Attribution::MachineUnverified => 3,
+        Attribution::UnverifiedTranscript => 4,
+        Attribution::OriginalUnknown => 5,
+    }
+}
+
+pub(crate) fn select_canonical_index(candidates: &[CanonicalCandidate<'_>]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let key_a = (
+                !(a.is_subtitle && a.has_cues),
+                extension_priority(a.path),
+                attribution_priority(a.attribution),
+                a.diagnostics_count,
+                a.path,
+                a.source_id.as_str(),
+            );
+            let key_b = (
+                !(b.is_subtitle && b.has_cues),
+                extension_priority(b.path),
+                attribution_priority(b.attribution),
+                b.diagnostics_count,
+                b.path,
+                b.source_id.as_str(),
+            );
+            key_a.cmp(&key_b)
+        })
+        .map(|(idx, _)| idx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -678,7 +811,7 @@ impl ErrorCode {
                 "Check filesystem paths, permissions, and available disk space, then retry."
             }
             Self::InvalidPackage => {
-                "Provide a valid clec-native-v1 release package and re-run `clec sync --manifest PATH`."
+                "Provide a valid clec-native-v2 release package and re-run `clec sync --manifest PATH`."
             }
             Self::IntegrityMismatch => {
                 "Re-run `clec sync --manifest PATH` from an unmodified publisher release."

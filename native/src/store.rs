@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, OpenFlags, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    Attribution, BoundaryKind, ByteSpan, CORPUS_FORMAT, ClecError, DateYmd, ErrorCode, PassageId,
-    ReleaseHash, SEGMENTATION_REVISION, SourceId, SourceRole, WorkId, sha256_hex,
+    Attribution, BoundaryKind, ByteSpan, CORPUS_FORMAT, CanonicalCandidate, ClecError,
+    DICTIONARY_REVISION, DateYmd, EQUIVALENCE_REVISION, EquivalenceBasis, ErrorCode,
+    NORMALIZATION_REVISION, PassageId, ProjectionKind, ReleaseHash, SEGMENTATION_REVISION,
+    SourceId, SourceRole, TOKENIZATION_REVISION, WorkId, select_canonical_index, sha256_hex,
 };
 use crate::ingest::{
-    ExtractionResult, SubtitleCue, extract_source, is_subtitle_path, reconstruct_passage_text,
-    segment_source,
+    SubtitleCue, compute_equivalence_projection, extract_source, is_subtitle_path,
+    reconstruct_passage_text, segment_source,
 };
 use crate::lexical::{index_tokens_string, normalize_for_search};
 
@@ -45,6 +50,14 @@ CREATE TABLE sources(
   origin TEXT,
   content_hash TEXT NOT NULL REFERENCES blobs(content_hash)
 );
+CREATE TABLE source_canonical_map(
+  source_id TEXT PRIMARY KEY REFERENCES sources(id),
+  canonical_source_id TEXT NOT NULL REFERENCES sources(id),
+  equivalence_hash TEXT NOT NULL,
+  projection_kind TEXT NOT NULL,
+  equivalence_basis TEXT NOT NULL
+);
+CREATE INDEX source_canonical_by_canon ON source_canonical_map(canonical_source_id);
 CREATE TABLE source_diagnostics(
   source_id TEXT NOT NULL REFERENCES sources(id),
   ordinal INTEGER NOT NULL,
@@ -104,6 +117,7 @@ CREATE VIRTUAL TABLE search USING fts5(
 pub struct CorpusCounts {
     pub works: usize,
     pub sources: usize,
+    pub canonical_sources: usize,
     pub blobs: usize,
     pub passages: usize,
     pub cues: usize,
@@ -116,6 +130,18 @@ pub(crate) struct WorkRecord {
     pub work_id: WorkId,
     pub work_key: String,
     pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EquivalentSourceRef {
+    pub source_id: SourceId,
+    pub path: String,
+    pub role: SourceRole,
+    pub attribution: Attribution,
+    pub projection_kind: ProjectionKind,
+    pub equivalence_basis: EquivalenceBasis,
+    pub is_canonical: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -135,6 +161,10 @@ pub(crate) struct SourceRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub content_hash: String,
+    pub canonical_source_id: SourceId,
+    pub equivalence_basis: EquivalenceBasis,
+    pub projection_kind: ProjectionKind,
+    pub equivalence_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -184,6 +214,7 @@ pub(crate) struct PassageReadItem {
 pub(crate) struct SourceOriginalItem {
     pub work: WorkRecord,
     pub source: SourceRecord,
+    pub equivalent_sources: Vec<EquivalentSourceRef>,
     pub diagnostics: Vec<String>,
     pub passage_ids: Vec<PassageId>,
     pub byte_len: usize,
@@ -197,10 +228,12 @@ pub(crate) struct SourceOriginalItem {
 pub(crate) struct SourceOverviewItem {
     pub work: WorkRecord,
     pub source: SourceRecord,
+    pub equivalent_sources: Vec<EquivalentSourceRef>,
     pub passage_count: usize,
     pub cue_count: usize,
     pub diagnostics: Vec<String>,
     pub passage_ids: Vec<PassageId>,
+    pub canonical_passage_ids: Vec<PassageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -220,6 +253,10 @@ pub(crate) struct SourceListEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_basis: Option<String>,
     pub content_hash: String,
+    pub canonical_source_id: SourceId,
+    pub is_canonical: bool,
+    pub equivalence_basis: EquivalenceBasis,
+    pub equivalent_count: usize,
     pub passage_count: usize,
     pub diagnostics_count: usize,
 }
@@ -308,7 +345,10 @@ impl CorpusStore {
             })?;
 
         let store = Self { conn, release };
-        store.validate_full(expected_counts)
+        store.validate_full(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            expected_counts,
+        )
     }
 
     pub(crate) fn query_bm25_candidates(
@@ -382,57 +422,70 @@ impl CorpusStore {
     }
 
     fn verify_format_header(&self) -> Result<(), ClecError> {
-        let fmt: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='corpus_format'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+        let expect_meta = |key: &str, expected: &str, err_msg: &str| -> Result<(), ClecError> {
+            let actual: Option<String> = self
+                .conn
+                .query_row("SELECT value FROM metadata WHERE key=?", [key], |row| {
+                    row.get(0)
+                })
+                .ok();
+            if actual.as_deref() != Some(expected) {
+                return Err(ClecError::new(ErrorCode::InvalidPackage, err_msg));
+            }
+            Ok(())
+        };
 
-        if fmt.as_deref() != Some(CORPUS_FORMAT) {
-            return Err(ClecError::new(
-                ErrorCode::InvalidPackage,
-                format!(
-                    "Unsupported corpus format (expected {CORPUS_FORMAT}; legacy format revisions 1, 2, and 3 are unsupported)."
-                ),
-            ));
-        }
-
-        let seg: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='segmentation_revision'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        if seg.as_deref() != Some(SEGMENTATION_REVISION) {
-            return Err(ClecError::new(
-                ErrorCode::InvalidPackage,
-                "Unsupported corpus segmentation revision.",
-            ));
-        }
+        expect_meta(
+            "corpus_format",
+            CORPUS_FORMAT,
+            "Unsupported corpus format (expected clec-native-v2; legacy format revisions 1, 2, 3, and clec-native-v1 are unsupported).",
+        )?;
+        expect_meta(
+            "segmentation_revision",
+            SEGMENTATION_REVISION,
+            "Unsupported corpus segmentation revision.",
+        )?;
+        expect_meta(
+            "tokenization_revision",
+            TOKENIZATION_REVISION,
+            "Unsupported corpus tokenization revision.",
+        )?;
+        expect_meta(
+            "normalization_revision",
+            NORMALIZATION_REVISION,
+            "Unsupported corpus normalization revision.",
+        )?;
+        expect_meta(
+            "dictionary_revision",
+            DICTIONARY_REVISION,
+            "Unsupported corpus dictionary revision.",
+        )?;
+        expect_meta(
+            "equivalence_revision",
+            EQUIVALENCE_REVISION,
+            "Unsupported corpus equivalence revision.",
+        )?;
         Ok(())
     }
 
     pub fn counts(&self) -> Result<CorpusCounts, ClecError> {
-        let count_of = |table: &str| -> Result<usize, ClecError> {
-            let sql = format!("SELECT count(*) FROM {table}");
-            let n: i64 = self.conn.query_row(&sql, [], |r| r.get(0)).map_err(|e| {
+        let count_of = |sql: &str| -> Result<usize, ClecError> {
+            let n: i64 = self.conn.query_row(sql, [], |r| r.get(0)).map_err(|e| {
                 ClecError::new(ErrorCode::InvalidPackage, format!("Count failed: {e}"))
             })?;
             usize::try_from(n)
                 .map_err(|_| ClecError::new(ErrorCode::InvalidPackage, "Negative count"))
         };
         Ok(CorpusCounts {
-            works: count_of("works")?,
-            sources: count_of("sources")?,
-            blobs: count_of("blobs")?,
-            passages: count_of("passages")?,
-            cues: count_of("cues")?,
-            inventory: count_of("inventory")?,
+            works: count_of("SELECT count(*) FROM works")?,
+            sources: count_of("SELECT count(*) FROM sources")?,
+            canonical_sources: count_of(
+                "SELECT count(*) FROM source_canonical_map WHERE source_id = canonical_source_id",
+            )?,
+            blobs: count_of("SELECT count(*) FROM blobs")?,
+            passages: count_of("SELECT count(*) FROM passages")?,
+            cues: count_of("SELECT count(*) FROM cues")?,
+            inventory: count_of("SELECT count(*) FROM inventory")?,
         })
     }
 
@@ -465,7 +518,11 @@ impl CorpusStore {
         })
     }
 
-    fn validate_full(&self, expected_counts: &CorpusCounts) -> Result<(), ClecError> {
+    fn validate_full(
+        &self,
+        work_dir: &Path,
+        expected_counts: &CorpusCounts,
+    ) -> Result<(), ClecError> {
         let actual_schema = collect_schema_rows(&self.conn)?;
         let expected_conn = Connection::open_in_memory().map_err(|e| {
             ClecError::new(
@@ -480,7 +537,7 @@ impl CorpusStore {
         if actual_schema != expected_schema {
             return Err(ClecError::new(
                 ErrorCode::InvalidPackage,
-                "Corpus SQLite schema does not match clec-native-v1.",
+                "Corpus SQLite schema does not match clec-native-v2.",
             ));
         }
 
@@ -511,11 +568,10 @@ impl CorpusStore {
             ));
         }
 
-        let blobs_map = self.validate_blobs()?;
+        let valid_blobs = self.validate_blobs()?;
         let work_ids = self.validate_works()?;
-        let source_map = self.validate_sources(&work_ids, &blobs_map)?;
-        let extractions = self.validate_cues_and_diagnostics(&source_map, &blobs_map)?;
-        self.validate_passages_and_fts(&source_map, &blobs_map, &extractions)
+        let source_map = self.validate_sources(&work_ids, &valid_blobs)?;
+        self.validate_sources_passages_and_fts(work_dir, &source_map, expected_counts)
     }
 
     fn run_native_fts5_integrity_check(&self) -> Result<(), ClecError> {
@@ -540,8 +596,8 @@ impl CorpusStore {
         Ok(())
     }
 
-    fn validate_blobs(&self) -> Result<HashMap<String, Vec<u8>>, ClecError> {
-        let mut blobs_map: HashMap<String, Vec<u8>> = HashMap::new();
+    fn validate_blobs(&self) -> Result<HashSet<String>, ClecError> {
+        let mut valid_hashes: HashSet<String> = HashSet::new();
         let mut stmt = self
             .conn
             .prepare("SELECT content_hash, raw_bytes, byte_len FROM blobs")
@@ -569,9 +625,9 @@ impl CorpusStore {
                     "Blob contains empty or NUL content.",
                 ));
             }
-            blobs_map.insert(hash, bytes);
+            valid_hashes.insert(hash);
         }
-        Ok(blobs_map)
+        Ok(valid_hashes)
     }
 
     fn validate_works(&self) -> Result<HashMap<String, WorkId>, ClecError> {
@@ -606,13 +662,16 @@ impl CorpusStore {
     fn validate_sources(
         &self,
         work_ids: &HashMap<String, WorkId>,
-        blobs_map: &HashMap<String, Vec<u8>>,
+        valid_blobs: &HashSet<String>,
     ) -> Result<HashMap<String, SourceRecord>, ClecError> {
         let mut source_map: HashMap<String, SourceRecord> = HashMap::new();
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, work_id, path, title, role, attribution, quality, date, date_basis, origin, content_hash FROM sources",
+                "SELECT s.id, s.work_id, s.path, s.title, s.role, s.attribution, s.quality, s.date, s.date_basis, s.origin, s.content_hash,
+                        m.canonical_source_id, m.equivalence_hash, m.projection_kind, m.equivalence_basis
+                 FROM sources s
+                 LEFT JOIN source_canonical_map m ON m.source_id = s.id",
             )
             .map_err(map_sql_pkg)?;
         let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
@@ -628,6 +687,10 @@ impl CorpusStore {
             let date_basis: Option<String> = row.get(8).map_err(map_sql_pkg)?;
             let origin: Option<String> = row.get(9).map_err(map_sql_pkg)?;
             let content_hash: String = row.get(10).map_err(map_sql_pkg)?;
+            let canon_str: Option<String> = row.get(11).map_err(map_sql_pkg)?;
+            let equiv_hash: Option<String> = row.get(12).map_err(map_sql_pkg)?;
+            let proj_kind_str: Option<String> = row.get(13).map_err(map_sql_pkg)?;
+            let equiv_basis_str: Option<String> = row.get(14).map_err(map_sql_pkg)?;
 
             let work_id = WorkId::parse(&work_id_str)?;
             if !work_ids.contains_key(work_id.as_str()) {
@@ -650,7 +713,7 @@ impl CorpusStore {
                 }
                 None => None,
             };
-            if !blobs_map.contains_key(&content_hash) {
+            if !valid_blobs.contains(&content_hash) {
                 return Err(ClecError::new(
                     ErrorCode::InvalidPackage,
                     "Source references missing blob.",
@@ -672,6 +735,33 @@ impl CorpusStore {
                     "SourceId does not match derived source identity.",
                 ));
             }
+            let canonical_source_id = SourceId::parse(canon_str.as_deref().ok_or_else(|| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Source is missing source_canonical_map row.",
+                )
+            })?)?;
+            let equivalence_hash = equiv_hash.ok_or_else(|| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Source is missing equivalence_hash.",
+                )
+            })?;
+            let projection_kind =
+                ProjectionKind::parse(proj_kind_str.as_deref().ok_or_else(|| {
+                    ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Source is missing projection_kind.",
+                    )
+                })?)?;
+            let equivalence_basis =
+                EquivalenceBasis::parse(equiv_basis_str.as_deref().ok_or_else(|| {
+                    ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Source is missing equivalence_basis.",
+                    )
+                })?)?;
+
             source_map.insert(
                 id_str,
                 SourceRecord {
@@ -686,366 +776,564 @@ impl CorpusStore {
                     date_basis,
                     origin,
                     content_hash,
+                    canonical_source_id,
+                    equivalence_basis,
+                    projection_kind,
+                    equivalence_hash,
                 },
             );
+        }
+
+        let map_total: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM source_canonical_map", [], |r| {
+                r.get(0)
+            })
+            .map_err(map_sql_pkg)?;
+        if usize::try_from(map_total).ok() != Some(source_map.len()) {
+            return Err(ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Orphan rows in source_canonical_map.",
+            ));
         }
         Ok(source_map)
     }
 
-    fn validate_cues_and_diagnostics(
+    fn validate_sources_passages_and_fts(
         &self,
+        work_dir: &Path,
         source_map: &HashMap<String, SourceRecord>,
-        blobs_map: &HashMap<String, Vec<u8>>,
-    ) -> Result<HashMap<String, ExtractionResult>, ClecError> {
-        let mut actual_cues: HashMap<String, Vec<SubtitleCue>> = HashMap::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT source_id, ordinal, original_identifier, raw_start_byte, raw_end_byte, text_start_byte, text_end_byte, start_ms, end_ms FROM cues ORDER BY source_id, ordinal",
-                )
-                .map_err(map_sql_pkg)?;
-            let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
-            while let Some(row) = rows.next().map_err(map_sql_pkg)? {
-                let source_id: String = row.get(0).map_err(map_sql_pkg)?;
-                if !source_map.contains_key(&source_id) {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Cue references unknown source.",
-                    ));
-                }
-                let cue = SubtitleCue {
-                    ordinal: usize::try_from(row.get::<_, i64>(1).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                    original_identifier: row.get(2).map_err(map_sql_pkg)?,
-                    raw_start_byte: usize::try_from(row.get::<_, i64>(3).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                    raw_end_byte: usize::try_from(row.get::<_, i64>(4).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                    text_start_byte: usize::try_from(row.get::<_, i64>(5).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                    text_end_byte: usize::try_from(row.get::<_, i64>(6).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                    start_ms: u64::try_from(row.get::<_, i64>(7).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                    end_ms: u64::try_from(row.get::<_, i64>(8).map_err(map_sql_pkg)?)
-                        .map_err(|_| bad_cue())?,
-                };
-                actual_cues.entry(source_id).or_default().push(cue);
-            }
-        }
+        expected_counts: &CorpusCounts,
+    ) -> Result<(), ClecError> {
+        let num_buckets = if expected_counts.passages <= 2000 {
+            1usize
+        } else {
+            64usize
+        };
+        let mut expected_buckets = PostingBuckets::new(work_dir, "expected", num_buckets)?;
+        let mut expected_docsize: HashMap<i64, (usize, usize)> =
+            HashMap::with_capacity(expected_counts.passages);
+        let mut term_doc_freq: HashMap<String, u32> = HashMap::new();
 
-        let mut actual_diags: HashMap<String, Vec<String>> = HashMap::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT source_id, ordinal, message FROM source_diagnostics ORDER BY source_id, ordinal")
-                .map_err(map_sql_pkg)?;
-            let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
-            while let Some(row) = rows.next().map_err(map_sql_pkg)? {
-                let source_id: String = row.get(0).map_err(map_sql_pkg)?;
-                if !source_map.contains_key(&source_id) {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Diagnostic references unknown source.",
-                    ));
-                }
-                let ord =
-                    usize::try_from(row.get::<_, i64>(1).map_err(map_sql_pkg)?).map_err(|_| {
-                        ClecError::new(ErrorCode::InvalidPackage, "Negative diagnostic ordinal.")
-                    })?;
-                let list = actual_diags.entry(source_id).or_default();
-                if ord != list.len() {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Non-sequential source diagnostic ordinal.",
-                    ));
-                }
-                list.push(row.get(2).map_err(map_sql_pkg)?);
-            }
+        struct GroupMemberMeta<'a> {
+            source: &'a SourceRecord,
+            is_subtitle: bool,
+            has_cues: bool,
+            diagnostics_count: usize,
         }
+        let mut equiv_groups: HashMap<(&str, SourceRole, &str), Vec<GroupMemberMeta<'_>>> =
+            HashMap::new();
 
-        let mut extractions = HashMap::with_capacity(source_map.len());
+        let mut stmt_blob = self
+            .conn
+            .prepare("SELECT raw_bytes FROM blobs WHERE content_hash = ?1")
+            .map_err(map_sql_pkg)?;
+        let mut stmt_cues = self
+            .conn
+            .prepare(
+                "SELECT ordinal, original_identifier, raw_start_byte, raw_end_byte, text_start_byte, text_end_byte, start_ms, end_ms FROM cues WHERE source_id = ?1 ORDER BY ordinal",
+            )
+            .map_err(map_sql_pkg)?;
+        let mut stmt_diags = self
+            .conn
+            .prepare("SELECT ordinal, message FROM source_diagnostics WHERE source_id = ?1 ORDER BY ordinal")
+            .map_err(map_sql_pkg)?;
+        let mut stmt_passages = self
+            .conn
+            .prepare(
+                "SELECT rowid, id, work_id, ordinal, boundary, is_continuation, continued_from, continued_to, text FROM passages WHERE source_id = ?1 ORDER BY ordinal",
+            )
+            .map_err(map_sql_pkg)?;
+        let mut stmt_spans = self
+            .conn
+            .prepare(
+                "SELECT span_ordinal, start_byte, end_byte, cue_ordinal FROM passage_spans WHERE passage_id = ?1 ORDER BY span_ordinal",
+            )
+            .map_err(map_sql_pkg)?;
+        let mut stmt_fts = self
+            .conn
+            .prepare("SELECT rowid FROM search WHERE rowid = ?1")
+            .map_err(map_sql_pkg)?;
+
+        let mut checked_cues = 0usize;
+        let mut checked_diags = 0usize;
+        let mut checked_passages = 0usize;
+        let mut checked_spans = 0usize;
+        let mut checked_canonical_sources = 0usize;
+
         for (source_id, source) in source_map {
-            let raw_bytes = blobs_map.get(&source.content_hash).unwrap();
+            let raw_bytes: Vec<u8> = stmt_blob
+                .query_row([source.content_hash.as_str()], |r| r.get(0))
+                .map_err(map_sql_pkg)?;
             let is_sub = is_subtitle_path(&source.path);
-            let expected_ext = extract_source(raw_bytes, is_sub)?;
-            let db_cues = actual_cues.get(source_id).map(Vec::as_slice).unwrap_or(&[]);
+            let expected_ext = extract_source(&raw_bytes, is_sub)?;
             if is_sub && expected_ext.cues.is_empty() {
                 return Err(ClecError::new(
                     ErrorCode::InvalidPackage,
                     "Subtitle source has no usable cues.",
                 ));
             }
-            if db_cues != expected_ext.cues.as_slice() {
-                return Err(bad_cue());
+
+            {
+                let mut db_cues = Vec::new();
+                let mut cue_rows = stmt_cues.query([source_id.as_str()]).map_err(map_sql_pkg)?;
+                while let Some(row) = cue_rows.next().map_err(map_sql_pkg)? {
+                    db_cues.push(SubtitleCue {
+                        ordinal: usize::try_from(row.get::<_, i64>(0).map_err(map_sql_pkg)?)
+                            .map_err(|_| bad_cue())?,
+                        original_identifier: row.get(1).map_err(map_sql_pkg)?,
+                        raw_start_byte: usize::try_from(row.get::<_, i64>(2).map_err(map_sql_pkg)?)
+                            .map_err(|_| bad_cue())?,
+                        raw_end_byte: usize::try_from(row.get::<_, i64>(3).map_err(map_sql_pkg)?)
+                            .map_err(|_| bad_cue())?,
+                        text_start_byte: usize::try_from(
+                            row.get::<_, i64>(4).map_err(map_sql_pkg)?,
+                        )
+                        .map_err(|_| bad_cue())?,
+                        text_end_byte: usize::try_from(row.get::<_, i64>(5).map_err(map_sql_pkg)?)
+                            .map_err(|_| bad_cue())?,
+                        start_ms: u64::try_from(row.get::<_, i64>(6).map_err(map_sql_pkg)?)
+                            .map_err(|_| bad_cue())?,
+                        end_ms: u64::try_from(row.get::<_, i64>(7).map_err(map_sql_pkg)?)
+                            .map_err(|_| bad_cue())?,
+                    });
+                }
+                if db_cues.as_slice() != expected_ext.cues.as_slice() {
+                    return Err(bad_cue());
+                }
+                checked_cues += db_cues.len();
             }
-            let db_diags = actual_diags
-                .get(source_id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if db_diags != expected_ext.diagnostics.as_slice() {
+
+            {
+                let mut db_diags = Vec::new();
+                let mut diag_rows = stmt_diags
+                    .query([source_id.as_str()])
+                    .map_err(map_sql_pkg)?;
+                while let Some(row) = diag_rows.next().map_err(map_sql_pkg)? {
+                    let ord = usize::try_from(row.get::<_, i64>(0).map_err(map_sql_pkg)?).map_err(
+                        |_| {
+                            ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Negative diagnostic ordinal.",
+                            )
+                        },
+                    )?;
+                    if ord != db_diags.len() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Non-sequential source diagnostic ordinal.",
+                        ));
+                    }
+                    db_diags.push(row.get::<_, String>(1).map_err(map_sql_pkg)?);
+                }
+                if db_diags.as_slice() != expected_ext.diagnostics.as_slice() {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Source diagnostics do not match canonical cue extraction.",
+                    ));
+                }
+                checked_diags += db_diags.len();
+            }
+
+            let proj = compute_equivalence_projection(&expected_ext, &source.path)?;
+            if source.equivalence_hash != proj.equivalence_hash
+                || source.projection_kind != proj.kind
+            {
                 return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Source diagnostics do not match canonical cue extraction.",
+                    ErrorCode::IntegrityMismatch,
+                    "Source equivalence projection does not match canonical extraction.",
                 ));
             }
-            extractions.insert(source_id.clone(), expected_ext);
-        }
+            equiv_groups
+                .entry((
+                    source.work_id.as_str(),
+                    source.role,
+                    source.equivalence_hash.as_str(),
+                ))
+                .or_default()
+                .push(GroupMemberMeta {
+                    source,
+                    is_subtitle: is_sub,
+                    has_cues: !expected_ext.cues.is_empty(),
+                    diagnostics_count: expected_ext.diagnostics.len(),
+                });
 
-        Ok(extractions)
-    }
+            let is_canonical = source.canonical_source_id == source.source_id;
+            let mut stored_passages = Vec::new();
+            {
+                let mut p_rows = stmt_passages
+                    .query([source_id.as_str()])
+                    .map_err(map_sql_pkg)?;
+                while let Some(row) = p_rows.next().map_err(map_sql_pkg)? {
+                    let rowid: i64 = row.get(0).map_err(map_sql_pkg)?;
+                    let id_str: String = row.get(1).map_err(map_sql_pkg)?;
+                    let work_id_str: String = row.get(2).map_err(map_sql_pkg)?;
+                    let ordinal_i64: i64 = row.get(3).map_err(map_sql_pkg)?;
+                    let boundary_str: String = row.get(4).map_err(map_sql_pkg)?;
+                    let is_cont_i64: i64 = row.get(5).map_err(map_sql_pkg)?;
+                    let cont_from: Option<String> = row.get(6).map_err(map_sql_pkg)?;
+                    let cont_to: Option<String> = row.get(7).map_err(map_sql_pkg)?;
+                    let text: String = row.get(8).map_err(map_sql_pkg)?;
 
-    fn validate_passages_and_fts(
-        &self,
-        source_map: &HashMap<String, SourceRecord>,
-        blobs_map: &HashMap<String, Vec<u8>>,
-        extractions: &HashMap<String, ExtractionResult>,
-    ) -> Result<(), ClecError> {
-        struct StoredPassageRow {
-            id: PassageId,
-            boundary: BoundaryKind,
-            is_continuation: bool,
-            continued_from: Option<PassageId>,
-            continued_to: Option<PassageId>,
-            spans: Vec<ByteSpan>,
-            text: String,
-        }
-
-        let mut by_source: HashMap<String, Vec<StoredPassageRow>> = HashMap::new();
-        let mut expected_postings: BTreeMap<(i64, String, usize), String> = BTreeMap::new();
-        let mut expected_docsize: HashMap<i64, (usize, usize)> = HashMap::new();
-        let mut fts_rows = 0usize;
-
-        {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT rowid, id, source_id, work_id, ordinal, boundary, is_continuation, continued_from, continued_to, text FROM passages ORDER BY source_id, ordinal",
-                )
-                .map_err(map_sql_pkg)?;
-            let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
-            while let Some(row) = rows.next().map_err(map_sql_pkg)? {
-                let rowid: i64 = row.get(0).map_err(map_sql_pkg)?;
-                let id_str: String = row.get(1).map_err(map_sql_pkg)?;
-                let source_id_str: String = row.get(2).map_err(map_sql_pkg)?;
-                let work_id_str: String = row.get(3).map_err(map_sql_pkg)?;
-                let ordinal_i64: i64 = row.get(4).map_err(map_sql_pkg)?;
-                let boundary_str: String = row.get(5).map_err(map_sql_pkg)?;
-                let is_cont_i64: i64 = row.get(6).map_err(map_sql_pkg)?;
-                let cont_from: Option<String> = row.get(7).map_err(map_sql_pkg)?;
-                let cont_to: Option<String> = row.get(8).map_err(map_sql_pkg)?;
-                let text: String = row.get(9).map_err(map_sql_pkg)?;
-
-                let is_continuation = match is_cont_i64 {
-                    0 => false,
-                    1 => true,
-                    _ => {
+                    if !is_canonical {
                         return Err(ClecError::new(
                             ErrorCode::InvalidPackage,
-                            "Invalid is_continuation value in passages.",
+                            "Non-canonical equivalent source must not have indexed passages.",
                         ));
                     }
-                };
-                let continued_from = cont_from.as_deref().map(PassageId::parse).transpose()?;
-                let continued_to = cont_to.as_deref().map(PassageId::parse).transpose()?;
 
-                let source = source_map.get(&source_id_str).ok_or_else(|| {
-                    ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Passage references unknown source.",
-                    )
-                })?;
-                if work_id_str != source.work_id.as_str() {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Passage work_id disagrees with source work_id.",
-                    ));
-                }
-                let ordinal = usize::try_from(ordinal_i64).map_err(|_| {
-                    ClecError::new(ErrorCode::InvalidPackage, "Negative passage ordinal.")
-                })?;
-                let list = by_source.entry(source_id_str.clone()).or_default();
-                if ordinal != list.len() {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Non-contiguous passage ordinals.",
-                    ));
-                }
-
-                let boundary = BoundaryKind::parse(&boundary_str)?;
-                let spans = self.load_spans(&id_str)?;
-                let ext = extractions.get(&source_id_str).unwrap();
-                for span in &spans {
-                    if ext.is_subtitle {
-                        let Some(cue_ord) = span.cue_ordinal() else {
+                    let is_continuation = match is_cont_i64 {
+                        0 => false,
+                        1 => true,
+                        _ => {
                             return Err(ClecError::new(
                                 ErrorCode::InvalidPackage,
-                                "Subtitle passage span is missing cue_ordinal.",
-                            ));
-                        };
-                        let Some(cue) = ext.cues.get(cue_ord) else {
-                            return Err(ClecError::new(
-                                ErrorCode::InvalidPackage,
-                                "Passage span references non-existent cue ordinal.",
-                            ));
-                        };
-                        if span.start_byte() < cue.text_start_byte
-                            || span.end_byte() > cue.text_end_byte
-                        {
-                            return Err(ClecError::new(
-                                ErrorCode::InvalidPackage,
-                                "Passage span lies outside its referenced cue payload.",
+                                "Invalid is_continuation value in passages.",
                             ));
                         }
-                    } else if span.cue_ordinal().is_some() {
+                    };
+                    let continued_from = cont_from.as_deref().map(PassageId::parse).transpose()?;
+                    let continued_to = cont_to.as_deref().map(PassageId::parse).transpose()?;
+
+                    if work_id_str != source.work_id.as_str() {
                         return Err(ClecError::new(
                             ErrorCode::InvalidPackage,
-                            "Plain-text passage span must not carry cue_ordinal.",
+                            "Passage work_id disagrees with source work_id.",
                         ));
                     }
-                }
+                    let ordinal = usize::try_from(ordinal_i64).map_err(|_| {
+                        ClecError::new(ErrorCode::InvalidPackage, "Negative passage ordinal.")
+                    })?;
+                    if ordinal != stored_passages.len() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Non-contiguous passage ordinals.",
+                        ));
+                    }
 
-                let raw_bytes = blobs_map.get(&source.content_hash).unwrap();
-                let reconstructed = reconstruct_passage_text(raw_bytes, &spans)?;
-                if reconstructed != text {
-                    return Err(ClecError::new(
-                        ErrorCode::IntegrityMismatch,
-                        "Passage text does not match source byte spans.",
+                    let boundary = BoundaryKind::parse(&boundary_str)?;
+                    let mut spans = Vec::new();
+                    {
+                        let mut s_rows =
+                            stmt_spans.query([id_str.as_str()]).map_err(map_sql_pkg)?;
+                        while let Some(srow) = s_rows.next().map_err(map_sql_pkg)? {
+                            let ord: i64 = srow.get(0).map_err(map_sql_pkg)?;
+                            if usize::try_from(ord).ok() != Some(spans.len()) {
+                                return Err(ClecError::new(
+                                    ErrorCode::InvalidPackage,
+                                    "Non-sequential passage span ordinal.",
+                                ));
+                            }
+                            let start =
+                                usize::try_from(srow.get::<_, i64>(1).map_err(map_sql_pkg)?)
+                                    .map_err(|_| {
+                                        ClecError::new(
+                                            ErrorCode::InvalidPackage,
+                                            "Negative span start.",
+                                        )
+                                    })?;
+                            let end = usize::try_from(srow.get::<_, i64>(2).map_err(map_sql_pkg)?)
+                                .map_err(|_| {
+                                    ClecError::new(ErrorCode::InvalidPackage, "Negative span end.")
+                                })?;
+                            let cue_ord: Option<i64> = srow.get(3).map_err(map_sql_pkg)?;
+                            let cue_ordinal = cue_ord
+                                .map(|v| {
+                                    usize::try_from(v).map_err(|_| {
+                                        ClecError::new(
+                                            ErrorCode::InvalidPackage,
+                                            "Negative cue ordinal.",
+                                        )
+                                    })
+                                })
+                                .transpose()?;
+                            spans.push(ByteSpan::new(start, end, cue_ordinal)?);
+                        }
+                    }
+                    if spans.is_empty() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Passage has zero source byte spans.",
+                        ));
+                    }
+                    checked_spans += spans.len();
+
+                    for span in &spans {
+                        if expected_ext.is_subtitle {
+                            let Some(cue_ord) = span.cue_ordinal() else {
+                                return Err(ClecError::new(
+                                    ErrorCode::InvalidPackage,
+                                    "Subtitle passage span is missing cue_ordinal.",
+                                ));
+                            };
+                            let Some(cue) = expected_ext.cues.get(cue_ord) else {
+                                return Err(ClecError::new(
+                                    ErrorCode::InvalidPackage,
+                                    "Passage span references non-existent cue ordinal.",
+                                ));
+                            };
+                            if span.start_byte() < cue.text_start_byte
+                                || span.end_byte() > cue.text_end_byte
+                            {
+                                return Err(ClecError::new(
+                                    ErrorCode::InvalidPackage,
+                                    "Passage span lies outside its referenced cue payload.",
+                                ));
+                            }
+                        } else if span.cue_ordinal().is_some() {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Plain-text passage span must not carry cue_ordinal.",
+                            ));
+                        }
+                    }
+
+                    let reconstructed = reconstruct_passage_text(&raw_bytes, &spans)?;
+                    if reconstructed != text {
+                        return Err(ClecError::new(
+                            ErrorCode::IntegrityMismatch,
+                            "Passage text does not match source byte spans.",
+                        ));
+                    }
+                    if text.chars().count() > 2000 {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Passage exceeds 2000 Unicode scalar cap.",
+                        ));
+                    }
+
+                    let parsed_id = PassageId::parse(&id_str)?;
+                    if parsed_id != PassageId::derive(&source.source_id, ordinal, &spans) {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "PassageId does not match derived provenance.",
+                        ));
+                    }
+
+                    let has_fts: Option<i64> = stmt_fts.query_row([rowid], |r| r.get(0)).ok();
+                    if has_fts.is_none() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Passage is missing from FTS5 search table.",
+                        ));
+                    }
+
+                    stored_passages.push((
+                        rowid,
+                        parsed_id,
+                        boundary,
+                        is_continuation,
+                        continued_from,
+                        continued_to,
+                        spans,
+                        text,
                     ));
                 }
-                if text.chars().count() > 2000 {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Passage exceeds 2000 Unicode scalar cap.",
-                    ));
-                }
+            }
 
-                let parsed_id = PassageId::parse(&id_str)?;
-                if parsed_id != PassageId::derive(&source.source_id, ordinal, &spans) {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "PassageId does not match derived provenance.",
-                    ));
-                }
+            if !is_canonical {
+                continue;
+            }
+            checked_canonical_sources += 1;
+            if stored_passages.is_empty() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Canonical source has zero passages.",
+                ));
+            }
 
-                let has_fts: Option<i64> = self
-                    .conn
-                    .query_row("SELECT rowid FROM search WHERE rowid=?", [rowid], |r| {
-                        r.get(0)
-                    })
-                    .ok();
-                if has_fts.is_none() {
-                    return Err(ClecError::new(
-                        ErrorCode::InvalidPackage,
-                        "Passage is missing from FTS5 search table.",
-                    ));
-                }
+            let expected_drafts = segment_source(&expected_ext, source.role)?;
+            if stored_passages.len() != expected_drafts.len() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Passage count does not match canonical segmentation.",
+                ));
+            }
 
-                let title_tokens = index_tokens_string(&source.title);
-                let body_tokens = index_tokens_string(&text);
-                let mut title_count = 0usize;
-                for (offset, tok) in title_tokens.split_ascii_whitespace().enumerate() {
-                    expected_postings
-                        .insert((rowid, "title_tokens".to_owned(), offset), tok.to_owned());
-                    title_count += 1;
-                }
-                let mut body_count = 0usize;
-                for (offset, tok) in body_tokens.split_ascii_whitespace().enumerate() {
-                    expected_postings
-                        .insert((rowid, "body_tokens".to_owned(), offset), tok.to_owned());
-                    body_count += 1;
-                }
-                expected_docsize.insert(rowid, (title_count, body_count));
-
-                fts_rows += 1;
-                list.push(StoredPassageRow {
-                    id: parsed_id,
+            let title_tokens = index_tokens_string(&source.title);
+            for (idx, (stored, draft)) in stored_passages
+                .iter()
+                .zip(expected_drafts.iter())
+                .enumerate()
+            {
+                let (
+                    rowid,
+                    pid,
                     boundary,
                     is_continuation,
                     continued_from,
                     continued_to,
                     spans,
                     text,
-                });
-            }
-        }
-
-        for (source_id, source) in source_map {
-            let actual = by_source.get(source_id).ok_or_else(|| {
-                ClecError::new(ErrorCode::InvalidPackage, "Source has zero passages.")
-            })?;
-            let ext = extractions.get(source_id).unwrap();
-            let expected_drafts = segment_source(ext, source.role)?;
-            if actual.len() != expected_drafts.len() {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Passage count does not match canonical segmentation.",
-                ));
-            }
-            for (idx, (row, draft)) in actual.iter().zip(expected_drafts.iter()).enumerate() {
-                if row.boundary != draft.boundary
-                    || row.is_continuation != draft.is_continuation
-                    || row.spans != draft.spans
-                    || row.text != draft.text
+                ) = stored;
+                if *boundary != draft.boundary
+                    || *is_continuation != draft.is_continuation
+                    || *spans != draft.spans
+                    || *text != draft.text
                 {
                     return Err(ClecError::new(
                         ErrorCode::InvalidPackage,
                         "Passage segmentation or spans do not match canonical ingest.",
                     ));
                 }
-                if idx == 0 && (row.is_continuation || row.continued_from.is_some()) {
+                if idx == 0 && (*is_continuation || continued_from.is_some()) {
                     return Err(ClecError::new(
                         ErrorCode::InvalidPackage,
                         "First passage cannot be a continuation.",
                     ));
                 }
                 if idx > 0 {
-                    let prev = &actual[idx - 1];
-                    if row.is_continuation {
-                        if row.continued_from.as_ref() != Some(&prev.id)
-                            || prev.continued_to.as_ref() != Some(&row.id)
+                    let prev_id = &stored_passages[idx - 1].1;
+                    let prev_to = &stored_passages[idx - 1].5;
+                    if *is_continuation {
+                        if continued_from.as_ref() != Some(prev_id) || prev_to.as_ref() != Some(pid)
                         {
                             return Err(ClecError::new(
                                 ErrorCode::InvalidPackage,
                                 "Continuation links do not match adjacent passage IDs.",
                             ));
                         }
-                    } else if row.continued_from.is_some() || prev.continued_to.is_some() {
+                    } else if continued_from.is_some() || prev_to.is_some() {
                         return Err(ClecError::new(
                             ErrorCode::InvalidPackage,
                             "Unexpected continuation link on non-continuation boundary.",
                         ));
                     }
                 }
-                if idx + 1 == actual.len() && row.continued_to.is_some() {
+                if idx + 1 == stored_passages.len() && continued_to.is_some() {
                     return Err(ClecError::new(
                         ErrorCode::InvalidPackage,
                         "Last passage cannot carry continued_to.",
                     ));
                 }
+
+                let mut seen_terms: HashSet<&str> = HashSet::new();
+                let mut title_count = 0usize;
+                for (offset, tok) in title_tokens.split_ascii_whitespace().enumerate() {
+                    expected_buckets.push(*rowid, 0, offset as u32, tok.as_bytes())?;
+                    seen_terms.insert(tok);
+                    title_count += 1;
+                }
+                let body_tokens = index_tokens_string(text);
+                let mut body_count = 0usize;
+                for (offset, tok) in body_tokens.split_ascii_whitespace().enumerate() {
+                    expected_buckets.push(*rowid, 1, offset as u32, tok.as_bytes())?;
+                    seen_terms.insert(tok);
+                    body_count += 1;
+                }
+                for tok in seen_terms {
+                    if let Some(cnt) = term_doc_freq.get_mut(tok) {
+                        *cnt = cnt.saturating_add(1);
+                    } else {
+                        term_doc_freq.insert(tok.to_owned(), 1);
+                    }
+                }
+                expected_docsize.insert(*rowid, (title_count, body_count));
+                checked_passages += 1;
             }
         }
 
-        let total_fts: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM search", [], |r| r.get(0))
-            .map_err(map_sql_pkg)?;
-        if usize::try_from(total_fts).ok() != Some(fts_rows) {
+        if checked_canonical_sources != expected_counts.canonical_sources {
             return Err(ClecError::new(
                 ErrorCode::InvalidPackage,
-                "Orphan FTS5 search rows detected.",
+                "Canonical source count mismatch.",
             ));
         }
 
-        self.validate_fts_postings(&expected_postings, &expected_docsize)
+        for members in equiv_groups.values() {
+            let candidates: Vec<CanonicalCandidate<'_>> = members
+                .iter()
+                .map(|m| CanonicalCandidate {
+                    source_id: &m.source.source_id,
+                    path: &m.source.path,
+                    attribution: m.source.attribution,
+                    is_subtitle: m.is_subtitle,
+                    has_cues: m.has_cues,
+                    diagnostics_count: m.diagnostics_count,
+                })
+                .collect();
+            let winner_idx = select_canonical_index(&candidates).ok_or_else(|| {
+                ClecError::new(ErrorCode::InvalidPackage, "Empty equivalence group.")
+            })?;
+            let winner_id = &members[winner_idx].source.source_id;
+            for (idx, m) in members.iter().enumerate() {
+                if &m.source.canonical_source_id != winner_id {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Canonical representative selection disagrees with deterministic policy.",
+                    ));
+                }
+                let expected_basis = if members.len() == 1 {
+                    EquivalenceBasis::UniqueInWorkRole
+                } else if idx == winner_idx {
+                    EquivalenceBasis::CanonicalByTimingAndFormat
+                } else {
+                    EquivalenceBasis::CollapsedToCanonical
+                };
+                if m.source.equivalence_basis != expected_basis {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Equivalence basis disagrees with canonical membership.",
+                    ));
+                }
+            }
+        }
+
+        let check_total = |sql: &str, expected: usize, msg: &str| -> Result<(), ClecError> {
+            let actual: i64 = self
+                .conn
+                .query_row(sql, [], |r| r.get(0))
+                .map_err(map_sql_pkg)?;
+            if usize::try_from(actual).ok() != Some(expected) {
+                return Err(ClecError::new(ErrorCode::InvalidPackage, msg));
+            }
+            Ok(())
+        };
+        check_total(
+            "SELECT count(*) FROM cues",
+            checked_cues,
+            "Orphan cues detected.",
+        )?;
+        check_total(
+            "SELECT count(*) FROM source_diagnostics",
+            checked_diags,
+            "Orphan source diagnostics detected.",
+        )?;
+        check_total(
+            "SELECT count(*) FROM passages",
+            checked_passages,
+            "Orphan passages detected.",
+        )?;
+        check_total(
+            "SELECT count(*) FROM passage_spans",
+            checked_spans,
+            "Orphan passage spans detected.",
+        )?;
+        check_total(
+            "SELECT count(*) FROM search",
+            expected_docsize.len(),
+            "Orphan FTS5 search rows detected.",
+        )?;
+
+        expected_buckets.flush()?;
+        self.validate_fts_postings_streaming(
+            work_dir,
+            &mut expected_buckets,
+            &expected_docsize,
+            &term_doc_freq,
+        )
     }
 
-    fn validate_fts_postings(
+    fn validate_fts_postings_streaming(
         &self,
-        expected_postings: &BTreeMap<(i64, String, usize), String>,
+        work_dir: &Path,
+        expected_buckets: &mut PostingBuckets,
         expected_docsize: &HashMap<i64, (usize, usize)>,
+        term_doc_freq: &HashMap<String, u32>,
     ) -> Result<(), ClecError> {
+        let num_buckets = expected_buckets.num_buckets();
+        let mut actual_buckets = PostingBuckets::new(work_dir, "actual", num_buckets)?;
+
         self.conn
             .execute_batch(
                 "PRAGMA query_only=OFF;
@@ -1059,8 +1347,7 @@ impl CorpusStore {
                 )
             })?;
 
-        let inspect_res = (|| -> Result<(), ClecError> {
-            let mut actual_postings: BTreeMap<(i64, String, usize), String> = BTreeMap::new();
+        let vocab_res = (|| -> Result<(), ClecError> {
             {
                 let mut stmt = self
                     .conn
@@ -1072,23 +1359,32 @@ impl CorpusStore {
                     let col: String = row.get(1).map_err(map_sql_pkg)?;
                     let offset_i64: i64 = row.get(2).map_err(map_sql_pkg)?;
                     let term: String = row.get(3).map_err(map_sql_pkg)?;
-                    let offset = usize::try_from(offset_i64).map_err(|_| {
-                        ClecError::new(ErrorCode::InvalidPackage, "Negative FTS5 token offset.")
-                    })?;
-                    if actual_postings.insert((doc, col, offset), term).is_some() {
+                    if !expected_docsize.contains_key(&doc) {
                         return Err(ClecError::new(
-                            ErrorCode::InvalidPackage,
-                            "Duplicate FTS5 posting at same rowid, column, and offset.",
+                            ErrorCode::IntegrityMismatch,
+                            "FTS5 posting references unknown passage rowid.",
                         ));
                     }
+                    let col_id = match col.as_str() {
+                        "title_tokens" => 0u8,
+                        "body_tokens" => 1u8,
+                        _ => {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Unknown FTS5 column in postings.",
+                            ));
+                        }
+                    };
+                    let offset = u32::try_from(offset_i64).map_err(|_| {
+                        ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Negative or oversized FTS5 token offset.",
+                        )
+                    })?;
+                    actual_buckets.push(doc, col_id, offset, term.as_bytes())?;
                 }
             }
-            if &actual_postings != expected_postings {
-                return Err(ClecError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "FTS5 search postings do not match source-derived normalized title/body tokens.",
-                ));
-            }
+            actual_buckets.flush()?;
 
             let mut docsize_rows = 0usize;
             {
@@ -1127,37 +1423,51 @@ impl CorpusStore {
         let _ = self
             .conn
             .execute_batch("DROP TABLE IF EXISTS temp.__clec_fts_vocab; PRAGMA query_only=ON;");
-        inspect_res?;
-        self.validate_fts_bm25_probe(expected_postings, expected_docsize)
+        vocab_res?;
+
+        let probe_tok = term_doc_freq
+            .iter()
+            .min_by(|(t1, c1), (t2, c2)| c1.cmp(c2).then_with(|| t1.cmp(t2)))
+            .map(|(t, _)| t.as_str());
+        let probe_bytes = probe_tok.map(str::as_bytes);
+        let mut doc_weights: BTreeMap<i64, f64> = BTreeMap::new();
+
+        for b in 0..num_buckets {
+            let exp = expected_buckets.take_sorted(b)?;
+            let act = actual_buckets.take_sorted(b)?;
+            if !postings_equal(&exp, &act) {
+                return Err(ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "FTS5 search postings do not match source-derived normalized title/body tokens.",
+                ));
+            }
+            if let Some(target) = probe_bytes {
+                for entry in &exp.entries {
+                    let term = &exp.arena[entry.term_off as usize
+                        ..entry.term_off as usize + entry.term_len as usize];
+                    if term == target {
+                        let weight = if entry.col == 0 { 4.0 } else { 1.0 };
+                        *doc_weights.entry(entry.rowid).or_insert(0.0) += weight;
+                    }
+                }
+            }
+        }
+
+        if let Some(tok) = probe_tok {
+            self.validate_fts_bm25_probe(tok, &doc_weights, expected_docsize)?;
+        }
+        Ok(())
     }
 
     fn validate_fts_bm25_probe(
         &self,
-        expected_postings: &BTreeMap<(i64, String, usize), String>,
+        probe_tok: &str,
+        doc_weights: &BTreeMap<i64, f64>,
         expected_docsize: &HashMap<i64, (usize, usize)>,
     ) -> Result<(), ClecError> {
         let total_tokens: usize = expected_docsize.values().map(|(t, b)| t + b).sum();
-        if expected_postings.is_empty() || expected_docsize.is_empty() || total_tokens == 0 {
+        if doc_weights.is_empty() || expected_docsize.is_empty() || total_tokens == 0 {
             return Ok(());
-        }
-
-        let mut term_docs: BTreeMap<&str, HashSet<i64>> = BTreeMap::new();
-        for ((rowid, _col, _off), tok) in expected_postings {
-            term_docs.entry(tok.as_str()).or_default().insert(*rowid);
-        }
-        let Some((probe_tok, _)) = term_docs
-            .iter()
-            .min_by_key(|(tok, docs)| (docs.len(), *tok))
-        else {
-            return Ok(());
-        };
-
-        let mut doc_weights: BTreeMap<i64, f64> = BTreeMap::new();
-        for ((rowid, col, _off), tok) in expected_postings {
-            if tok == probe_tok {
-                let weight = if col == "title_tokens" { 4.0 } else { 1.0 };
-                *doc_weights.entry(*rowid).or_insert(0.0) += weight;
-            }
         }
 
         let n_row = expected_docsize.len() as f64;
@@ -1181,7 +1491,7 @@ impl CorpusStore {
                     format!("FTS5 BM25 health check prepare failed: {e}"),
                 )
             })?;
-        let mut rows = stmt.query([*probe_tok]).map_err(|e| {
+        let mut rows = stmt.query([probe_tok]).map_err(|e| {
             ClecError::new(
                 ErrorCode::IntegrityMismatch,
                 format!("FTS5 BM25 health check query failed: {e}"),
@@ -1227,7 +1537,7 @@ impl CorpusStore {
             ));
         }
 
-        for (rowid, freq) in doc_weights {
+        for (&rowid, &freq) in doc_weights {
             let Some(&actual) = actual_scores.get(&rowid) else {
                 return Err(ClecError::new(
                     ErrorCode::IntegrityMismatch,
@@ -1273,7 +1583,11 @@ impl CorpusStore {
         let row = self
             .conn
             .query_row(
-                "SELECT id, work_id, path, title, role, attribution, quality, date, date_basis, origin, content_hash FROM sources WHERE id=?",
+                "SELECT s.id, s.work_id, s.path, s.title, s.role, s.attribution, s.quality, s.date, s.date_basis, s.origin, s.content_hash,
+                        m.canonical_source_id, m.equivalence_basis, m.projection_kind, m.equivalence_hash
+                 FROM sources s
+                 JOIN source_canonical_map m ON m.source_id = s.id
+                 WHERE s.id=?",
                 [source_id.as_str()],
                 |row| {
                     Ok((
@@ -1288,6 +1602,10 @@ impl CorpusStore {
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
                         row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
                     ))
                 },
             )
@@ -1305,7 +1623,52 @@ impl CorpusStore {
             date_basis: row.8,
             origin: row.9,
             content_hash: row.10,
+            canonical_source_id: SourceId::parse(&row.11)?,
+            equivalence_basis: EquivalenceBasis::parse(&row.12)?,
+            projection_kind: ProjectionKind::parse(&row.13)?,
+            equivalence_hash: row.14,
         })
+    }
+
+    pub fn load_equivalent_sources(
+        &self,
+        canonical_source_id: &SourceId,
+    ) -> Result<Vec<EquivalentSourceRef>, ClecError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id, s.path, s.role, s.attribution, m.projection_kind, m.equivalence_basis, m.canonical_source_id
+                 FROM source_canonical_map m
+                 JOIN sources s ON s.id = m.source_id
+                 WHERE m.canonical_source_id = ?
+                 ORDER BY s.path, s.id",
+            )
+            .map_err(map_sql_pkg)?;
+        let mut rows = stmt
+            .query([canonical_source_id.as_str()])
+            .map_err(map_sql_pkg)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+            let sid = SourceId::parse(&row.get::<_, String>(0).map_err(map_sql_pkg)?)?;
+            let path: String = row.get(1).map_err(map_sql_pkg)?;
+            let role = SourceRole::parse(&row.get::<_, String>(2).map_err(map_sql_pkg)?)?;
+            let attribution = Attribution::parse(&row.get::<_, String>(3).map_err(map_sql_pkg)?)?;
+            let projection_kind =
+                ProjectionKind::parse(&row.get::<_, String>(4).map_err(map_sql_pkg)?)?;
+            let equivalence_basis =
+                EquivalenceBasis::parse(&row.get::<_, String>(5).map_err(map_sql_pkg)?)?;
+            let canon = SourceId::parse(&row.get::<_, String>(6).map_err(map_sql_pkg)?)?;
+            out.push(EquivalentSourceRef {
+                is_canonical: sid == canon,
+                source_id: sid,
+                path,
+                role,
+                attribution,
+                projection_kind,
+                equivalence_basis,
+            });
+        }
+        Ok(out)
     }
 
     pub fn load_verified_blob(&self, content_hash: &str) -> Result<Vec<u8>, ClecError> {
@@ -1593,6 +1956,7 @@ impl CorpusStore {
     ) -> Result<SourceOriginalItem, ClecError> {
         let source = self.load_source(source_id)?;
         let work = self.load_work(&source.work_id)?;
+        let equivalent_sources = self.load_equivalent_sources(&source.canonical_source_id)?;
         let raw_bytes = self.load_verified_blob(&source.content_hash)?;
         let original_text = String::from_utf8(raw_bytes).map_err(|_| {
             ClecError::new(
@@ -1613,6 +1977,7 @@ impl CorpusStore {
         Ok(SourceOriginalItem {
             work,
             source,
+            equivalent_sources,
             diagnostics,
             passage_ids,
             byte_len,
@@ -1627,8 +1992,14 @@ impl CorpusStore {
     ) -> Result<SourceOverviewItem, ClecError> {
         let source = self.load_source(source_id)?;
         let work = self.load_work(&source.work_id)?;
+        let equivalent_sources = self.load_equivalent_sources(&source.canonical_source_id)?;
         let diagnostics = self.load_diagnostics(&source.source_id)?;
         let passage_ids = self.list_source_passage_ids(&source.source_id)?;
+        let canonical_passage_ids = if source.canonical_source_id == source.source_id {
+            passage_ids.clone()
+        } else {
+            self.list_source_passage_ids(&source.canonical_source_id)?
+        };
         let cue_count_i64: i64 = self
             .conn
             .query_row(
@@ -1640,10 +2011,12 @@ impl CorpusStore {
         Ok(SourceOverviewItem {
             work,
             source,
+            equivalent_sources,
             passage_count: passage_ids.len(),
             cue_count: usize::try_from(cue_count_i64).unwrap_or(0),
             diagnostics,
             passage_ids,
+            canonical_passage_ids,
         })
     }
 
@@ -1723,6 +2096,7 @@ impl CorpusStore {
         query: Option<&str>,
         work_filter: Option<&WorkId>,
         role_filter: Option<SourceRole>,
+        canonical_only: bool,
     ) -> Result<Vec<SourceListEntry>, ClecError> {
         let normalized_terms: Vec<String> = match query {
             Some(q) if !q.trim().is_empty() => {
@@ -1744,10 +2118,13 @@ impl CorpusStore {
             .conn
             .prepare(
                 "SELECT s.id, s.work_id, w.work_key, w.title, s.path, s.title, s.role, s.attribution, s.quality, s.date, s.date_basis, s.content_hash,
+                 m.canonical_source_id, m.equivalence_basis,
+                 (SELECT count(*) FROM source_canonical_map m2 WHERE m2.canonical_source_id = m.canonical_source_id),
                  (SELECT count(*) FROM passages p WHERE p.source_id = s.id),
                  (SELECT count(*) FROM source_diagnostics d WHERE d.source_id = s.id)
                  FROM sources s
                  JOIN works w ON w.id = s.work_id
+                 JOIN source_canonical_map m ON m.source_id = s.id
                  ORDER BY w.work_key, s.path, s.id",
             )
             .map_err(map_sql_pkg)?;
@@ -1771,11 +2148,21 @@ impl CorpusStore {
                 .transpose()?;
             let date_basis: Option<String> = row.get(10).map_err(map_sql_pkg)?;
             let content_hash: String = row.get(11).map_err(map_sql_pkg)?;
+            let canonical_source_id =
+                SourceId::parse(&row.get::<_, String>(12).map_err(map_sql_pkg)?)?;
+            let equivalence_basis =
+                EquivalenceBasis::parse(&row.get::<_, String>(13).map_err(map_sql_pkg)?)?;
+            let equivalent_count =
+                usize::try_from(row.get::<_, i64>(14).map_err(map_sql_pkg)?).unwrap_or(1);
             let passage_count =
-                usize::try_from(row.get::<_, i64>(12).map_err(map_sql_pkg)?).unwrap_or(0);
+                usize::try_from(row.get::<_, i64>(15).map_err(map_sql_pkg)?).unwrap_or(0);
             let diagnostics_count =
-                usize::try_from(row.get::<_, i64>(13).map_err(map_sql_pkg)?).unwrap_or(0);
+                usize::try_from(row.get::<_, i64>(16).map_err(map_sql_pkg)?).unwrap_or(0);
+            let is_canonical = source_id == canonical_source_id;
 
+            if canonical_only && !is_canonical {
+                continue;
+            }
             if work_filter.is_some_and(|w| w != &work_id) {
                 continue;
             }
@@ -1803,6 +2190,10 @@ impl CorpusStore {
                 date,
                 date_basis,
                 content_hash,
+                canonical_source_id,
+                is_canonical,
+                equivalence_basis,
+                equivalent_count,
                 passage_count,
                 diagnostics_count,
             });
@@ -1886,6 +2277,242 @@ fn decode_fts5_docsize(sz: &[u8]) -> Option<(usize, usize)> {
     Some((usize::try_from(t).ok()?, usize::try_from(b).ok()?))
 }
 
+#[derive(Clone, Copy)]
+struct PostingEntry {
+    rowid: i64,
+    col: u8,
+    offset: u32,
+    term_off: u32,
+    term_len: u16,
+}
+
+struct SortedPostingBucket {
+    arena: Vec<u8>,
+    entries: Vec<PostingEntry>,
+}
+
+static BUCKET_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
+
+struct OwnedBucketDir(PathBuf);
+
+impl OwnedBucketDir {
+    fn create_in(work_dir: &Path, label: &str) -> Result<Self, ClecError> {
+        for _ in 0..32 {
+            let seq = BUCKET_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = work_dir.join(format!(".clec-fts-{label}-{}-{seq}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(ClecError::new(
+                        ErrorCode::IoError,
+                        format!("Temp bucket dir failed: {e}"),
+                    ));
+                }
+            }
+        }
+        Err(ClecError::new(
+            ErrorCode::IoError,
+            "Failed to allocate unique temp bucket directory.",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for OwnedBucketDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+enum BucketStorage {
+    Memory(Vec<u8>),
+    Files {
+        _temp_dir: OwnedBucketDir,
+        writers: Vec<Option<BufWriter<File>>>,
+        paths: Vec<PathBuf>,
+    },
+}
+
+struct PostingBuckets {
+    num_buckets: usize,
+    storage: BucketStorage,
+}
+
+impl PostingBuckets {
+    fn new(work_dir: &Path, label: &str, num_buckets: usize) -> Result<Self, ClecError> {
+        if num_buckets <= 1 {
+            return Ok(Self {
+                num_buckets: 1,
+                storage: BucketStorage::Memory(Vec::new()),
+            });
+        }
+        let temp_dir = OwnedBucketDir::create_in(work_dir, label)?;
+        let mut writers = Vec::with_capacity(num_buckets);
+        let mut paths = Vec::with_capacity(num_buckets);
+        for b in 0..num_buckets {
+            let p = temp_dir.path().join(format!("b{b}.bin"));
+            let f = File::create(&p).map_err(|e| {
+                ClecError::new(
+                    ErrorCode::IoError,
+                    format!("Bucket file create failed: {e}"),
+                )
+            })?;
+            writers.push(Some(BufWriter::with_capacity(32 * 1024, f)));
+            paths.push(p);
+        }
+        Ok(Self {
+            num_buckets,
+            storage: BucketStorage::Files {
+                _temp_dir: temp_dir,
+                writers,
+                paths,
+            },
+        })
+    }
+
+    fn num_buckets(&self) -> usize {
+        self.num_buckets
+    }
+
+    fn push(&mut self, rowid: i64, col: u8, offset: u32, term: &[u8]) -> Result<(), ClecError> {
+        let term_len = u16::try_from(term.len())
+            .map_err(|_| ClecError::new(ErrorCode::InvalidPackage, "FTS5 token exceeds 64 KiB."))?;
+        let mut header = [0u8; 15];
+        header[0..8].copy_from_slice(&rowid.to_le_bytes());
+        header[8] = col;
+        header[9..13].copy_from_slice(&offset.to_le_bytes());
+        header[13..15].copy_from_slice(&term_len.to_le_bytes());
+        match &mut self.storage {
+            BucketStorage::Memory(buf) => {
+                buf.extend_from_slice(&header);
+                buf.extend_from_slice(term);
+            }
+            BucketStorage::Files { writers, .. } => {
+                let idx = (rowid.unsigned_abs() as usize) % self.num_buckets;
+                let w = writers[idx].as_mut().ok_or_else(|| {
+                    ClecError::new(ErrorCode::InternalError, "Bucket writer already closed.")
+                })?;
+                w.write_all(&header).map_err(|e| {
+                    ClecError::new(ErrorCode::IoError, format!("Bucket write failed: {e}"))
+                })?;
+                w.write_all(term).map_err(|e| {
+                    ClecError::new(ErrorCode::IoError, format!("Bucket write failed: {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), ClecError> {
+        if let BucketStorage::Files { writers, .. } = &mut self.storage {
+            for slot in writers.iter_mut() {
+                if let Some(mut w) = slot.take() {
+                    w.flush().map_err(|e| {
+                        ClecError::new(ErrorCode::IoError, format!("Bucket flush failed: {e}"))
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take_sorted(&mut self, bucket_idx: usize) -> Result<SortedPostingBucket, ClecError> {
+        let raw = match &mut self.storage {
+            BucketStorage::Memory(buf) => std::mem::take(buf),
+            BucketStorage::Files { paths, .. } => {
+                let path = &paths[bucket_idx];
+                let data = fs::read(path).map_err(|e| {
+                    ClecError::new(ErrorCode::IoError, format!("Bucket read failed: {e}"))
+                })?;
+                let _ = fs::remove_file(path);
+                data
+            }
+        };
+
+        let mut arena = Vec::new();
+        let mut entries = Vec::new();
+        let mut pos = 0usize;
+        while pos < raw.len() {
+            if pos + 15 > raw.len() {
+                return Err(ClecError::new(
+                    ErrorCode::InternalError,
+                    "Truncated posting bucket record.",
+                ));
+            }
+            let rowid = i64::from_le_bytes(raw[pos..pos + 8].try_into().unwrap());
+            let col = raw[pos + 8];
+            let offset = u32::from_le_bytes(raw[pos + 9..pos + 13].try_into().unwrap());
+            let term_len = u16::from_le_bytes(raw[pos + 13..pos + 15].try_into().unwrap());
+            pos += 15;
+            let tlen = term_len as usize;
+            if pos + tlen > raw.len() {
+                return Err(ClecError::new(
+                    ErrorCode::InternalError,
+                    "Truncated posting bucket term.",
+                ));
+            }
+            let term_off = u32::try_from(arena.len()).map_err(|_| {
+                ClecError::new(ErrorCode::InternalError, "Posting bucket arena overflow.")
+            })?;
+            arena.extend_from_slice(&raw[pos..pos + tlen]);
+            pos += tlen;
+            entries.push(PostingEntry {
+                rowid,
+                col,
+                offset,
+                term_off,
+                term_len,
+            });
+        }
+
+        entries.sort_unstable_by(|a, b| {
+            a.rowid
+                .cmp(&b.rowid)
+                .then_with(|| a.col.cmp(&b.col))
+                .then_with(|| a.offset.cmp(&b.offset))
+                .then_with(|| {
+                    let ta = &arena[a.term_off as usize..a.term_off as usize + a.term_len as usize];
+                    let tb = &arena[b.term_off as usize..b.term_off as usize + b.term_len as usize];
+                    ta.cmp(tb)
+                })
+        });
+
+        for pair in entries.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            if a.rowid == b.rowid && a.col == b.col && a.offset == b.offset {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Duplicate FTS5 posting at same rowid, column, and offset.",
+                ));
+            }
+        }
+
+        Ok(SortedPostingBucket { arena, entries })
+    }
+}
+
+fn postings_equal(a: &SortedPostingBucket, b: &SortedPostingBucket) -> bool {
+    if a.entries.len() != b.entries.len() {
+        return false;
+    }
+    for (ea, eb) in a.entries.iter().zip(b.entries.iter()) {
+        if ea.rowid != eb.rowid || ea.col != eb.col || ea.offset != eb.offset {
+            return false;
+        }
+        let ta = &a.arena[ea.term_off as usize..ea.term_off as usize + ea.term_len as usize];
+        let tb = &b.arena[eb.term_off as usize..eb.term_off as usize + eb.term_len as usize];
+        if ta != tb {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,9 +2536,23 @@ mod tests {
         drop(conn);
 
         let release = ReleaseHash::parse(&"a".repeat(64)).unwrap();
-        let err = CorpusStore::open_readonly(&db_path, release).err().unwrap();
+        let err = CorpusStore::open_readonly(&db_path, release.clone())
+            .err()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::InvalidPackage);
-        assert!(err.message.contains("legacy format revisions 1, 2, and 3"));
+        assert!(err.message.contains("clec-native-v1"));
+
+        let v1_path = dir.path().join("v1.sqlite");
+        let conn_v1 = Connection::open(&v1_path).unwrap();
+        conn_v1
+            .execute_batch(
+                "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata VALUES('corpus_format','clec-native-v1');",
+            )
+            .unwrap();
+        drop(conn_v1);
+        let err_v1 = CorpusStore::open_readonly(&v1_path, release).err().unwrap();
+        assert_eq!(err_v1.code, ErrorCode::InvalidPackage);
     }
 
     #[test]
@@ -1948,8 +2589,15 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn.execute(
-            "INSERT INTO metadata VALUES('corpus_format', ?),('segmentation_revision', ?)",
-            [CORPUS_FORMAT, SEGMENTATION_REVISION],
+            "INSERT INTO metadata VALUES('corpus_format', ?),('segmentation_revision', ?),('tokenization_revision', ?),('normalization_revision', ?),('dictionary_revision', ?),('equivalence_revision', ?)",
+            [
+                CORPUS_FORMAT,
+                SEGMENTATION_REVISION,
+                TOKENIZATION_REVISION,
+                NORMALIZATION_REVISION,
+                DICTIONARY_REVISION,
+                EQUIVALENCE_REVISION,
+            ],
         )
         .unwrap();
         conn.execute(
@@ -1998,6 +2646,30 @@ mod tests {
                 Option::<String>::None,
                 Option::<String>::None,
                 content_hash
+            ],
+        )
+        .unwrap();
+        let eq_hash =
+            sha256_hex(format!("equiv-v1:{}", std::str::from_utf8(raw).unwrap()).as_bytes());
+        conn.execute(
+            "INSERT INTO source_canonical_map VALUES(?,?,?,?,?)",
+            params![
+                s1.as_str(),
+                s1.as_str(),
+                eq_hash,
+                "plain_text",
+                "unique_in_work_role"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO source_canonical_map VALUES(?,?,?,?,?)",
+            params![
+                s2.as_str(),
+                s2.as_str(),
+                eq_hash,
+                "plain_text",
+                "unique_in_work_role"
             ],
         )
         .unwrap();
@@ -2053,6 +2725,7 @@ mod tests {
         let counts = CorpusCounts {
             works: 2,
             sources: 2,
+            canonical_sources: 2,
             blobs: 1,
             passages: 2,
             cues: 0,
@@ -2329,5 +3002,96 @@ mod tests {
         assert_eq!(hc_counts.cues, 1);
         assert_eq!(hc_counts.passages, 2);
         CorpusStore::validate_staging_db(&hc_db, release, &hc_counts).unwrap();
+    }
+
+    #[test]
+    fn rejects_noncanonical_passages_and_wrong_canonical_winner_and_tests_bucketed_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nalpha beta\n";
+        let txt = "alpha beta\n";
+        let md = "# 語音筆記：測試\n\n## [0:00:01,000 – 0:00:02,000]\nalpha beta\n";
+        fs::write(ws.join("ep.srt"), srt).unwrap();
+        fs::write(ws.join("ep.txt"), txt).unwrap();
+        fs::write(ws.join("ep.md"), md).unwrap();
+
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            serde_json::to_string(&serde_json::json!({
+                "schemaVersion": 1,
+                "works": [{ "key": "w1", "title": "Work One" }],
+                "sources": [
+                    {"work": "w1", "path": "ep.srt", "title": "Ep SRT", "role": "transcript", "attribution": "unverified_transcript", "quality": "archive", "status": "ready"},
+                    {"work": "w1", "path": "ep.txt", "title": "Ep TXT", "role": "transcript", "attribution": "unverified_transcript", "quality": "archive", "status": "ready"},
+                    {"work": "w1", "path": "ep.md", "title": "Ep MD", "role": "transcript", "attribution": "unverified_transcript", "quality": "archive", "status": "ready"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rel = tmp.path().join("release");
+        let manifest = publish_release(&ws, &intake, &rel).unwrap();
+        assert_eq!(manifest.counts.sources, 3);
+        assert_eq!(manifest.counts.canonical_sources, 1);
+        assert_eq!(manifest.counts.passages, 1);
+
+        let db_path = tmp.path().join("corpus.sqlite");
+        let zst = fs::File::open(rel.join("corpus.sqlite.zst")).unwrap();
+        let mut dec = zstd::stream::Decoder::new(zst).unwrap();
+        let mut buf = Vec::new();
+        dec.read_to_end(&mut buf).unwrap();
+        fs::write(&db_path, &buf).unwrap();
+
+        let release = ReleaseHash::parse(&"1".repeat(64)).unwrap();
+        CorpusStore::validate_staging_db(&db_path, release.clone(), &manifest.counts).unwrap();
+
+        let store = CorpusStore::open_readonly(&db_path, release.clone()).unwrap();
+        let all_sources = store.list_sources(None, None, None, false).unwrap();
+        assert_eq!(all_sources.len(), 3);
+        let canon_only = store.list_sources(None, None, None, true).unwrap();
+        assert_eq!(canon_only.len(), 1);
+        assert_eq!(canon_only[0].path, "ep.srt");
+        assert_eq!(canon_only[0].equivalent_count, 3);
+        let txt_entry = all_sources.iter().find(|s| s.path == "ep.txt").unwrap();
+        assert!(!txt_entry.is_canonical);
+        assert_eq!(txt_entry.canonical_source_id, canon_only[0].source_id);
+        let txt_orig = store
+            .read_source_original(&txt_entry.source_id, None)
+            .unwrap();
+        assert_eq!(txt_orig.original_text, txt);
+        assert_eq!(txt_orig.equivalent_sources.len(), 3);
+        let txt_ov = store.read_source_overview(&txt_entry.source_id).unwrap();
+        assert!(txt_ov.passage_ids.is_empty());
+        assert_eq!(txt_ov.canonical_passage_ids.len(), 1);
+        drop(store);
+
+        let swap_winner_db = tmp.path().join("swap_winner.sqlite");
+        fs::copy(&db_path, &swap_winner_db).unwrap();
+        {
+            let conn = Connection::open(&swap_winner_db).unwrap();
+            let txt_id = txt_entry.source_id.as_str();
+            let srt_id = canon_only[0].source_id.as_str();
+            conn.execute(
+                "UPDATE source_canonical_map SET canonical_source_id = ?, equivalence_basis = CASE WHEN source_id = ? THEN 'canonical_by_timing_and_format' ELSE 'collapsed_to_canonical' END",
+                params![txt_id, txt_id],
+            )
+            .unwrap();
+            let _ = srt_id;
+        }
+        assert_eq!(
+            CorpusStore::validate_staging_db(&swap_winner_db, release.clone(), &manifest.counts)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidPackage
+        );
+
+        let mut bucket_test = PostingBuckets::new(tmp.path(), "unit", 4).unwrap();
+        bucket_test.push(1, 0, 0, b"t6162").unwrap();
+        bucket_test.push(5, 1, 2, b"t6364").unwrap();
+        bucket_test.flush().unwrap();
+        let b1 = bucket_test.take_sorted(1).unwrap();
+        assert_eq!(b1.entries.len(), 2);
     }
 }

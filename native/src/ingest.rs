@@ -3,7 +3,9 @@ use std::path::Path;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{BoundaryKind, ByteSpan, ClecError, ErrorCode, SourceRole};
+use crate::domain::{
+    BoundaryKind, ByteSpan, ClecError, ErrorCode, ProjectionKind, SourceRole, sha256_hex,
+};
 
 pub(crate) const TARGET_MIN_SCALARS: usize = 1000;
 pub(crate) const TARGET_MAX_SCALARS: usize = 1200;
@@ -37,6 +39,114 @@ pub(crate) struct DraftPassage {
     pub is_continuation: bool,
     pub spans: Vec<ByteSpan>,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EquivalenceProjection {
+    pub kind: ProjectionKind,
+    pub equivalence_hash: String,
+}
+
+fn fold_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+fn is_archive_md_ts_header(trimmed: &str) -> bool {
+    let Some(inner) = trimmed
+        .strip_prefix("## [")
+        .and_then(|s| s.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let Some((left, right)) = inner.split_once(" – ").or_else(|| inner.split_once(" - ")) else {
+        return false;
+    };
+    parse_timestamp_ms(left.trim()).is_some() && parse_timestamp_ms(right.trim()).is_some()
+}
+
+fn extract_archive_voice_note_md_payload(text: &str) -> Option<String> {
+    let stripped = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let mut lines = stripped.lines();
+    let first = lines.next()?.trim();
+    if !first.starts_with("# 語音筆記：") {
+        return None;
+    }
+    let mut saw_ts_header = false;
+    let mut out = String::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if is_archive_md_ts_header(trimmed) {
+            saw_ts_header = true;
+            continue;
+        }
+        if !trimmed.is_empty() {
+            for word in trimmed.split_whitespace() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+        }
+    }
+    if !saw_ts_header || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+pub(crate) fn compute_equivalence_projection(
+    extraction: &ExtractionResult,
+    path: &str,
+) -> Result<EquivalenceProjection, ClecError> {
+    let (kind, folded) = if extraction.is_subtitle {
+        if extraction.cues.is_empty() {
+            return Err(ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Subtitle source has no usable cues for equivalence projection.",
+            ));
+        }
+        let mut out = String::new();
+        for cue in &extraction.cues {
+            let payload = &extraction.text[cue.text_start_byte..cue.text_end_byte];
+            for word in payload.split_whitespace() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(word);
+            }
+        }
+        (ProjectionKind::SubtitleCuePayload, out)
+    } else if path.to_ascii_lowercase().ends_with(".md")
+        && let Some(md_folded) = extract_archive_voice_note_md_payload(&extraction.text)
+    {
+        (ProjectionKind::ArchiveVoiceNoteMd, md_folded)
+    } else {
+        let stripped = extraction
+            .text
+            .strip_prefix('\u{FEFF}')
+            .unwrap_or(&extraction.text);
+        (ProjectionKind::PlainText, fold_whitespace(stripped))
+    };
+
+    if folded.is_empty() {
+        return Err(ClecError::new(
+            ErrorCode::InvalidPackage,
+            "Source projected text is empty.",
+        ));
+    }
+
+    let equivalence_hash = sha256_hex(format!("equiv-v1:{folded}").as_bytes());
+    Ok(EquivalenceProjection {
+        kind,
+        equivalence_hash,
+    })
 }
 
 pub(crate) fn is_subtitle_path(path: &str) -> bool {
@@ -829,5 +939,59 @@ mod tests {
                 .iter()
                 .any(|d| d.contains("No usable subtitle cues"))
         );
+    }
+
+    #[test]
+    fn equivalence_projection_matches_tri_format_and_rejects_unrecognized_md_or_edits() {
+        let srt = "1\n0:00:00,000 --> 0:00:02,000\n大家好\n\n2\n0:00:02,000 --> 0:00:05,000\n0050與QQQ 4%\n";
+        let vtt =
+            "WEBVTT\n\n00:00.000 --> 00:02.000\n大家好\n\n00:02.000 --> 00:05.000\n0050與QQQ 4%\n";
+        let txt = "大家好\n\n0050與QQQ 4%\n";
+        let md_archive = "# 語音筆記：測試標題\n\n## [0:00:00,000 – 0:00:02,000]\n大家好\n\n## [0:00:02,000 – 0:00:05,000]\n0050與QQQ 4%\n";
+        let md_unknown = "# 測試標題\n\n大家好\n\n0050與QQQ 4%\n";
+        let txt_punct = "大家好。\n\n0050與QQQ 4%\n";
+
+        let p_srt = compute_equivalence_projection(
+            &extract_source(srt.as_bytes(), true).unwrap(),
+            "ep1.srt",
+        )
+        .unwrap();
+        let p_vtt = compute_equivalence_projection(
+            &extract_source(vtt.as_bytes(), true).unwrap(),
+            "ep1.vtt",
+        )
+        .unwrap();
+        let p_txt = compute_equivalence_projection(
+            &extract_source(txt.as_bytes(), false).unwrap(),
+            "ep1.txt",
+        )
+        .unwrap();
+        let p_md = compute_equivalence_projection(
+            &extract_source(md_archive.as_bytes(), false).unwrap(),
+            "ep1.md",
+        )
+        .unwrap();
+        let p_unknown = compute_equivalence_projection(
+            &extract_source(md_unknown.as_bytes(), false).unwrap(),
+            "ep1_other.md",
+        )
+        .unwrap();
+        let p_punct = compute_equivalence_projection(
+            &extract_source(txt_punct.as_bytes(), false).unwrap(),
+            "ep1_punct.txt",
+        )
+        .unwrap();
+
+        assert_eq!(p_srt.kind, ProjectionKind::SubtitleCuePayload);
+        assert_eq!(p_vtt.kind, ProjectionKind::SubtitleCuePayload);
+        assert_eq!(p_txt.kind, ProjectionKind::PlainText);
+        assert_eq!(p_md.kind, ProjectionKind::ArchiveVoiceNoteMd);
+        assert_eq!(p_unknown.kind, ProjectionKind::PlainText);
+
+        assert_eq!(p_srt.equivalence_hash, p_vtt.equivalence_hash);
+        assert_eq!(p_srt.equivalence_hash, p_txt.equivalence_hash);
+        assert_eq!(p_srt.equivalence_hash, p_md.equivalence_hash);
+        assert_ne!(p_srt.equivalence_hash, p_unknown.equivalence_hash);
+        assert_ne!(p_srt.equivalence_hash, p_punct.equivalence_hash);
     }
 }

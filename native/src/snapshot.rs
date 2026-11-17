@@ -9,10 +9,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    Attribution, ByteSpan, CORPUS_FORMAT, ClecError, DateYmd, ErrorCode, PassageId, ReleaseHash,
-    SCHEMA_VERSION, SEGMENTATION_REVISION, SourceId, SourceRole, WorkId, sha256_hex,
+    Attribution, ByteSpan, CORPUS_FORMAT, CanonicalCandidate, ClecError, DICTIONARY_REVISION,
+    DateYmd, EQUIVALENCE_REVISION, EquivalenceBasis, ErrorCode, NORMALIZATION_REVISION, PassageId,
+    ProjectionKind, ReleaseHash, SCHEMA_VERSION, SEGMENTATION_REVISION, SourceId, SourceRole,
+    TOKENIZATION_REVISION, WorkId, select_canonical_index, sha256_hex,
 };
-use crate::ingest::{extract_source, is_subtitle_path, is_supported_text_path, segment_source};
+use crate::ingest::{
+    compute_equivalence_projection, extract_source, is_subtitle_path, is_supported_text_path,
+    segment_source,
+};
 use crate::lexical::index_tokens_string;
 use crate::store::{CorpusCounts, CorpusStore, DiagnosticsSummary, SCHEMA_SQL};
 
@@ -36,6 +41,7 @@ struct IntakeSource {
     pub attribution: String,
     pub quality: String,
     pub status: String,
+    pub status_reason: Option<String>,
     pub date: Option<String>,
     pub date_basis: Option<String>,
     pub origin: Option<String>,
@@ -55,6 +61,10 @@ pub struct ReleaseManifest {
     pub schema_version: u32,
     pub corpus_format: String,
     pub segmentation_revision: String,
+    pub tokenization_revision: String,
+    pub normalization_revision: String,
+    pub dictionary_revision: String,
+    pub equivalence_revision: String,
     pub artifact: String,
     pub bytes: u64,
     pub sha256: ReleaseHash,
@@ -239,8 +249,15 @@ fn build_in_staging(
         )
     })?;
     conn.execute(
-        "INSERT INTO metadata VALUES('corpus_format', ?),('segmentation_revision', ?)",
-        [CORPUS_FORMAT, SEGMENTATION_REVISION],
+        "INSERT INTO metadata VALUES('corpus_format', ?),('segmentation_revision', ?),('tokenization_revision', ?),('normalization_revision', ?),('dictionary_revision', ?),('equivalence_revision', ?)",
+        [
+            CORPUS_FORMAT,
+            SEGMENTATION_REVISION,
+            TOKENIZATION_REVISION,
+            NORMALIZATION_REVISION,
+            DICTIONARY_REVISION,
+            EQUIVALENCE_REVISION,
+        ],
     )
     .map_err(|e| {
         ClecError::new(
@@ -249,12 +266,29 @@ fn build_in_staging(
         )
     })?;
 
+    struct AdmittedCandidate {
+        source_id: SourceId,
+        work_id: WorkId,
+        path: String,
+        title: String,
+        role: SourceRole,
+        attribution: Attribution,
+        content_hash: String,
+        equivalence_hash: String,
+        projection_kind: ProjectionKind,
+        is_subtitle: bool,
+        has_cues: bool,
+        diagnostics_count: usize,
+    }
+
     let mut seen_work_paths: HashSet<(String, String)> = HashSet::new();
     let mut inserted_works: HashSet<String> = HashSet::new();
     let mut inserted_blobs: HashSet<String> = HashSet::new();
+    let mut admitted: Vec<AdmittedCandidate> = Vec::new();
     let mut counts = CorpusCounts {
         works: 0,
         sources: 0,
+        canonical_sources: 0,
         blobs: 0,
         passages: 0,
         cues: 0,
@@ -329,14 +363,19 @@ fn build_in_staging(
         if src.status != "ready" {
             if !matches!(
                 src.status.as_str(),
-                "quarantined" | "unsupported" | "metadata_only"
+                "quarantined" | "unsupported" | "metadata_only" | "excluded" | "empty" | "missing"
             ) {
                 return Err(ClecError::new(
                     ErrorCode::InvalidManifest,
                     format!("Unknown intake status '{}' for '{}'.", src.status, src.path),
                 ));
             }
-            record_inventory(&src.status, "Excluded by intake status.", None)?;
+            let reason = src
+                .status_reason
+                .as_deref()
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or("Excluded by intake status.");
+            record_inventory(&src.status, reason, None)?;
             continue;
         }
 
@@ -399,7 +438,8 @@ fn build_in_staging(
             continue;
         }
 
-        let drafts = segment_source(&extraction, role)?;
+        let proj = compute_equivalence_projection(&extraction, &src.path)?;
+        let _ = segment_source(&extraction, role)?;
 
         if inserted_works.insert(work_id.as_str().to_owned()) {
             tx.execute(
@@ -502,75 +542,22 @@ fn build_in_staging(
             counts.cues += 1;
         }
 
-        let derived_ids: Vec<PassageId> = drafts
-            .iter()
-            .map(|d| PassageId::derive(&source_id, d.ordinal, &d.spans))
-            .collect();
+        admitted.push(AdmittedCandidate {
+            source_id,
+            work_id: work_id.clone(),
+            path: src.path.clone(),
+            title: src.title.clone(),
+            role,
+            attribution,
+            content_hash: content_hash.clone(),
+            equivalence_hash: proj.equivalence_hash,
+            projection_kind: proj.kind,
+            is_subtitle: is_sub,
+            has_cues: !extraction.cues.is_empty(),
+            diagnostics_count: extraction.diagnostics.len(),
+        });
 
-        let title_toks = index_tokens_string(&src.title);
-        for (idx, draft) in drafts.iter().enumerate() {
-            let pid = &derived_ids[idx];
-            let continued_from = if draft.is_continuation && idx > 0 {
-                Some(derived_ids[idx - 1].as_str())
-            } else {
-                None
-            };
-            let continued_to = if idx + 1 < drafts.len() && drafts[idx + 1].is_continuation {
-                Some(derived_ids[idx + 1].as_str())
-            } else {
-                None
-            };
-
-            tx.execute(
-                "INSERT INTO passages VALUES(?,?,?,?,?,?,?,?,?)",
-                params![
-                    pid.as_str(),
-                    source_id.as_str(),
-                    work_id.as_str(),
-                    draft.ordinal as i64,
-                    draft.boundary.as_str(),
-                    i64::from(draft.is_continuation),
-                    continued_from,
-                    continued_to,
-                    draft.text
-                ],
-            )
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InternalError,
-                    format!("Passage insert failed: {e}"),
-                )
-            })?;
-            let rowid = tx.last_insert_rowid();
-
-            for (span_ord, span) in draft.spans.iter().enumerate() {
-                let span_val: &ByteSpan = span;
-                tx.execute(
-                    "INSERT INTO passage_spans VALUES(?,?,?,?,?)",
-                    params![
-                        pid.as_str(),
-                        span_ord as i64,
-                        span_val.start_byte() as i64,
-                        span_val.end_byte() as i64,
-                        span_val.cue_ordinal().map(|v| v as i64)
-                    ],
-                )
-                .map_err(|e| {
-                    ClecError::new(ErrorCode::InternalError, format!("Span insert failed: {e}"))
-                })?;
-            }
-
-            tx.execute(
-                "INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(?,?,?)",
-                params![rowid, title_toks, index_tokens_string(&draft.text)],
-            )
-            .map_err(|e| {
-                ClecError::new(ErrorCode::InternalError, format!("FTS insert failed: {e}"))
-            })?;
-            counts.passages += 1;
-        }
-
-        record_inventory("indexed", "Admitted and indexed.", Some(&content_hash))?;
+        record_inventory("indexed", "Admitted.", Some(&content_hash))?;
     }
 
     if counts.sources == 0 {
@@ -578,6 +565,182 @@ fn build_in_staging(
             ErrorCode::EmptyCorpus,
             "No usable ready sources were admitted.",
         ));
+    }
+
+    let mut groups: HashMap<(String, SourceRole, String), Vec<usize>> = HashMap::new();
+    for (idx, cand) in admitted.iter().enumerate() {
+        groups
+            .entry((
+                cand.work_id.as_str().to_owned(),
+                cand.role,
+                cand.equivalence_hash.clone(),
+            ))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut canonical_indices: Vec<usize> = Vec::new();
+    for member_indices in groups.values() {
+        let candidates: Vec<CanonicalCandidate<'_>> = member_indices
+            .iter()
+            .map(|&idx| {
+                let c = &admitted[idx];
+                CanonicalCandidate {
+                    source_id: &c.source_id,
+                    path: &c.path,
+                    attribution: c.attribution,
+                    is_subtitle: c.is_subtitle,
+                    has_cues: c.has_cues,
+                    diagnostics_count: c.diagnostics_count,
+                }
+            })
+            .collect();
+        let winner_pos = select_canonical_index(&candidates)
+            .ok_or_else(|| ClecError::new(ErrorCode::InternalError, "Empty equivalence group."))?;
+        let winner_idx = member_indices[winner_pos];
+        canonical_indices.push(winner_idx);
+        let winner_id = admitted[winner_idx].source_id.as_str();
+        for &idx in member_indices {
+            let member = &admitted[idx];
+            let basis = if member_indices.len() == 1 {
+                EquivalenceBasis::UniqueInWorkRole
+            } else if idx == winner_idx {
+                EquivalenceBasis::CanonicalByTimingAndFormat
+            } else {
+                EquivalenceBasis::CollapsedToCanonical
+            };
+            tx.execute(
+                "INSERT INTO source_canonical_map VALUES(?,?,?,?,?)",
+                params![
+                    member.source_id.as_str(),
+                    winner_id,
+                    member.equivalence_hash,
+                    member.projection_kind.as_str(),
+                    basis.as_str(),
+                ],
+            )
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Canonical map insert failed: {e}"),
+                )
+            })?;
+        }
+    }
+
+    canonical_indices.sort_unstable();
+    counts.canonical_sources = canonical_indices.len();
+
+    {
+        let mut stmt_blob = tx
+            .prepare("SELECT raw_bytes FROM blobs WHERE content_hash = ?1")
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Blob lookup prepare failed: {e}"),
+                )
+            })?;
+        let mut stmt_passage = tx
+            .prepare("INSERT INTO passages VALUES(?,?,?,?,?,?,?,?,?)")
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Passage insert prepare failed: {e}"),
+                )
+            })?;
+        let mut stmt_span = tx
+            .prepare("INSERT INTO passage_spans VALUES(?,?,?,?,?)")
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Span insert prepare failed: {e}"),
+                )
+            })?;
+        let mut stmt_fts = tx
+            .prepare("INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(?,?,?)")
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("FTS insert prepare failed: {e}"),
+                )
+            })?;
+
+        for idx in canonical_indices {
+            let cand = &admitted[idx];
+            let raw_bytes: Vec<u8> = stmt_blob
+                .query_row([cand.content_hash.as_str()], |r| r.get(0))
+                .map_err(|e| {
+                    ClecError::new(ErrorCode::InternalError, format!("Blob read failed: {e}"))
+                })?;
+            let extraction = extract_source(&raw_bytes, cand.is_subtitle)?;
+            let drafts = segment_source(&extraction, cand.role)?;
+
+            let derived_ids: Vec<PassageId> = drafts
+                .iter()
+                .map(|d| PassageId::derive(&cand.source_id, d.ordinal, &d.spans))
+                .collect();
+
+            let title_toks = index_tokens_string(&cand.title);
+            for (d_idx, draft) in drafts.iter().enumerate() {
+                let pid = &derived_ids[d_idx];
+                let continued_from = if draft.is_continuation && d_idx > 0 {
+                    Some(derived_ids[d_idx - 1].as_str())
+                } else {
+                    None
+                };
+                let continued_to = if d_idx + 1 < drafts.len() && drafts[d_idx + 1].is_continuation
+                {
+                    Some(derived_ids[d_idx + 1].as_str())
+                } else {
+                    None
+                };
+
+                stmt_passage
+                    .execute(params![
+                        pid.as_str(),
+                        cand.source_id.as_str(),
+                        cand.work_id.as_str(),
+                        draft.ordinal as i64,
+                        draft.boundary.as_str(),
+                        i64::from(draft.is_continuation),
+                        continued_from,
+                        continued_to,
+                        draft.text
+                    ])
+                    .map_err(|e| {
+                        ClecError::new(
+                            ErrorCode::InternalError,
+                            format!("Passage insert failed: {e}"),
+                        )
+                    })?;
+                let rowid = tx.last_insert_rowid();
+
+                for (span_ord, span) in draft.spans.iter().enumerate() {
+                    let span_val: &ByteSpan = span;
+                    stmt_span
+                        .execute(params![
+                            pid.as_str(),
+                            span_ord as i64,
+                            span_val.start_byte() as i64,
+                            span_val.end_byte() as i64,
+                            span_val.cue_ordinal().map(|v| v as i64)
+                        ])
+                        .map_err(|e| {
+                            ClecError::new(
+                                ErrorCode::InternalError,
+                                format!("Span insert failed: {e}"),
+                            )
+                        })?;
+                }
+
+                stmt_fts
+                    .execute(params![rowid, title_toks, index_tokens_string(&draft.text)])
+                    .map_err(|e| {
+                        ClecError::new(ErrorCode::InternalError, format!("FTS insert failed: {e}"))
+                    })?;
+                counts.passages += 1;
+            }
+        }
     }
 
     tx.commit()
@@ -624,6 +787,10 @@ fn build_in_staging(
         schema_version: SCHEMA_VERSION,
         corpus_format: CORPUS_FORMAT.to_owned(),
         segmentation_revision: SEGMENTATION_REVISION.to_owned(),
+        tokenization_revision: TOKENIZATION_REVISION.to_owned(),
+        normalization_revision: NORMALIZATION_REVISION.to_owned(),
+        dictionary_revision: DICTIONARY_REVISION.to_owned(),
+        equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
         artifact: "corpus.sqlite.zst".to_owned(),
         bytes,
         sha256: release,
@@ -1061,6 +1228,30 @@ fn validate_manifest_fields(m: &ReleaseManifest) -> Result<(), ClecError> {
         return Err(ClecError::new(
             ErrorCode::InvalidPackage,
             "Unsupported segmentationRevision in manifest.",
+        ));
+    }
+    if m.tokenization_revision != TOKENIZATION_REVISION {
+        return Err(ClecError::new(
+            ErrorCode::InvalidPackage,
+            "Unsupported tokenizationRevision in manifest.",
+        ));
+    }
+    if m.normalization_revision != NORMALIZATION_REVISION {
+        return Err(ClecError::new(
+            ErrorCode::InvalidPackage,
+            "Unsupported normalizationRevision in manifest.",
+        ));
+    }
+    if m.dictionary_revision != DICTIONARY_REVISION {
+        return Err(ClecError::new(
+            ErrorCode::InvalidPackage,
+            "Unsupported dictionaryRevision in manifest.",
+        ));
+    }
+    if m.equivalence_revision != EQUIVALENCE_REVISION {
+        return Err(ClecError::new(
+            ErrorCode::InvalidPackage,
+            "Unsupported equivalenceRevision in manifest.",
         ));
     }
     if m.bytes == 0

@@ -271,7 +271,10 @@ fn apply_work_diversity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Attribution, ByteSpan, CORPUS_FORMAT, SEGMENTATION_REVISION, sha256_hex};
+    use crate::domain::{
+        Attribution, ByteSpan, CORPUS_FORMAT, DICTIONARY_REVISION, EQUIVALENCE_REVISION,
+        NORMALIZATION_REVISION, SEGMENTATION_REVISION, TOKENIZATION_REVISION, sha256_hex,
+    };
     use crate::lexical::index_tokens_string;
     use crate::store::{CorpusCounts, SCHEMA_SQL};
     use rusqlite::{Connection, params};
@@ -284,14 +287,22 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn.execute(
-            "INSERT INTO metadata VALUES('corpus_format', ?),('segmentation_revision', ?)",
-            [CORPUS_FORMAT, SEGMENTATION_REVISION],
+            "INSERT INTO metadata VALUES('corpus_format', ?),('segmentation_revision', ?),('tokenization_revision', ?),('normalization_revision', ?),('dictionary_revision', ?),('equivalence_revision', ?)",
+            [
+                CORPUS_FORMAT,
+                SEGMENTATION_REVISION,
+                TOKENIZATION_REVISION,
+                NORMALIZATION_REVISION,
+                DICTIONARY_REVISION,
+                EQUIVALENCE_REVISION,
+            ],
         )
         .unwrap();
 
         let mut counts = CorpusCounts {
             works: 0,
             sources: 0,
+            canonical_sources: 0,
             blobs: 0,
             passages: 0,
             cues: 0,
@@ -350,6 +361,19 @@ mod tests {
             )
             .unwrap();
             counts.sources += 1;
+            counts.canonical_sources += 1;
+            let eq_hash = sha256_hex(format!("equiv-v1:{text}").as_bytes());
+            conn.execute(
+                "INSERT INTO source_canonical_map VALUES(?,?,?,?,?)",
+                params![
+                    sid.as_str(),
+                    sid.as_str(),
+                    eq_hash,
+                    "plain_text",
+                    "unique_in_work_role"
+                ],
+            )
+            .unwrap();
 
             let span = ByteSpan::new(0, raw.len(), None).unwrap();
             let pid = PassageId::derive(&sid, 0, std::slice::from_ref(&span));
