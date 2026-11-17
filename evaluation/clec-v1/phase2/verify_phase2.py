@@ -845,7 +845,57 @@ def main() -> int:
             assert len(res_after["hits"]) == 1
             return "2001-passage 64-bucket sync, 64/65 boundary swap, last-row 2001 missing/duplicate postings, global stats, unchanged active state, and temp cleanup verified"
 
+        def check_deterministic_repeat_publish(log: list[dict[str, Any]]) -> str:
+            ws = tmp / "det-ws"
+            ws.mkdir()
+            works = []
+            sources = []
+            for w in range(5):
+                wk = f"det-w{w:02d}"
+                works.append({"key": wk, "title": f"Det Work {w:02d}"})
+                body = f"確定性發布測試{w}\n多群組對比內容"
+                (ws / f"w{w}.srt").write_text(f"1\n00:00:01,000 --> 00:00:02,000\n{body}\n", encoding="utf-8")
+                (ws / f"w{w}.txt").write_text(body, encoding="utf-8")
+                (ws / f"w{w}_sum.txt").write_text(f"摘要{w}獨立內容", encoding="utf-8")
+                for path, role in ((f"w{w}.srt", "transcript"), (f"w{w}.txt", "transcript"), (f"w{w}_sum.txt", "summary")):
+                    sources.append(
+                        {
+                            "work": wk,
+                            "path": path,
+                            "title": f"{wk} {path}",
+                            "role": role,
+                            "attribution": "authored_fixture",
+                            "quality": "fixture",
+                            "status": "ready",
+                        }
+                    )
+            intake_fwd = tmp / "det-intake-fwd.json"
+            intake_fwd.write_text(json.dumps({"schemaVersion": 1, "works": works, "sources": sources}, ensure_ascii=False), encoding="utf-8")
+            intake_rev = tmp / "det-intake-rev.json"
+            intake_rev.write_text(
+                json.dumps({"schemaVersion": 1, "works": list(reversed(works)), "sources": list(reversed(sources))}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            sqlite_hashes = []
+            zst_hashes = []
+            for idx, ipath in enumerate((intake_fwd, intake_fwd, intake_fwd, intake_rev)):
+                rel = tmp / f"det-rel-{idx}"
+                proc = run_cmd(pub_bin, ["--workspace", str(ws), "--intake", str(ipath), "--output", str(rel)], clean_env, log)
+                assert proc.returncode == 0, proc.stderr
+                m = json.loads((rel / "manifest.json").read_text(encoding="utf-8"))
+                assert m["counts"]["canonicalSources"] == 10, m["counts"]
+                sqlite_hashes.append(m["sha256"])
+                zst_hashes.append(m["compressedSha256"])
+                assert sha256_file(rel / "corpus.sqlite.zst") == m["compressedSha256"]
+                decompressed = py_zstd.decompress((rel / "corpus.sqlite.zst").read_bytes())
+                assert hashlib.sha256(decompressed).hexdigest() == m["sha256"]
+            assert len(set(sqlite_hashes)) == 1, sqlite_hashes
+            assert len(set(zst_hashes)) == 1, zst_hashes
+            return f"4 repeat/permuted multi-group publishes matched byte-for-byte ({sqlite_hashes[0][:12]}...)"
+
         run_check("no_data_lifecycle", check_no_data)
+        run_check("deterministic_repeat_publish", check_deterministic_repeat_publish)
         run_check("parser_and_unsupported_flags", check_parser_and_unsupported)
         run_check("synthetic_triples_and_false_friends", check_synthetic_triples_and_false_friends)
         run_check("authored_edge_fixtures", check_edge_fixtures_e2e)

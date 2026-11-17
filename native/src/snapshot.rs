@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -567,7 +567,7 @@ fn build_in_staging(
         ));
     }
 
-    let mut groups: HashMap<(String, SourceRole, String), Vec<usize>> = HashMap::new();
+    let mut groups: BTreeMap<(String, SourceRole, String), Vec<usize>> = BTreeMap::new();
     for (idx, cand) in admitted.iter().enumerate() {
         groups
             .entry((
@@ -580,6 +580,8 @@ fn build_in_staging(
     }
 
     let mut canonical_indices: Vec<usize> = Vec::new();
+    let mut canonical_map_rows: Vec<(usize, usize, EquivalenceBasis)> =
+        Vec::with_capacity(admitted.len());
     for member_indices in groups.values() {
         let candidates: Vec<CanonicalCandidate<'_>> = member_indices
             .iter()
@@ -599,9 +601,7 @@ fn build_in_staging(
             .ok_or_else(|| ClecError::new(ErrorCode::InternalError, "Empty equivalence group."))?;
         let winner_idx = member_indices[winner_pos];
         canonical_indices.push(winner_idx);
-        let winner_id = admitted[winner_idx].source_id.as_str();
         for &idx in member_indices {
-            let member = &admitted[idx];
             let basis = if member_indices.len() == 1 {
                 EquivalenceBasis::UniqueInWorkRole
             } else if idx == winner_idx {
@@ -609,23 +609,46 @@ fn build_in_staging(
             } else {
                 EquivalenceBasis::CollapsedToCanonical
             };
-            tx.execute(
-                "INSERT INTO source_canonical_map VALUES(?,?,?,?,?)",
-                params![
-                    member.source_id.as_str(),
-                    winner_id,
-                    member.equivalence_hash,
-                    member.projection_kind.as_str(),
-                    basis.as_str(),
-                ],
-            )
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InternalError,
-                    format!("Canonical map insert failed: {e}"),
-                )
-            })?;
+            canonical_map_rows.push((idx, winner_idx, basis));
         }
+    }
+
+    canonical_map_rows.sort_by(|(idx_a, _, _), (idx_b, _, _)| {
+        let a = &admitted[*idx_a];
+        let b = &admitted[*idx_b];
+        (
+            a.work_id.as_str(),
+            a.role.as_str(),
+            a.equivalence_hash.as_str(),
+            a.source_id.as_str(),
+        )
+            .cmp(&(
+                b.work_id.as_str(),
+                b.role.as_str(),
+                b.equivalence_hash.as_str(),
+                b.source_id.as_str(),
+            ))
+    });
+
+    for (idx, winner_idx, basis) in canonical_map_rows {
+        let member = &admitted[idx];
+        let winner_id = admitted[winner_idx].source_id.as_str();
+        tx.execute(
+            "INSERT INTO source_canonical_map VALUES(?,?,?,?,?)",
+            params![
+                member.source_id.as_str(),
+                winner_id,
+                member.equivalence_hash,
+                member.projection_kind.as_str(),
+                basis.as_str(),
+            ],
+        )
+        .map_err(|e| {
+            ClecError::new(
+                ErrorCode::InternalError,
+                format!("Canonical map insert failed: {e}"),
+            )
+        })?;
     }
 
     canonical_indices.sort_unstable();
@@ -1679,5 +1702,122 @@ mod tests {
         .unwrap();
         let err_same_path = sync_local(&data_dir, Some(&valid_copy_manifest)).unwrap_err();
         assert_eq!(err_same_path.code, ErrorCode::InvalidPackage);
+    }
+
+    #[test]
+    fn publish_is_byte_deterministic_across_repeats_and_input_permutations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let mut works = Vec::new();
+        let mut sources = Vec::new();
+        for w in 0..4 {
+            let wk = format!("work-{w:02}");
+            works.push(serde_json::json!({"key": wk, "title": format!("Work {w:02}")}));
+
+            let body = format!("工作{w}測試重複內容\n資產配置討論");
+            let srt =
+                format!("1\n00:00:01,000 --> 00:00:03,000\n工作{w}測試重複內容\n資產配置討論\n");
+            let md = format!(
+                "# 語音筆記：Work {w}\n\n## [00:00:01.000 – 00:00:03.000]\n工作{w}測試重複內容\n資產配置討論\n"
+            );
+            fs::write(ws.join(format!("ep{w}.srt")), &srt).unwrap();
+            fs::write(ws.join(format!("ep{w}.txt")), &body).unwrap();
+            fs::write(ws.join(format!("ep{w}.md")), &md).unwrap();
+            fs::write(
+                ws.join(format!("sum{w}.txt")),
+                format!("工作{w}摘要獨立內容"),
+            )
+            .unwrap();
+
+            for (path, role) in [
+                (format!("ep{w}.srt"), "transcript"),
+                (format!("ep{w}.txt"), "transcript"),
+                (format!("ep{w}.md"), "transcript"),
+                (format!("sum{w}.txt"), "summary"),
+            ] {
+                sources.push(serde_json::json!({
+                    "work": wk,
+                    "path": path,
+                    "title": format!("{wk} {path}"),
+                    "role": role,
+                    "attribution": "authored_fixture",
+                    "quality": "fixture",
+                    "status": "ready"
+                }));
+            }
+        }
+        sources.push(serde_json::json!({
+            "work": "work-00",
+            "path": "excluded.bin",
+            "title": "Excluded",
+            "role": "document",
+            "attribution": "authored_fixture",
+            "quality": "fixture",
+            "status": "unsupported",
+            "statusReason": "fixture"
+        }));
+
+        let intake_forward = tmp.path().join("intake-fwd.json");
+        fs::write(
+            &intake_forward,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "works": works,
+                "sources": sources,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        works.reverse();
+        sources.reverse();
+        let intake_reversed = tmp.path().join("intake-rev.json");
+        fs::write(
+            &intake_reversed,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "works": works,
+                "sources": sources,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut manifests = Vec::new();
+        let mut zst_payloads = Vec::new();
+        let mut sqlite_payloads = Vec::new();
+        for (idx, intake_path) in [
+            &intake_forward,
+            &intake_forward,
+            &intake_forward,
+            &intake_reversed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let out = tmp.path().join(format!("rel-{idx}"));
+            let m = publish_release(&ws, intake_path, &out).unwrap();
+            assert_eq!(m.counts.works, 4);
+            assert_eq!(m.counts.sources, 16);
+            assert_eq!(m.counts.canonical_sources, 8);
+            let zst_bytes = fs::read(out.join("corpus.sqlite.zst")).unwrap();
+            let sqlite_bytes = zstd::stream::decode_all(&zst_bytes[..]).unwrap();
+            manifests.push(m);
+            zst_payloads.push(zst_bytes);
+            sqlite_payloads.push(sqlite_bytes);
+        }
+
+        for i in 1..manifests.len() {
+            assert_eq!(manifests[i].sha256, manifests[0].sha256);
+            assert_eq!(
+                manifests[i].compressed_sha256,
+                manifests[0].compressed_sha256
+            );
+            assert_eq!(manifests[i].counts, manifests[0].counts);
+            assert_eq!(sqlite_payloads[i], sqlite_payloads[0]);
+            assert_eq!(zst_payloads[i], zst_payloads[0]);
+        }
     }
 }
