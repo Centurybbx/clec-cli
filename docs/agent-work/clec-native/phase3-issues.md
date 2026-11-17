@@ -2,6 +2,10 @@
 
 This ledger records confirmed Unit B defects found during independent review of head `f4d04a7` (reproduced in `.cache/before-repro/before_repro.json`) and tracks each verified fix at `14ef91a`.
 
+## Measurement status
+
+Phase 3 measurement and the default decision are complete with a failed quality gate. A remains unchanged, and C is not promoted. See the [measurement report](phase3-report.md) and the [open quality ledger](phase3-quality-issues.md). The historical harness resolutions below do not certify complete-answer quality.
+
 ## Unit B findings and resolutions
 
 1. **`P3-ALIAS-WORD-OVERLAP`: Canonical alias matching credits partial/disjoint character slices as full coverage.**
