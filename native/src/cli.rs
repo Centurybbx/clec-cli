@@ -11,13 +11,18 @@ use crate::distribution::{NetworkPolicy, TransferPolicy};
 use crate::domain::{
     CORPUS_FORMAT, ClecError, DEFAULT_MAX_BYTES, DICTIONARY_REVISION, DateYmd,
     EQUIVALENCE_REVISION, ErrorCode, ErrorEnvelope, NORMALIZATION_REVISION, PassageId, ReleaseHash,
-    SCHEMA_VERSION, SEGMENTATION_REVISION, SourceId, SourceRole, TOKENIZATION_REVISION, TypedRef,
-    WorkId,
+    SCHEMA_VERSION, SEGMENTATION_REVISION, Sag2ErrorContext, Sag2Stage, SourceId, SourceRole,
+    TOKENIZATION_REVISION, TypedRef, WorkId,
 };
 use crate::retrieval::{
     BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, MatchMode, PreparedSearch, SearchData,
     SearchRequest, execute_search,
 };
+#[cfg(not(feature = "test-hooks"))]
+use crate::sag2::run_sag2;
+#[cfg(feature = "test-hooks")]
+use crate::sag2::run_sag2_with_test_overrides;
+use crate::sag2::{Sag2SearchData, jev::ValidatedJevConfig};
 use crate::snapshot::{
     StatusData, SyncData, SyncDryRunData, data_dir_status, ensure_current_store, sync_dry_run,
     sync_with_prepare,
@@ -30,6 +35,8 @@ pub(crate) const BUILTIN_DEFAULT_MANIFEST_URL: Option<&str> = None;
 pub(crate) struct RuntimeOptions {
     pub default_origin: Option<String>,
     pub transfer_policy: TransferPolicy,
+    #[cfg(feature = "test-hooks")]
+    pub jev_request_timeout: Option<std::time::Duration>,
 }
 
 impl RuntimeOptions {
@@ -37,6 +44,8 @@ impl RuntimeOptions {
         Self {
             default_origin: BUILTIN_DEFAULT_MANIFEST_URL.map(ToOwned::to_owned),
             transfer_policy: TransferPolicy::shipped(),
+            #[cfg(feature = "test-hooks")]
+            jev_request_timeout: None,
         }
     }
 }
@@ -54,6 +63,7 @@ pub struct TestFixtureOptions {
     pub setup_delay_ms: Option<u64>,
     pub cleanup_delay_ms: Option<u64>,
     pub hook_log_path: Option<PathBuf>,
+    pub jev_request_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Parser)]
@@ -80,8 +90,8 @@ struct Cli {
     #[arg(long, global = true, default_value_t = DEFAULT_MAX_BYTES, value_name = "N")]
     pub max_bytes: usize,
 
-    /// Unsupported flag (explicitly rejected)
-    #[arg(long, global = true, hide = true)]
+    /// Enable explicit SAG2 one-hop Jev retrieval on `search` (conflicts with --offline)
+    #[arg(long, global = true)]
     pub sag2: bool,
 
     #[command(subcommand)]
@@ -151,7 +161,7 @@ struct SyncArgs {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
-    /// 1 to 4 lexical queries
+    /// 1 to 4 lexical queries (for --sag2, the first query is original_question and others are retrieval alternatives)
     #[arg(required = true, num_args = 1..=4, value_name = "QUERY")]
     pub queries: Vec<String>,
 
@@ -190,6 +200,10 @@ struct SearchArgs {
     /// Expected active release SHA-256
     #[arg(long, value_name = "SHA256")]
     pub release: Option<String>,
+
+    /// Path to file containing Jev/OpenRouter bearer credential for `search --sag2` (overrides env)
+    #[arg(long, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -316,12 +330,27 @@ struct UnsupportedFeatureSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum SearchOutput {
+    Local(SearchData),
+    Sag2(Box<Sag2SearchData>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum SearchOutputRef<'a> {
+    Local(&'a SearchData),
+    Sag2(&'a Sag2SearchData),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct SchemaData {
     pub phase: String,
     pub binary: String,
     pub version: String,
     pub default_configured: bool,
+    pub provider_verified: bool,
     pub corpus_format: String,
     pub segmentation_revision: String,
     pub tokenization_revision: String,
@@ -358,6 +387,7 @@ pub fn run_cli_with_test_options(options: TestFixtureOptions) -> i32 {
                 .map_or(shipped.artifact_timeout, Duration::from_millis),
             extra_root_pem: options.extra_root_pem,
         },
+        jev_request_timeout: options.jev_request_timeout_ms.map(Duration::from_millis),
     };
     let _hooks_guard = crate::http_transport::install_fixture_hooks_guard(
         options.resolver_delay_ms,
@@ -422,10 +452,10 @@ pub(crate) fn run_cli_with_args_and_options(args: &[String], options: &RuntimeOp
     };
 
     let cmd_name = command_name(&parsed.command);
-    if parsed.sag2 {
+    if parsed.sag2 && !matches!(parsed.command, Commands::Search(_)) {
         let err = ClecError::new(
-            ErrorCode::UnsupportedFeature,
-            "--sag2 is unsupported; no external LLM API calls are permitted.",
+            ErrorCode::InvalidArgument,
+            "--sag2 is only supported on `clec search`.",
         );
         emit_error(&err, Some(cmd_name));
         return err.code.exit_code();
@@ -645,7 +675,39 @@ fn prepare_search_request(args: &SearchArgs) -> Result<PreparedSearch, ClecError
     PreparedSearch::prepare(req)
 }
 
+enum SearchMode {
+    Local,
+    Sag2(ValidatedJevConfig),
+}
+
+fn authorize_search_mode(cli: &Cli, args: &SearchArgs) -> Result<SearchMode, ClecError> {
+    if !cli.sag2 {
+        if args.key_file.is_some() {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                "--key-file requires --sag2 on `clec search`.",
+            ));
+        }
+        return Ok(SearchMode::Local);
+    }
+    if cli.offline {
+        return Err(ClecError::new(
+            ErrorCode::OfflineRequired,
+            "--sag2 cannot be used with --offline; SAG2 requires Jev API requests.",
+        ));
+    }
+    let config = ValidatedJevConfig::from_env_and_args(args.key_file.as_deref())?;
+    Ok(SearchMode::Sag2(config))
+}
+
 fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<String, ClecError> {
+    if cli.sag2 && !matches!(cli.command, Commands::Search(_)) {
+        return Err(ClecError::new(
+            ErrorCode::InvalidArgument,
+            "--sag2 is only supported on `clec search`.",
+        ));
+    }
+
     let data_dir = resolve_data_dir(cli.data_dir.as_ref());
     let max_bytes = cli.max_bytes;
     let network_policy = if cli.offline {
@@ -691,16 +753,46 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
             )
         }
         Commands::Search(args) => {
+            if cli.sag2 && cli.offline {
+                return Err(ClecError::new(
+                    ErrorCode::OfflineRequired,
+                    "--sag2 cannot be used with --offline; SAG2 requires Jev API requests.",
+                ));
+            }
+            if !cli.sag2 && args.key_file.is_some() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidArgument,
+                    "--key-file requires --sag2 on `clec search`.",
+                ));
+            }
             let prepared = prepare_search_request(args)?;
-            let store = ensure_current_store(
+            let mode = authorize_search_mode(cli, args)?;
+            let mut store = ensure_current_store(
                 &data_dir,
                 network_policy,
                 default_origin,
                 &options.transfer_policy,
                 None,
             )?;
-            let full = execute_search(&store, &prepared)?;
-            fit_search_budget(full, use_json, max_bytes)
+            match mode {
+                SearchMode::Local => {
+                    let full = execute_search(&store, &prepared)?;
+                    fit_search_budget(full, use_json, max_bytes)
+                }
+                SearchMode::Sag2(jev_config) => {
+                    #[cfg(feature = "test-hooks")]
+                    let full = run_sag2_with_test_overrides(
+                        &mut store,
+                        &prepared,
+                        jev_config,
+                        options.transfer_policy.extra_root_pem.clone(),
+                        options.jev_request_timeout,
+                    )?;
+                    #[cfg(not(feature = "test-hooks"))]
+                    let full = run_sag2(&mut store, &prepared, jev_config)?;
+                    fit_sag2_search_budget(full, use_json, max_bytes)
+                }
+            }
         }
         Commands::Sources(args) => {
             let prepared = PreparedSources::prepare(args)?;
@@ -887,11 +979,52 @@ fn fit_search_budget(
             omitted_ids,
         };
         if use_json {
-            serialize_envelope("search", &data)
+            serialize_envelope("search", &SearchOutputRef::Local(&data))
         } else {
             Ok(format_search_text(&data))
         }
     })
+}
+
+fn fit_sag2_search_budget(
+    mut data: Sag2SearchData,
+    use_json: bool,
+    max_bytes: usize,
+) -> Result<String, ClecError> {
+    let stage_ctx = Sag2ErrorContext {
+        completed_stage: Sag2Stage::OutputBudget,
+        rounds_completed: data.rounds_completed,
+        http_attempts: data.calls.http_attempts,
+        successful_batches: data.calls.successful_batches,
+        scored_occurrences: data.candidate_counts.scored_occurrences,
+        sql_candidate_queries: data.calls.sql_candidate_queries,
+        df_lookups_distinct: data.calls.df_lookups_distinct,
+        request_bytes: data.consumption.request_bytes,
+        response_bytes: data.consumption.response_bytes,
+        estimated_token_units: data.consumption.estimated_token_units,
+    };
+    let all_hits = std::mem::take(&mut data.hits);
+    let total = all_hits.len();
+    let min_keep = usize::from(total > 0);
+    fit_list_budget(total, min_keep, max_bytes, |keep, used_bytes| {
+        let omitted_ids: Vec<PassageId> = all_hits[keep..]
+            .iter()
+            .map(|h| h.passage_id.clone())
+            .collect();
+        data.hits = all_hits[..keep].to_vec();
+        data.budget = BudgetReport {
+            max_bytes,
+            used_bytes,
+            omitted_count: total - keep,
+            omitted_ids,
+        };
+        if use_json {
+            serialize_envelope("search", &SearchOutputRef::Sag2(&data))
+        } else {
+            Ok(format_sag2_search_text(&data))
+        }
+    })
+    .map_err(|err| err.with_sag2_stage(stage_ctx))
 }
 
 fn fit_sources_budget(
@@ -992,17 +1125,18 @@ fn build_schema_data(default_configured: bool) -> SchemaData {
         "sync": schema_for!(SuccessEnvelope<SyncData>),
         "syncDryRun": schema_for!(SuccessEnvelope<SyncDryRunData>),
         "status": schema_for!(SuccessEnvelope<StatusData>),
-        "search": schema_for!(SuccessEnvelope<SearchData>),
+        "search": schema_for!(SuccessEnvelope<SearchOutput>),
         "read": schema_for!(SuccessEnvelope<ReadData>),
         "sources": schema_for!(SuccessEnvelope<SourcesData>),
         "error": schema_for!(ErrorEnvelope),
     });
 
     SchemaData {
-        phase: "phase4".to_owned(),
+        phase: "phase5".to_owned(),
         binary: cmd.get_name().to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         default_configured,
+        provider_verified: false,
         corpus_format: CORPUS_FORMAT.to_owned(),
         segmentation_revision: SEGMENTATION_REVISION.to_owned(),
         tokenization_revision: TOKENIZATION_REVISION.to_owned(),
@@ -1011,12 +1145,7 @@ fn build_schema_data(default_configured: bool) -> SchemaData {
         equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
         global_options,
         commands,
-        unsupported_features: vec![UnsupportedFeatureSpec {
-            name: "sag2".to_owned(),
-            supported: false,
-            reason: "LLM/SAG2 retrieval is unsupported; no external LLM API calls are made."
-                .to_owned(),
-        }],
+        unsupported_features: Vec::new(),
         envelopes,
     }
 }
@@ -1034,7 +1163,7 @@ fn arg_to_spec(arg: &clap::Arg) -> SchemaArgSpec {
         .collect();
     let id = arg.get_id().as_str().to_owned();
     SchemaArgSpec {
-        supported: id != "sag2",
+        supported: true,
         id,
         long: arg.get_long().map(|s| format!("--{s}")),
         short: arg.get_short().map(|c| format!("-{c}")),
@@ -1115,6 +1244,29 @@ fn format_search_text(d: &SearchData) -> String {
     out
 }
 
+fn format_sag2_search_text(d: &Sag2SearchData) -> String {
+    let mut out = format!(
+        "Mode: sag2 ({})\nRelease: {}\nStop: {:?}; Rounds: {}; HTTP attempts: {}; Returned: {}; Omitted by budget: {}\n\n",
+        d.algorithm,
+        d.release,
+        d.stop_reason,
+        d.rounds_completed,
+        d.calls.http_attempts,
+        d.hits.len(),
+        d.budget.omitted_count
+    );
+    for hit in &d.hits {
+        let rrf = hit
+            .rrf_score
+            .map_or_else(|| "none".to_owned(), |v| format!("{v:.6}"));
+        out.push_str(&format!(
+            "[{}] {} ({}) jev={:.6} rrf={}\n{}\n\n",
+            hit.passage_id, hit.source.title, hit.source.source_id, hit.jev_score, rrf, hit.text
+        ));
+    }
+    out
+}
+
 fn format_sources_text(d: &SourcesData) -> String {
     let mut out = format!(
         "Release: {}\nMatched: {}; Showing: {}; Omitted: {}\n\n",
@@ -1174,8 +1326,9 @@ mod tests {
     #[test]
     fn schema_derives_directly_from_clap_and_serde() {
         let schema = build_schema_data(false);
-        assert_eq!(schema.phase, "phase4");
+        assert_eq!(schema.phase, "phase5");
         assert!(!schema.default_configured);
+        assert!(!schema.provider_verified);
         assert_eq!(schema.corpus_format, CORPUS_FORMAT);
         assert!(schema.commands.iter().any(|c| c.name == "search"));
         assert!(schema.commands.iter().any(|c| c.name == "sync"));
@@ -1188,12 +1341,13 @@ mod tests {
             .iter()
             .find(|o| o.id == "sag2")
             .unwrap();
-        assert!(!sag2.supported);
-        assert_eq!(schema.unsupported_features.len(), 1);
-        assert_eq!(schema.unsupported_features[0].name, "sag2");
+        assert!(sag2.supported);
+        assert!(schema.unsupported_features.is_empty());
 
         let env_json = serde_json::to_string(&schema.envelopes).unwrap();
         assert!(env_json.contains("syncDryRun"));
+        assert!(env_json.contains("sag2Stage"));
+        assert!(env_json.contains("\"sag2\""));
         assert!(env_json.contains("^w_[0-9a-f]{16,64}$"));
         assert!(env_json.contains("^s_[0-9a-f]{16,64}$"));
         assert!(env_json.contains("^p_[0-9a-f]{16,64}$"));
@@ -1620,6 +1774,8 @@ mod tests {
         let opts = RuntimeOptions {
             default_origin: Some(default_url.clone()),
             transfer_policy: TransferPolicy::shipped(),
+            #[cfg(feature = "test-hooks")]
+            jev_request_timeout: None,
         };
 
         let dry_dir = tmp.path().join("dry_data");
@@ -1711,5 +1867,78 @@ mod tests {
 
         let _ = reqwest::blocking::get(format!("http://127.0.0.1:{port}/shutdown"));
         let _ = srv.join();
+    }
+
+    #[test]
+    fn sag2_mode_validation_rejects_conflicts_and_non_search_before_bootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent_dir = tmp.path().join("never_created_sag2");
+        let dir_arg = nonexistent_dir.display().to_string();
+        let key_path = tmp.path().join("k.txt");
+        std::fs::write(&key_path, "dummy-sentinel\n").unwrap();
+        let key_arg = key_path.display().to_string();
+
+        let cases: &[(&[&str], ErrorCode)] = &[
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "--offline",
+                    "search",
+                    "q",
+                    "--sag2",
+                ],
+                ErrorCode::OfflineRequired,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "q",
+                    "--key-file",
+                    &key_arg,
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "sync",
+                    "--dry-run",
+                    "--sag2",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &["clec", "--data-dir", &dir_arg, "status", "--sag2"],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "   ",
+                    "--sag2",
+                    "--key-file",
+                    &key_arg,
+                ],
+                ErrorCode::InvalidQuery,
+            ),
+        ];
+
+        for (argv, expected_code) in cases {
+            let owned: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+            let cli = Cli::try_parse_from(&owned).unwrap();
+            let err = dispatch(&cli, true, &RuntimeOptions::shipped()).unwrap_err();
+            assert_eq!(err.code, *expected_code, "argv={argv:?}");
+        }
+        assert!(!nonexistent_dir.exists());
     }
 }

@@ -348,7 +348,7 @@ impl Sag2Tracker<'_> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, not(feature = "test-hooks")))]
 pub(crate) fn run_sag2(
     store: &mut CorpusStore,
     req: &PreparedSearch,
@@ -360,18 +360,20 @@ pub(crate) fn run_sag2(
         config,
         #[cfg(feature = "test-hooks")]
         None,
+        #[cfg(feature = "test-hooks")]
+        None,
     )
 }
 
 #[cfg(feature = "test-hooks")]
-#[allow(dead_code)]
-pub(crate) fn run_sag2_with_extra_root_pem(
+pub(crate) fn run_sag2_with_test_overrides(
     store: &mut CorpusStore,
     req: &PreparedSearch,
     config: ValidatedJevConfig,
     extra_root_pem: Option<Vec<u8>>,
+    request_timeout: Option<std::time::Duration>,
 ) -> Result<Sag2SearchData, ClecError> {
-    run_sag2_internal(store, req, config, extra_root_pem)
+    run_sag2_internal(store, req, config, extra_root_pem, request_timeout)
 }
 
 fn run_sag2_internal(
@@ -379,6 +381,7 @@ fn run_sag2_internal(
     req: &PreparedSearch,
     config: ValidatedJevConfig,
     #[cfg(feature = "test-hooks")] extra_root_pem: Option<Vec<u8>>,
+    #[cfg(feature = "test-hooks")] request_timeout: Option<std::time::Duration>,
 ) -> Result<Sag2SearchData, ClecError> {
     if let Some(pin) = &req.release_pin
         && pin != &store.release
@@ -389,13 +392,18 @@ fn run_sag2_internal(
         ));
     }
 
+    #[cfg(feature = "test-hooks")]
+    let run_deadline =
+        Instant::now() + request_timeout.map_or(SAG2_RUN_DEADLINE, |t| SAG2_RUN_DEADLINE.min(t));
+    #[cfg(not(feature = "test-hooks"))]
     let run_deadline = Instant::now() + SAG2_RUN_DEADLINE;
     store.set_deadline_progress_handler(run_deadline);
 
     let res = (|| -> Result<Sag2SearchData, ClecError> {
         let _snapshot = store.begin_read_snapshot()?;
         #[cfg(feature = "test-hooks")]
-        let jev = JevClient::new(config, run_deadline).with_extra_root_pem(extra_root_pem);
+        let jev = JevClient::new(config, run_deadline)
+            .with_test_overrides(extra_root_pem, request_timeout);
         #[cfg(not(feature = "test-hooks"))]
         let jev = JevClient::new(config, run_deadline);
 

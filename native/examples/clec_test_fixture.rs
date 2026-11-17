@@ -38,6 +38,9 @@ fn main() -> ExitCode {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from);
+    let jev_request_timeout_ms = env::var("CLEC_TEST_JEV_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
 
     let code = run_cli_with_test_options(TestFixtureOptions {
         default_origin,
@@ -50,6 +53,7 @@ fn main() -> ExitCode {
         setup_delay_ms,
         cleanup_delay_ms,
         hook_log_path,
+        jev_request_timeout_ms,
     });
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }

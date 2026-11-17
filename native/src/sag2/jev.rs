@@ -19,13 +19,10 @@ use crate::http_transport::{
     is_loopback_literal_host,
 };
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DEFAULT_JEV_BASE_URL: &str = "https://openrouter.ai/api/alpha/decisions";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DEFAULT_JEV_MODEL: &str = "~typesafe/jev-latest";
 
 pub(crate) const MAX_MODEL_NAME_BYTES: usize = 256;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MAX_KEY_FILE_BYTES: usize = 8192;
 pub(crate) const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -62,12 +59,10 @@ pub(crate) struct ValidatedJevConfig {
 }
 
 impl ValidatedJevConfig {
-    #[allow(dead_code)]
     pub(crate) fn from_env_and_args(key_file: Option<&Path>) -> Result<Self, ClecError> {
         Self::from_lookup(key_file, |name| env::var(name).ok())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_lookup<F>(key_file: Option<&Path>, env_lookup: F) -> Result<Self, ClecError>
     where
         F: Fn(&str) -> Option<String>,
@@ -142,7 +137,6 @@ impl ValidatedJevConfig {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_and_normalize_endpoint(raw: &str) -> Result<Url, ClecError> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
@@ -229,7 +223,6 @@ fn validate_model_name(raw: &str, err_code: ErrorCode) -> Result<String, ClecErr
     Ok(trimmed.to_owned())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn read_bounded_key_file(path: &Path) -> Result<String, ClecError> {
     let mut file = File::open(path).map_err(|_| {
         ClecError::new(
@@ -267,7 +260,6 @@ fn read_bounded_key_file(path: &Path) -> Result<String, ClecError> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn validate_secret_and_headers(raw: &str) -> Result<RedactedSecret, ClecError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -413,6 +405,7 @@ struct ValidatedBatchResponse {
 pub(crate) struct JevClient {
     config: ValidatedJevConfig,
     run_deadline: Instant,
+    request_timeout: Duration,
     #[cfg(any(test, feature = "test-hooks"))]
     extra_root_pem: Option<Vec<u8>>,
     actual_model: Option<String>,
@@ -434,6 +427,7 @@ impl JevClient {
         Self {
             config,
             run_deadline,
+            request_timeout: JEV_REQUEST_TIMEOUT,
             #[cfg(any(test, feature = "test-hooks"))]
             extra_root_pem: None,
             actual_model: None,
@@ -452,8 +446,19 @@ impl JevClient {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub(crate) fn with_extra_root_pem(mut self, pem: Option<Vec<u8>>) -> Self {
+    pub(crate) fn with_test_overrides(
+        mut self,
+        pem: Option<Vec<u8>>,
+        request_timeout: Option<Duration>,
+    ) -> Self {
         self.extra_root_pem = pem;
+        if let Some(t) = request_timeout {
+            self.request_timeout = t;
+            let clamped = Instant::now() + t;
+            if clamped < self.run_deadline {
+                self.run_deadline = clamped;
+            }
+        }
         self
     }
 
@@ -604,7 +609,7 @@ impl JevClient {
                 "SAG2 run deadline exceeded.",
             ));
         }
-        let request_deadline = self.run_deadline.min(now + JEV_REQUEST_TIMEOUT);
+        let request_deadline = self.run_deadline.min(now + self.request_timeout);
 
         #[cfg(any(test, feature = "test-hooks"))]
         let hooks = current_test_hooks();

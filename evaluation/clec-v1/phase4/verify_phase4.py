@@ -1014,7 +1014,8 @@ def main() -> int:
                 # 1. Ordinary build honest NO_DATA and schema defaultConfigured=false
                 ord_d = tmp / "d_ord"
                 ord_sc = assert_ok_json(run_cli(clec_bin, ["--data-dir", str(ord_d), "schema"], clean_env))
-                assert ord_sc["defaultConfigured"] is False and ord_sc["phase"] == "phase4"
+                assert ord_sc["defaultConfigured"] is False and ord_sc["phase"] == "phase5"
+                assert ord_sc["providerVerified"] is False
                 assert "http_bootstrap" not in {u["name"] for u in ord_sc["unsupportedFeatures"]}
                 assert not ord_d.exists()
                 assert_err_json(run_cli(clec_bin, ["--data-dir", str(ord_d), "search", "alpha"], clean_env), "NO_DATA", 3)

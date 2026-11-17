@@ -269,12 +269,13 @@ def main() -> int:
             assert st["ready"] is False and st["activeRelease"] is None
             sc = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "schema"], clean_env, log))
             assert sc["corpusFormat"] == "clec-native-v2"
-            assert sc["phase"] == "phase4"
+            assert sc["phase"] == "phase5"
             assert sc["defaultConfigured"] is False
+            assert sc["providerVerified"] is False
             for rev_key in ("tokenizationRevision", "normalizationRevision", "dictionaryRevision", "equivalenceRevision"):
                 assert sc.get(rev_key), f"missing {rev_key} in schema"
             unsupported_names = {u["name"] for u in sc["unsupportedFeatures"]}
-            assert "sag2" in unsupported_names
+            assert "sag2" not in unsupported_names
             assert "http_bootstrap" not in unsupported_names
             assert "cross_format_dedup" not in unsupported_names
             assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "search", "退休"], clean_env, log), "NO_DATA")
@@ -286,8 +287,8 @@ def main() -> int:
             assert "similar" not in err["message"] and "Did you mean" not in err["message"]
             assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "search"], clean_env, log), "INVALID_ARGUMENT")
             assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "search", "q1", "q2", "q3", "q4", "q5"], clean_env, log), "INVALID_ARGUMENT")
-            assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "search", "退休", "--sag2"], clean_env, log), "UNSUPPORTED_FEATURE")
-            return "clap parser errors and --sag2 exit nonzero with structured stderr JSON and no fuzzy suggestions"
+            assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "search", "退休", "--sag2"], clean_env, log), "INVALID_JEV_CONFIG")
+            return "clap parser errors and unconfigured --sag2 exit nonzero with structured stderr JSON and no fuzzy suggestions"
 
         def check_synthetic_triples_and_false_friends(log: list[dict[str, Any]]) -> str:
             ws = tmp / "triple-ws"
