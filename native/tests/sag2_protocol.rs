@@ -1662,6 +1662,91 @@ fn group7_bounds_filters_ties_dpp_and_local_parity() {
 }
 
 #[test]
+fn group7_dpp_varied_frequency_determinism_across_processes() {
+    let words = [
+        "amber", "birch", "cedar", "delta", "elm", "frost", "grove", "hazel", "iris", "jade",
+        "kelp", "lime", "moss", "navy", "oak", "pine", "quartz", "reed", "sage", "teal", "umber",
+        "violet", "willow", "xenon", "yellow", "zinc",
+    ];
+    let mut owned_sources: Vec<(String, String, String, String)> = Vec::new();
+    for i in 0..5usize {
+        let shared: String = words
+            .iter()
+            .enumerate()
+            .map(|(j, w)| vec![*w; 1 + (j % 5)].join(" "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let unique: String = (0..20usize)
+            .map(|j| {
+                format!(
+                    "unique{}{}",
+                    (b'a' + i as u8) as char,
+                    (b'a' + j as u8) as char
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        owned_sources.push((
+            format!("w{i}"),
+            format!("{i}.txt"),
+            format!("T{i}"),
+            format!("anchor {shared} {unique}"),
+        ));
+    }
+    let works: Vec<(&str, &str)> = owned_sources
+        .iter()
+        .map(|(w, _, t, _)| (w.as_str(), t.as_str()))
+        .collect();
+    let sources: Vec<SourceSpec<'_>> = owned_sources
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let corpus = publish_and_sync_corpus(&works, &sources);
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.8, "synthetic"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let url = srv.url("/decisions");
+
+    let mut first_order: Option<Vec<String>> = None;
+    for run in 0..20usize {
+        let res = assert_ok_json(&run_clec(
+            &["--data-dir", &dir_s, "search", "anchor", "--sag2"],
+            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        ));
+        let order: Vec<String> = res["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["passageId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(order.len(), 5);
+        match &first_order {
+            None => first_order = Some(order),
+            Some(expected) => assert_eq!(
+                &order, expected,
+                "full 5-passage DPP order must remain deterministic across processes (run {run})"
+            ),
+        }
+    }
+}
+
+#[test]
 fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
     let mut sources: Vec<OwnedSourceSpec<'_>> = Vec::new();
     for i in 0..35usize {

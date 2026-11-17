@@ -1540,4 +1540,70 @@ mod tests {
             rank_dpp_indices(&store, &mut df_cache, 3, &dup_and_empty, deadline).unwrap();
         assert_eq!(order_dup, vec![0, 2, 1]);
     }
+
+    #[test]
+    fn dpp_varied_frequency_symmetric_vectors_are_deterministic() {
+        let words = [
+            "amber", "birch", "cedar", "delta", "elm", "frost", "grove", "hazel", "iris", "jade",
+            "kelp", "lime", "moss", "navy", "oak", "pine", "quartz", "reed", "sage", "teal",
+            "umber", "violet", "willow", "xenon", "yellow", "zinc",
+        ];
+        let docs: Vec<(String, String, String, String)> = (0..5usize)
+            .map(|i| {
+                let shared: String = words
+                    .iter()
+                    .enumerate()
+                    .map(|(j, w)| vec![*w; 1 + (j % 5)].join(" "))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let unique: String = (0..20usize)
+                    .map(|j| {
+                        format!(
+                            "unique{}{}",
+                            (b'a' + i as u8) as char,
+                            (b'a' + j as u8) as char
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    format!("w{i}"),
+                    format!("T{i}"),
+                    format!("{i}.txt"),
+                    format!("anchor {shared} {unique}"),
+                )
+            })
+            .collect();
+        let doc_refs: Vec<(&str, &str, &str, &str)> = docs
+            .iter()
+            .map(|(w, t, p, b)| (w.as_str(), t.as_str(), p.as_str(), b.as_str()))
+            .collect();
+        let (_dir, store) = build_sag2_test_store(&doc_refs);
+        let mut df_cache = TermDfCache::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let candidates: Vec<PoolCandidate> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, (w, _, _, text))| PoolCandidate {
+                passage_id: PassageId::parse(&format!("p_{:016x}", i + 1)).unwrap(),
+                work_id: WorkId::from_work_key(w).unwrap(),
+                title: format!("T{i}"),
+                text: text.clone(),
+                genuine_rrf_score: Some(0.016),
+                matched_queries: vec!["anchor".to_owned()],
+                found_in_round: 0,
+                retrieval_rank: i,
+                jev_score: 0.8,
+                expansion_terms: Vec::new(),
+                dpp_order: None,
+            })
+            .collect();
+
+        let baseline = rank_dpp_indices(&store, &mut df_cache, 5, &candidates, deadline).unwrap();
+        assert_eq!(baseline, vec![0, 1, 2, 3, 4]);
+        for run in 0..40 {
+            let order = rank_dpp_indices(&store, &mut df_cache, 5, &candidates, deadline).unwrap();
+            assert_eq!(order, baseline, "DPP order drifted at run {run}");
+        }
+    }
 }
