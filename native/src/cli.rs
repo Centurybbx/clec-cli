@@ -602,6 +602,27 @@ fn serialize_fixed<T: Serialize>(
     Ok(out)
 }
 
+fn converge_rendered_bytes<FRender>(
+    keep: usize,
+    render_with_keep: &mut FRender,
+) -> Result<String, ClecError>
+where
+    FRender: FnMut(usize, usize) -> Result<String, ClecError>,
+{
+    let mut used_bytes = 0usize;
+    for _ in 0..32 {
+        let rendered = render_with_keep(keep, used_bytes)?;
+        if rendered.len() == used_bytes {
+            return Ok(rendered);
+        }
+        used_bytes = rendered.len();
+    }
+    Err(ClecError::new(
+        ErrorCode::InternalError,
+        "Output byte-count calculation failed to converge.",
+    ))
+}
+
 fn fit_list_budget<FRender>(
     total: usize,
     min_keep: usize,
@@ -612,12 +633,7 @@ where
     FRender: FnMut(usize, usize) -> Result<String, ClecError>,
 {
     for keep in (min_keep..=total).rev() {
-        let mut used_bytes = 0usize;
-        for _ in 0..2 {
-            let rendered = render_with_keep(keep, used_bytes)?;
-            used_bytes = rendered.len();
-        }
-        let final_out = render_with_keep(keep, used_bytes)?;
+        let final_out = converge_rendered_bytes(keep, &mut render_with_keep)?;
         if final_out.len() <= max_bytes {
             return Ok(final_out);
         }
@@ -985,5 +1001,148 @@ mod tests {
             ]),
             0
         );
+    }
+
+    #[test]
+    fn budget_used_bytes_converges_to_exact_stdout_len_across_decimal_and_escaping_boundaries() {
+        use crate::domain::{Attribution, ByteSpan};
+        use crate::retrieval::{SearchHit, SearchQueryTerms};
+        use crate::store::WorkRecord;
+
+        let release = ReleaseHash::parse(&"a".repeat(64)).unwrap();
+        let wid = WorkId::from_work_key("demo").unwrap();
+        let sid = SourceId::parse(&format!("s_{}", "1".repeat(24))).unwrap();
+        let pid1 = PassageId::parse(&format!("p_{}", "2".repeat(24))).unwrap();
+        let pid2 = PassageId::parse(&format!("p_{}", "3".repeat(24))).unwrap();
+
+        for pad in 410..=425 {
+            let title = format!("Demo{}\n\"\\😀\u{001f}", ".".repeat(pad));
+            let data = SourcesData {
+                release: release.clone(),
+                total_matched: 1,
+                offset: 0,
+                limit: 1,
+                items: vec![SourceListEntry {
+                    work_id: wid.clone(),
+                    work_key: "demo".to_owned(),
+                    work_title: "Demo".to_owned(),
+                    source_id: sid.clone(),
+                    path: "a.txt".to_owned(),
+                    title,
+                    role: SourceRole::Transcript,
+                    attribution: Attribution::AuthoredFixture,
+                    quality: "fixture".to_owned(),
+                    date: None,
+                    date_basis: None,
+                    content_hash: "b".repeat(64),
+                    passage_count: 1,
+                    diagnostics_count: 0,
+                }],
+                budget: ReadBudgetReport {
+                    max_bytes: DEFAULT_MAX_BYTES,
+                    used_bytes: 0,
+                    omitted_count: 0,
+                },
+            };
+            let out = fit_sources_budget(data.clone(), true, DEFAULT_MAX_BYTES).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                parsed["data"]["budget"]["usedBytes"].as_u64().unwrap() as usize,
+                out.len(),
+                "mismatch at pad={pad}"
+            );
+
+            let out_4digit_cap = fit_sources_budget(data.clone(), true, 2000).unwrap();
+            let cap_len = out_4digit_cap.len();
+            let exact = fit_sources_budget(data.clone(), true, cap_len).unwrap();
+            let exact_parsed: serde_json::Value = serde_json::from_str(&exact).unwrap();
+            assert_eq!(exact.len(), cap_len);
+            assert_eq!(
+                exact_parsed["data"]["budget"]["usedBytes"]
+                    .as_u64()
+                    .unwrap() as usize,
+                exact.len()
+            );
+            let too_tight = fit_sources_budget(data, true, cap_len - 1).unwrap_err();
+            assert_eq!(too_tight.code, ErrorCode::OutputBudgetTooSmall);
+        }
+
+        let make_hit = |pid: &PassageId, text: String| SearchHit {
+            passage_id: pid.clone(),
+            work: WorkRecord {
+                work_id: wid.clone(),
+                work_key: "demo".to_owned(),
+                title: "Demo".to_owned(),
+            },
+            source: crate::store::SourceRecord {
+                source_id: sid.clone(),
+                work_id: wid.clone(),
+                path: "a.txt".to_owned(),
+                title: "Demo".to_owned(),
+                role: SourceRole::Document,
+                attribution: Attribution::AuthoredFixture,
+                quality: "fixture".to_owned(),
+                date: None,
+                date_basis: None,
+                origin: None,
+                content_hash: "c".repeat(64),
+            },
+            ordinal: 0,
+            spans: vec![ByteSpan::new(0, 10, None).unwrap()],
+            cues: Vec::new(),
+            diagnostics: Vec::new(),
+            previous: None,
+            next: None,
+            continued_from: None,
+            continued_to: None,
+            text,
+            rrf_score: 0.5,
+            matched_queries: vec!["alpha".to_owned()],
+        };
+
+        let search_data = SearchData {
+            release,
+            match_mode: MatchMode::Any,
+            queries: vec![SearchQueryTerms {
+                query: "alpha".to_owned(),
+                terms: vec!["alpha".to_owned()],
+            }],
+            total_candidates: 2,
+            hits: vec![
+                make_hit(&pid1, "a".repeat(8600)),
+                make_hit(&pid2, "b".repeat(800)),
+            ],
+            budget: BudgetReport {
+                max_bytes: 10_005,
+                used_bytes: 0,
+                omitted_count: 0,
+                omitted_ids: Vec::new(),
+            },
+        };
+        let full_search = fit_search_budget(search_data.clone(), true, 65_536).unwrap();
+        let full_parsed: serde_json::Value = serde_json::from_str(&full_search).unwrap();
+        assert!(full_search.len() > 10_000);
+        assert_eq!(
+            full_parsed["data"]["budget"]["usedBytes"].as_u64().unwrap() as usize,
+            full_search.len()
+        );
+
+        let tight_one_hit =
+            fit_search_budget(search_data.clone(), true, full_search.len() - 1).unwrap();
+        let tight_parsed: serde_json::Value = serde_json::from_str(&tight_one_hit).unwrap();
+        assert_eq!(tight_parsed["data"]["budget"]["omittedCount"], 1);
+        assert_eq!(
+            tight_parsed["data"]["budget"]["omittedIds"],
+            serde_json::json!([pid2.as_str()])
+        );
+        assert_eq!(
+            tight_parsed["data"]["budget"]["usedBytes"]
+                .as_u64()
+                .unwrap() as usize,
+            tight_one_hit.len()
+        );
+
+        let plain_search = fit_search_budget(search_data, false, full_search.len()).unwrap();
+        assert!(plain_search.contains(&"a".repeat(8600)));
     }
 }
