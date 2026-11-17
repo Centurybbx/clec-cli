@@ -6,13 +6,13 @@ This document records the settled Phase 1 design for the Rust `native/` package 
 
 The crate `native/src/` organizes code by domain ownership instead of pipeline step files.
 
-- `domain`: typed IDs (`WorkId`, `SourceId`, `PassageId`, `ReleaseHash`), `SourceRole`, `Attribution`, `ByteSpan`, `ClecError`, and error exit/remedy mapping.
+- `domain`: typed IDs (`WorkId`, `SourceId`, `PassageId`, `ReleaseHash`), `SourceRole`, `Attribution`, `ByteSpan`, `DateYmd`, `ClecError`, and error exit/remedy mapping, with `Deserialize` routed through validated constructors, encapsulated `ByteSpan` accessors, and constraint-aware `JsonSchema` output.
 - `ingest`: UTF-8 validation, BOM/CRLF-preserving text extraction, SRT/STR/VTT cue parsing with recovery diagnostics, and Unicode scalar segmentation (`1000..1200` target, `2000` hard cap, multi-span passage mapping).
 - `lexical`: Traditional-to-Simplified conversion via `ferrous-opencc` (`tw2s`), NFKC normalization, lowercasing, `jieba-rs` segmentation, and explicit preservation of ticker/number/percent tokens (`0050`, `qqq`, `4%`).
-- `store`: `clec-native-v1` SQLite schema via bundled `rusqlite`, exact-content `blobs` sharing, schema/span/cue/FTS5 validation, and read queries verified against raw bytes.
-- `retrieval`: 1 to 4 query execution, BM25 top-100 per query, deterministic RRF fusion, work-aware diversity (default 2 per work before backfill up to 5), and `--max-bytes` whole-result budget fitting.
-- `snapshot`: publisher build (`corpus.sqlite` + `corpus.sqlite.zst` + `manifest.json`) and atomic local `sync` with OS file locking (`std::fs::File::lock`), integrity verification, idempotent reuse, and rollback.
-- `cli`: `clap` parser (`suggestions` disabled), `schemars`-derived schema output, non-TTY JSON output, stdout/stderr error separation, and subcommand dispatch.
+- `store`: `clec-native-v1` SQLite schema via bundled `rusqlite`, exact-content `blobs` sharing, schema/blob/source/cue/span/continuation/FTS5-postings pre-activation validation, store-owned BM25 candidate queries, and read queries verified against raw bytes.
+- `retrieval`: 1 to 4 query execution over store-owned BM25 top-100 candidates per query, deterministic RRF fusion, and work-aware diversity (default 2 per work before backfill up to 5).
+- `snapshot`: publisher build (`corpus.sqlite` + `corpus.sqlite.zst` + `manifest.json`) and atomic local `sync` with OS file locking (`std::fs::File::lock`), single authoritative activation record (`active.json`), pre-commit validation and output/budget preparation, idempotent reuse, and best-effort post-commit cleanup.
+- `cli`: `clap` parser (`suggestions` disabled), `schemars`-derived schema output, non-TTY JSON output, consistent `--max-bytes` stdout enforcement (including `--help` and `--version`), stdout/stderr error separation, and subcommand dispatch.
 
 ## Corpus format `clec-native-v1`
 
@@ -31,7 +31,8 @@ The SQLite schema stores explicit domain entities and raw UTF-8 provenance. Lega
 
 ## Throughput checkpoint
 
-1. **Correctness invariant.** Every `read` and `search` passage verifies its text against `blobs.raw_bytes` and `passage_spans` before returning. Any mismatch triggers `INTEGRITY_MISMATCH`.
-2. **Isolation and safety.** All tests and verification runs use disposable temporary directories. Existing user installs and tracked raw collection files stay untouched.
-3. **Verifiable delivery sequence.** Each module unit ends with `cargo test` before starting the next unit, followed by `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, release builds, and the blackbox verification script.
-4. **Phase 1 boundaries.** Network bootstrap, global full-corpus packaging, SAG2/LLM calls, cross-format fuzzy deduplication, and non-macOS CI remain out of scope and are declared unsupported in `clec schema`.
+1. **Correctness invariant.** Every `read` and `search` passage verifies its text against `blobs.raw_bytes` and `passage_spans` before returning. Any mismatch triggers `INTEGRITY_MISMATCH`. Pre-activation `sync` validates FTS5 postings (`rowid`, column, offset, token) against source-derived normalized tokens, re-extracts cues and segmentation via `ingest` to verify cue metadata and span containment, and verifies continuation adjacency.
+2. **Atomic activation.** One authoritative record (`active.json`) in `--data-dir` stores the active `release` hash and `manifestPath`. All fallible work (manifest checks, zstd decompression, SQLite validation, projected `storageBytes`, and `--max-bytes` output preparation) completes under `.sync.lock` before `active.json` is atomically replaced. Post-commit cleanup of superseded `.sqlite` files runs best effort without failing a committed sync.
+3. **Isolation and safety.** All tests and verification runs use disposable temporary directories. Existing user installs and tracked raw collection files stay untouched.
+4. **Verifiable delivery sequence.** Each module unit ends with `cargo test --locked` before starting the next unit, followed by `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --release --locked`, and the blackbox verification script. Acceptance requires independent Astra review at the final committed head.
+5. **Phase 1 boundaries.** Network bootstrap, global full-corpus packaging, SAG2/LLM calls, cross-format fuzzy deduplication, and non-macOS CI remain out of scope and are declared unsupported in `clec schema`.
