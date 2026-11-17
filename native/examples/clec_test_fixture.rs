@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clec_core::cli::{TestFixtureOptions, run_cli_with_test_options};
 
 fn main() -> ExitCode {
+    clec_core::build_identity::retain(clec_core::clec_build_identity!("clec_test_fixture"));
     let default_origin = env::var("CLEC_TEST_DEFAULT_MANIFEST")
         .ok()
         .filter(|v| !v.trim().is_empty());

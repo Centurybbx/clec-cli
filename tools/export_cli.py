@@ -12,6 +12,7 @@ def collect_allowlist(repo_root: Path) -> list[Path]:
         repo_root / '.github' / 'workflows' / 'ci.yml',
         repo_root / 'native' / 'Cargo.toml',
         repo_root / 'native' / 'Cargo.lock',
+        repo_root / 'native' / 'build.rs',
         repo_root / 'cli' / '.gitignore',
         repo_root / 'cli' / 'README.md',
         repo_root / 'cli' / 'NOTICES.md',

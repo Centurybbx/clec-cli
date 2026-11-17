@@ -1,3 +1,4 @@
+pub mod build_identity;
 pub mod cli;
 pub(crate) mod distribution;
 pub mod domain;

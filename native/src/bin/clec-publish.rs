@@ -30,6 +30,7 @@ struct PublishCli {
 }
 
 fn main() -> ExitCode {
+    clec_core::build_identity::retain(clec_core::clec_build_identity!("clec-publish"));
     let cli = match PublishCli::try_parse() {
         Ok(c) => c,
         Err(e) => {

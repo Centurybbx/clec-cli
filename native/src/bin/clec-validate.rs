@@ -106,6 +106,7 @@ fn fail_error(err: &ClecError) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    clec_core::build_identity::retain(clec_core::clec_build_identity!("clec-validate"));
     let cli = match ValidateCli::try_parse() {
         Ok(c) => c,
         Err(e) => {
