@@ -269,11 +269,13 @@ def main() -> int:
             assert st["ready"] is False and st["activeRelease"] is None
             sc = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "schema"], clean_env, log))
             assert sc["corpusFormat"] == "clec-native-v2"
-            assert sc["phase"] == "phase2"
+            assert sc["phase"] == "phase4"
+            assert sc["defaultConfigured"] is False
             for rev_key in ("tokenizationRevision", "normalizationRevision", "dictionaryRevision", "equivalenceRevision"):
                 assert sc.get(rev_key), f"missing {rev_key} in schema"
             unsupported_names = {u["name"] for u in sc["unsupportedFeatures"]}
-            assert {"sag2", "http_bootstrap"}.issubset(unsupported_names)
+            assert "sag2" in unsupported_names
+            assert "http_bootstrap" not in unsupported_names
             assert "cross_format_dedup" not in unsupported_names
             assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "search", "退休"], clean_env, log), "NO_DATA")
             assert_err_json(run_cmd(clec_bin, ["--data-dir", str(empty_data), "read", "p_" + "0" * 24], clean_env, log), "NO_DATA")

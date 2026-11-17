@@ -1631,7 +1631,6 @@ mod tests {
         let data_dir = tmp.path().join("boot_data");
         let dir_s = data_dir.display().to_string();
 
-        // Invalid query makes 0 HTTP requests and creates no cache.
         let bad_cli = Cli::try_parse_from(["clec", "--data-dir", &dir_s, "search", "   "]).unwrap();
         assert_eq!(
             dispatch(&bad_cli, true, &opts).unwrap_err().code,
@@ -1640,7 +1639,6 @@ mod tests {
         assert!(!data_dir.exists());
         assert_eq!(manifest_gets.load(Ordering::SeqCst), 1);
 
-        // Cold search bootstraps once, then missing ID / budget failure leaves cache usable offline.
         let miss_cli = Cli::try_parse_from([
             "clec",
             "--data-dir",
@@ -1657,7 +1655,6 @@ mod tests {
         assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
         assert!(data_dir.join("active.json").is_file());
 
-        // Subsequent search makes zero HTTP requests (warm cache).
         let search_cli =
             Cli::try_parse_from(["clec", "--data-dir", &dir_s, "search", "0050"]).unwrap();
         let search_out = dispatch(&search_cli, true, &opts).unwrap();
@@ -1666,7 +1663,6 @@ mod tests {
         assert_eq!(manifest_gets.load(Ordering::SeqCst), 2);
         assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
 
-        // Corrupt active.json must never auto-bootstrap.
         fs::write(data_dir.join("active.json"), "{corrupt").unwrap();
         assert_eq!(
             dispatch(&search_cli, true, &opts).unwrap_err().code,
@@ -1675,7 +1671,6 @@ mod tests {
         assert_eq!(manifest_gets.load(Ordering::SeqCst), 2);
         assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
 
-        // Lock contention during cold bootstrap fails SYNC_LOCKED with zero HTTP requests.
         let lock_dir = tmp.path().join("lock_boot_data");
         fs::create_dir_all(&lock_dir).unwrap();
         let lf = OpenOptions::new()

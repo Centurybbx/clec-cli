@@ -554,23 +554,38 @@ fn is_reqwest_timeout(err: &reqwest::Error) -> bool {
     false
 }
 
+fn format_reqwest_error_without_url(err: reqwest::Error) -> (bool, String) {
+    let timed_out = is_reqwest_timeout(&err);
+    let stripped = err.without_url();
+    let mut parts = vec![stripped.to_string()];
+    let mut cur: Option<&dyn std::error::Error> = std::error::Error::source(&stripped);
+    while let Some(src) = cur {
+        let s = src.to_string();
+        if !s.is_empty() && !parts.contains(&s) {
+            parts.push(s);
+        }
+        cur = src.source();
+    }
+    (timed_out, parts.join(": "))
+}
+
 fn classify_reqwest_err(
     err: reqwest::Error,
     deadline: Instant,
     phase: &str,
     safe_url: &str,
 ) -> ClecError {
-    let timed_out = is_reqwest_timeout(&err) || Instant::now() >= deadline;
-    let stripped = err.without_url();
+    let (req_timed_out, detail) = format_reqwest_error_without_url(err);
+    let timed_out = req_timed_out || Instant::now() >= deadline;
     if timed_out {
         ClecError::new(
             ErrorCode::TransferTimeout,
-            format!("{phase} transfer timed out for {safe_url}: {stripped}"),
+            format!("{phase} transfer timed out for {safe_url}: {detail}"),
         )
     } else {
         ClecError::new(
             ErrorCode::TransferFailed,
-            format!("{phase} transfer failed for {safe_url}: {stripped}"),
+            format!("{phase} transfer failed for {safe_url}: {detail}"),
         )
     }
 }
@@ -759,7 +774,7 @@ fn resolve_remote_artifact_url(
     let resolved = match manifest.artifact_url.as_deref() {
         Some(raw) => validate_remote_url(raw, ErrorCode::InvalidPackage)?,
         None => {
-            let _ = validate_relative_path(&manifest.artifact)?;
+            validate_relative_path(&manifest.artifact)?;
             if manifest.artifact.contains('?')
                 || manifest.artifact.contains('#')
                 || manifest.artifact.contains(':')
