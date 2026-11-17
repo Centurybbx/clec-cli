@@ -49,6 +49,11 @@ pub struct TestFixtureOptions {
     pub manifest_timeout_ms: Option<u64>,
     pub artifact_timeout_ms: Option<u64>,
     pub extra_root_pem: Option<Vec<u8>>,
+    pub resolver_delay_ms: Option<u64>,
+    pub resolver_delay_host: Option<String>,
+    pub setup_delay_ms: Option<u64>,
+    pub cleanup_delay_ms: Option<u64>,
+    pub hook_log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -354,6 +359,13 @@ pub fn run_cli_with_test_options(options: TestFixtureOptions) -> i32 {
             extra_root_pem: options.extra_root_pem,
         },
     };
+    let _hooks_guard = crate::distribution::install_fixture_hooks_guard(
+        options.resolver_delay_ms,
+        options.resolver_delay_host,
+        options.setup_delay_ms,
+        options.cleanup_delay_ms,
+        options.hook_log_path,
+    );
     let args: Vec<String> = env::args().collect();
     run_cli_with_args_and_options(&args, &runtime)
 }
