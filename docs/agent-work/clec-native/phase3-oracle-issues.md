@@ -58,13 +58,21 @@ We replaced those boolean checks with typed structural boundaries.
 
 **Verification.** `test_bench_rejects_duplicate_and_semantically_identical_rewrite_plans` and `.audit/phase3-after-receipts.json` confirm both `["稅務", "稅務"]` and `["稅務問題", "税务问题"]` report `IDENTICAL_QUERY_PLANS` and `no_comparison_identical_query_plans`, while distinct rewrites `["匯回臺灣 稅務問題", "稅務 問題"]` report `DISTINCT_QUERY_PLANS` and `valid_interleaved_latency_comparison`.
 
-### 6. Scoped type annotation cleanup
+### 6. Adapter execution grammar and command-plan binding (follow-up on `b481630`)
+
+**Before.** `_derive_execution_outcome` checked whether each step succeeded, not whether the sequence of steps or their `argv` and declared query plans obeyed the adapter's supported contract. Mutated outcomes with `read_only`, `read_before_search`, `duplicate_search`, `argv=['clec', 'read', 'invented']`, or `status='completed'` paired with `stopReason='read_cli_error:2'` passed `eval.py score-outcomes` with exit code `0`, `verdict='complete'`, `evidenceCoverage=1.0`, and `completeChain=true`.
+
+**Fix.** `score.py` defines typed `SearchCommandPlan` and `ReadCommandPlan` models shared with `adapter.py`, plus `parse_adapter_argv` and `_validate_execution_grammar`. `ScoreableExecution` structurally encodes one `search_step` and at most one `read_step`. Before constructing `ScoreableExecution`, `_derive_execution_outcome` requires `stopReason is None`, an initial `search` step with matching declared `mode`/`queryAngle`/`queries` and `argv`, and at most one `read --context 1` step on a non-empty `search` whose requested and returned `passageId`s bind to `search` hits. Impossible sequences, missing/malformed/mismatched `argv`, and contradictory `stopReason` values remain in the scheduled denominator as `NonScoreableExecution` (`status='inconclusive'`, `evidenceCoverage=null`, `completeChain=null`, `conditionLoss=null`).
+
+**Verification.** `test_execution_grammar_score_outcomes_positives_and_negatives` and `.audit/phase3-execution-grammar-after.json` verify genuine `search`-only, `search` + `read`, keyword-in-query, budget-trimmed `read`, and `rrf_multiquery` positives pass `score-outcomes` with exit `0`, while all `19` negative variants (including `read_only`, `read_before_search`, `duplicate_search`, `contradictory_stop_reason`, and `argv_mismatch`) exit `1` with `verdict='inconclusive_errors_present'`, `scheduledQuestions` preserved, and `null` coverage/chain/loss metrics.
+
+### 7. Scoped type annotation cleanup
 
 **Fix.** Replaced `# type: ignore[assignment]` on `CorpusIndexView._conn` in `score.py` with `sqlite3.Connection | None` and `_require_conn()`. Replaced `# type: ignore[union-attr]` suppressions in `test_phase3.py` with `_CliStepDict` (`TypedDict`).
 
 ## Verification summary and supported limits
 
 - `python3 -m unittest discover -s evaluation/clec-v1/phase2 -p "test_*.py" -v` passed `4` tests.
-- `python3 -m unittest discover -s evaluation/clec-v1/phase3 -p "test_*.py" -v` passed `15` tests (`10` existing controls plus `5` new regression tests).
-- Synthetic CLI end-to-end `validate-dataset`, `run`, `score-outcomes`, and `bench.py` passed on release `9fecd825b478904e65c5b427f19a6619ca79ef166405ba926a9911b7797859c6`.
+- `python3 -m unittest discover -s evaluation/clec-v1/phase3 -p "test_*.py" -v` passed `16` tests (`15` migrated existing controls plus `1` new `score-outcomes` execution-grammar suite).
+- Synthetic CLI end-to-end `validate-dataset`, `run`, and `score-outcomes` passed alongside the `b481630` probe suite (`genuine` complete, all `5` invalid probe variants rejected as `inconclusive` with `null` coverage/chain/conditionLoss).
 - Known limits: undecodable base64 capture inside step records truncates at `65536` raw bytes while recording exact `stdoutRawByteLen` and `stdoutRawSha256`; no static type checker (`mypy` or `pyright`) is installed in this environment; real dataset scoring and retrieval quality remain unmeasured.

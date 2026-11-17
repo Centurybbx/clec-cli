@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
-from typing import Any
+from typing import Any, Literal
 
 try:
     from . import score
@@ -17,10 +17,10 @@ except ImportError:
     import score
 
 
-VALID_MODES = frozenset({"single_query_product_baseline", "rrf_multiquery"})
-VALID_QUERY_ANGLES = frozenset({"question", "blind_rewrite"})
+VALID_MODES = score.VALID_MODES
+VALID_QUERY_ANGLES = score.VALID_QUERY_ANGLES
 FORBIDDEN_QUERY_FIELDS = frozenset({"evidence", "quote", "quotes", "workKeys", "notes", "spans"})
-OUTCOME_SCHEMA_VERSION = 2
+OUTCOME_SCHEMA_VERSION = score.OUTCOME_SCHEMA_VERSION
 _MAX_UNDECODABLE_BASE64_BYTES = 65536
 
 
@@ -112,22 +112,13 @@ def build_runtime_queries(
 
 def run_clec_command(
     clec_bin: Path,
-    argv_tail: list[str],
+    argv_tail: list[str] | score.CommandPlan,
     *,
     data_dir: Path,
     max_bytes: int,
     timeout_sec: float,
 ) -> dict[str, Any]:
-    argv = [
-        str(clec_bin),
-        "--data-dir",
-        str(data_dir),
-        "--offline",
-        "--json",
-        "--max-bytes",
-        str(max_bytes),
-        *argv_tail,
-    ]
+    argv = score.build_adapter_argv(clec_bin, data_dir, max_bytes, argv_tail)
     started = time.monotonic()
     timed_out = False
     exit_code: int | None = None
@@ -274,24 +265,23 @@ def execute_dataset_queries(
     outcomes: list[dict[str, Any]] = []
     raw_logs: list[dict[str, Any]] = []
 
+    if match_mode not in score.VALID_MATCH_MODES:
+        raise ValueError(f"Unsupported match_mode {match_mode!r}; expected one of {sorted(score.VALID_MATCH_MODES)}")
+    typed_match_mode: Literal["any", "all"] = "any" if match_mode == "any" else "all"
+
     for q in questions:
         qid = q["id"]
         queries = build_runtime_queries(q, mode=mode, query_angle=query_angle, blind_map=blind_map)
-        search_argv = [
-            "search",
-            *queries,
-            "--match-mode",
-            match_mode,
-            "--limit",
-            str(limit),
-            "--per-work",
-            str(per_work),
-            "--release",
-            corpus_sha256,
-        ]
+        search_plan = score.SearchCommandPlan(
+            queries=tuple(queries),
+            match_mode=typed_match_mode,
+            limit=limit,
+            per_work=per_work,
+            release=corpus_sha256,
+        )
         search_rec = run_clec_command(
             clec_bin,
-            search_argv,
+            search_plan,
             data_dir=data_dir,
             max_bytes=max_bytes,
             timeout_sec=timeout_sec,
@@ -378,10 +368,13 @@ def execute_dataset_queries(
         read_status = "completed"
         read_error: str | None = None
         if read_top_n > 0 and hits:
-            read_ids = [h["passageId"] for h in hits[:read_top_n]]
+            read_plan = score.ReadCommandPlan(
+                passage_ids=tuple(h["passageId"] for h in hits[:read_top_n]),
+                context=1,
+            )
             read_rec = run_clec_command(
                 clec_bin,
-                ["read", *read_ids, "--context", "1"],
+                read_plan,
                 data_dir=data_dir,
                 max_bytes=read_max_bytes,
                 timeout_sec=timeout_sec,

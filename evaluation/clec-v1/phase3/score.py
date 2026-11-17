@@ -20,8 +20,12 @@ except ImportError:
 VALID_SPLITS = frozenset({"development", "evaluation"})
 VALID_EVIDENCE_KINDS = frozenset({"required", "counterexample", "condition"})
 VALID_OUTCOME_STATUSES = frozenset({"completed", "timeout", "error"})
+VALID_MODES = frozenset({"single_query_product_baseline", "rrf_multiquery"})
+VALID_QUERY_ANGLES = frozenset({"question", "blind_rewrite"})
+VALID_MATCH_MODES = frozenset({"any", "all"})
 OUTCOME_SCHEMA_VERSION = 2
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+PASSAGE_ID_RE = re.compile(r"^p_[0-9a-f]{16,64}$")
 
 
 class CorpusBindingError(ValueError):
@@ -823,12 +827,180 @@ def _build_obligations(evidence: list[dict[str, Any]]) -> list[list[dict[str, An
     return obligations
 
 
+def _parse_strict_positive_int(raw: str) -> int | None:
+    if not raw or not raw.isascii() or not raw.isdigit():
+        return None
+    val = int(raw)
+    if val <= 0 or str(val) != raw:
+        return None
+    return val
+
+
+@dataclass(frozen=True)
+class SearchCommandPlan:
+    queries: tuple[str, ...]
+    match_mode: Literal["any", "all"]
+    limit: int
+    per_work: int
+    release: str
+
+    def to_argv_tail(self) -> list[str]:
+        return [
+            "search",
+            *self.queries,
+            "--match-mode",
+            self.match_mode,
+            "--limit",
+            str(self.limit),
+            "--per-work",
+            str(self.per_work),
+            "--release",
+            self.release,
+        ]
+
+
+@dataclass(frozen=True)
+class ReadCommandPlan:
+    passage_ids: tuple[str, ...]
+    context: int = 1
+
+    def to_argv_tail(self) -> list[str]:
+        return [
+            "read",
+            *self.passage_ids,
+            "--context",
+            str(self.context),
+        ]
+
+
+CommandPlan = SearchCommandPlan | ReadCommandPlan
+
+
+@dataclass(frozen=True)
+class ParsedAdapterArgv:
+    executable: str
+    data_dir: str
+    max_bytes: int
+    plan: CommandPlan
+
+
+def build_adapter_argv(
+    clec_bin: Path | str,
+    data_dir: Path | str,
+    max_bytes: int,
+    tail_or_plan: list[str] | CommandPlan,
+) -> list[str]:
+    tail = tail_or_plan.to_argv_tail() if isinstance(tail_or_plan, (SearchCommandPlan, ReadCommandPlan)) else tail_or_plan
+    return [
+        str(clec_bin),
+        "--data-dir",
+        str(data_dir),
+        "--offline",
+        "--json",
+        "--max-bytes",
+        str(max_bytes),
+        *tail,
+    ]
+
+
+def parse_adapter_argv(argv: Any) -> tuple[ParsedAdapterArgv | None, str | None]:
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return None, "invalid_argv_type"
+    if len(argv) < 8:
+        return None, "truncated_argv"
+    executable, f_dd, data_dir, f_off, f_json, f_mb, max_bytes_raw = argv[:7]
+    if not executable.strip():
+        return None, "empty_executable"
+    if f_dd != "--data-dir" or not data_dir.strip():
+        return None, "missing_data_dir_flag"
+    if f_off != "--offline":
+        return None, "missing_offline_flag"
+    if f_json != "--json":
+        return None, "missing_json_flag"
+    if f_mb != "--max-bytes":
+        return None, "missing_max_bytes_flag"
+    max_bytes = _parse_strict_positive_int(max_bytes_raw)
+    if max_bytes is None:
+        return None, "invalid_max_bytes"
+
+    tail = argv[7:]
+    subcmd = tail[0]
+    if subcmd == "search":
+        if len(tail) < 10:
+            return None, "invalid_search_argv_length"
+        if tail[-8] != "--match-mode" or tail[-7] not in VALID_MATCH_MODES:
+            return None, "invalid_search_match_mode"
+        match_mode: Literal["any", "all"] = "any" if tail[-7] == "any" else "all"
+        if tail[-6] != "--limit":
+            return None, "invalid_search_limit_flag"
+        limit = _parse_strict_positive_int(tail[-5])
+        if limit is None or not (1 <= limit <= 5):
+            return None, "invalid_search_limit"
+        if tail[-4] != "--per-work":
+            return None, "invalid_search_per_work_flag"
+        per_work = _parse_strict_positive_int(tail[-3])
+        if per_work is None or not (1 <= per_work <= 5):
+            return None, "invalid_search_per_work"
+        if tail[-2] != "--release" or not SHA256_HEX_RE.match(tail[-1]):
+            return None, "invalid_search_release"
+        queries = tuple(tail[1:-8])
+        if not (1 <= len(queries) <= 4):
+            return None, "invalid_search_query_count"
+        if any(not q or q.strip() != q for q in queries):
+            return None, "empty_or_untrimmed_search_query"
+        return (
+            ParsedAdapterArgv(
+                executable=executable,
+                data_dir=data_dir,
+                max_bytes=max_bytes,
+                plan=SearchCommandPlan(
+                    queries=queries,
+                    match_mode=match_mode,
+                    limit=limit,
+                    per_work=per_work,
+                    release=tail[-1],
+                ),
+            ),
+            None,
+        )
+
+    if subcmd == "read":
+        if len(tail) < 4:
+            return None, "invalid_read_argv_length"
+        if tail[-2] != "--context":
+            return None, "invalid_read_context_flag"
+        ctx = _parse_strict_positive_int(tail[-1])
+        if ctx != 1:
+            return None, "invalid_read_context_value"
+        passage_ids = tuple(tail[1:-2])
+        if not (1 <= len(passage_ids) <= 50):
+            return None, "invalid_read_id_count"
+        if any(not PASSAGE_ID_RE.match(pid) for pid in passage_ids):
+            return None, "invalid_read_passage_id"
+        return (
+            ParsedAdapterArgv(
+                executable=executable,
+                data_dir=data_dir,
+                max_bytes=max_bytes,
+                plan=ReadCommandPlan(passage_ids=passage_ids, context=ctx),
+            ),
+            None,
+        )
+
+    return None, f"unsupported_subcommand:{subcmd!r}"
+
+
 @dataclass(frozen=True)
 class CompletedStep:
     step_name: str
     stdout_bytes: int
     stderr_bytes: int
     items: tuple[dict[str, Any], ...]
+    parsed_argv: ParsedAdapterArgv | None = None
+    argv_error: str | None = None
+    declared_match_mode: str | None = None
+    declared_queries: tuple[str, ...] | None = None
+    omitted_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -846,11 +1018,16 @@ ParsedStep = CompletedStep | FailedStep
 
 @dataclass(frozen=True)
 class ScoreableExecution:
-    completed_steps: tuple[CompletedStep, ...]
+    search_step: CompletedStep
+    read_step: CompletedStep | None
     all_steps: tuple[ParsedStep, ...]
     search_stdout_bytes: int
     read_stdout_bytes: int
     stderr_bytes: int
+
+    @property
+    def completed_steps(self) -> tuple[CompletedStep, ...]:
+        return (self.search_step, self.read_step) if self.read_step is not None else (self.search_step,)
 
 
 @dataclass(frozen=True)
@@ -888,10 +1065,6 @@ def _is_valid_v2_outcome(outcome: Any) -> tuple[bool, str | None]:
             return False, f"Step {idx} must be an object"
         if step.get("step") not in ("search", "read"):
             return False, f"Step {idx} has invalid step kind {step.get('step')!r}"
-        if "argv" in step:
-            argv = step["argv"]
-            if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
-                return False, f"Step {idx} has invalid argv"
         if not isinstance(step.get("timedOut"), bool):
             return False, f"Step {idx} missing boolean timedOut"
         exit_code = step.get("exitCode")
@@ -1060,16 +1233,173 @@ def _parse_step_payload(step: dict[str, Any], corpus: CorpusIndexView) -> Parsed
             timed_out=False,
             reason=f"invalid_{step_name}_items_list",
         )
+
+    declared_match_mode: str | None = None
+    declared_queries: tuple[str, ...] | None = None
+    omitted_count: int | None = None
+    if step_name == "search":
+        if "matchMode" in data:
+            mm = data["matchMode"]
+            if not isinstance(mm, str):
+                return FailedStep(
+                    step_name=step_name,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                    timed_out=False,
+                    reason="invalid_search_match_mode",
+                )
+            declared_match_mode = mm
+        if "queries" in data:
+            raw_queries = data["queries"]
+            if not isinstance(raw_queries, list) or not all(
+                isinstance(entry, dict) and isinstance(entry.get("query"), str) for entry in raw_queries
+            ):
+                return FailedStep(
+                    step_name=step_name,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                    timed_out=False,
+                    reason="invalid_search_queries_metadata",
+                )
+            declared_queries = tuple(entry["query"] for entry in raw_queries)
+    else:
+        if isinstance(budget_obj, dict) and "omittedCount" in budget_obj:
+            oc = budget_obj["omittedCount"]
+            if not _is_int_non_bool(oc) or oc < 0:
+                return FailedStep(
+                    step_name=step_name,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                    timed_out=False,
+                    reason="invalid_read_budget_omittedCount",
+                )
+            omitted_count = int(oc)
+
+    if "argv" not in step:
+        parsed_argv, argv_error = None, "missing_argv"
+    else:
+        parsed_argv, argv_error = parse_adapter_argv(step["argv"])
+
     return CompletedStep(
         step_name=step_name,
         stdout_bytes=stdout_bytes,
         stderr_bytes=stderr_bytes,
         items=tuple(raw_items),
+        parsed_argv=parsed_argv,
+        argv_error=argv_error,
+        declared_match_mode=declared_match_mode,
+        declared_queries=declared_queries,
+        omitted_count=omitted_count,
     )
 
 
+def _is_valid_failed_step_sequence(parsed_steps: tuple[ParsedStep, ...]) -> bool:
+    if not parsed_steps:
+        return True
+    if len(parsed_steps) == 1:
+        return parsed_steps[0].step_name == "search"
+    if len(parsed_steps) == 2:
+        return (
+            isinstance(parsed_steps[0], CompletedStep)
+            and parsed_steps[0].step_name == "search"
+            and bool(parsed_steps[0].items)
+            and parsed_steps[1].step_name == "read"
+        )
+    return False
+
+
+def _validate_execution_grammar(
+    outcome: dict[str, Any],
+    completed_steps: tuple[CompletedStep, ...],
+    corpus: CorpusIndexView,
+    question: dict[str, Any],
+) -> str | None:
+    if outcome.get("stopReason") is not None:
+        return f"completed_with_stop_reason:{outcome.get('stopReason')!r}"
+
+    if len(completed_steps) == 1:
+        if completed_steps[0].step_name != "search":
+            return f"invalid_initial_step:{completed_steps[0].step_name}"
+    elif len(completed_steps) == 2:
+        if completed_steps[0].step_name != "search" or completed_steps[1].step_name != "read":
+            return f"invalid_step_sequence:{[s.step_name for s in completed_steps]}"
+    else:
+        return f"invalid_step_count:{len(completed_steps)}"
+
+    mode = outcome.get("mode")
+    if not isinstance(mode, str) or mode not in VALID_MODES:
+        return f"invalid_mode:{mode!r}"
+    query_angle = outcome.get("queryAngle")
+    if not isinstance(query_angle, str) or query_angle not in VALID_QUERY_ANGLES:
+        return f"invalid_query_angle:{query_angle!r}"
+    queries = outcome.get("queries")
+    if (
+        not isinstance(queries, list)
+        or not queries
+        or not all(isinstance(q, str) and q and q.strip() == q for q in queries)
+    ):
+        return "invalid_declared_queries"
+    if mode == "single_query_product_baseline" and len(queries) != 1:
+        return f"invalid_query_count_for_single_query_mode:{len(queries)}"
+    if mode == "rrf_multiquery" and query_angle == "question" and len(queries) != 1:
+        return f"invalid_query_count_for_question_angle:{len(queries)}"
+    if mode == "rrf_multiquery" and len(queries) > 4:
+        return f"invalid_query_count_for_rrf_multiquery:{len(queries)}"
+    if query_angle == "question":
+        expected_q = str(question.get("question", "")).strip()
+        if queries != [expected_q]:
+            return "question_query_mismatch"
+
+    search_step = completed_steps[0]
+    if search_step.parsed_argv is None:
+        return f"search_argv_error:{search_step.argv_error}"
+    if not isinstance(search_step.parsed_argv.plan, SearchCommandPlan):
+        return "search_argv_command_mismatch"
+    search_plan = search_step.parsed_argv.plan
+    if search_plan.release != corpus.actual_sha256:
+        return "search_argv_release_mismatch"
+    if list(search_plan.queries) != queries:
+        return "search_argv_queries_mismatch"
+    if search_step.declared_match_mode is not None and search_step.declared_match_mode != search_plan.match_mode:
+        return "search_stdout_match_mode_mismatch"
+    if search_step.declared_queries is not None and search_step.declared_queries != search_plan.queries:
+        return "search_stdout_queries_mismatch"
+
+    if len(completed_steps) == 2:
+        read_step = completed_steps[1]
+        if not search_step.items:
+            return "read_after_empty_search"
+        if read_step.parsed_argv is None:
+            return f"read_argv_error:{read_step.argv_error}"
+        if not isinstance(read_step.parsed_argv.plan, ReadCommandPlan):
+            return "read_argv_command_mismatch"
+        read_plan = read_step.parsed_argv.plan
+        search_hit_ids = [h.get("passageId") if isinstance(h, dict) else None for h in search_step.items]
+        if len(read_plan.passage_ids) > len(search_hit_ids):
+            return "read_id_count_exceeds_search_hits"
+        expected_selected = search_hit_ids[: len(read_plan.passage_ids)]
+        if any(not isinstance(pid, str) or not pid for pid in expected_selected) or (
+            list(read_plan.passage_ids) != expected_selected
+        ):
+            return "read_ids_not_bound_to_search_hits"
+        if any(not isinstance(it, dict) or it.get("kind") not in (None, "passage") for it in read_step.items):
+            return "unsupported_read_item_kind"
+        returned_read_ids = [it.get("passageId") for it in read_step.items]
+        if not returned_read_ids or len(returned_read_ids) > len(read_plan.passage_ids):
+            return "read_returned_count_mismatch"
+        if returned_read_ids != list(read_plan.passage_ids[: len(returned_read_ids)]):
+            return "read_returned_ids_not_bound_to_call"
+        if (
+            read_step.omitted_count is not None
+            and len(returned_read_ids) + read_step.omitted_count != len(read_plan.passage_ids)
+        ):
+            return "read_budget_omitted_count_mismatch"
+
+    return None
+
+
 def _derive_execution_outcome(
-    outcome: dict[str, Any], corpus: CorpusIndexView
+    outcome: dict[str, Any], corpus: CorpusIndexView, question: dict[str, Any]
 ) -> ExecutionOutcome:
     raw_status = outcome.get("status")
     stop_reason = outcome.get("stopReason")
@@ -1112,6 +1442,17 @@ def _derive_execution_outcome(
                 stderr_bytes=stderr_bytes,
                 undecodable_reasons=undecodable_reasons,
             )
+        if not _is_valid_failed_step_sequence(parsed_steps):
+            return NonScoreableExecution(
+                status="inconclusive",
+                stop_reason=f"incoherent_outcome:invalid_step_sequence:{[s.step_name for s in parsed_steps]}",
+                completed_steps=completed_steps,
+                all_steps=parsed_steps,
+                search_stdout_bytes=search_stdout_bytes,
+                read_stdout_bytes=read_stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                undecodable_reasons=undecodable_reasons,
+            )
         if raw_status == "timeout" and timeout_fail is None:
             return NonScoreableExecution(
                 status="inconclusive",
@@ -1147,8 +1488,21 @@ def _derive_execution_outcome(
                 stderr_bytes=stderr_bytes,
                 undecodable_reasons=undecodable_reasons,
             )
+        grammar_err = _validate_execution_grammar(outcome, completed_steps, corpus, question)
+        if grammar_err is not None:
+            return NonScoreableExecution(
+                status="inconclusive",
+                stop_reason=f"incoherent_outcome:{grammar_err}",
+                completed_steps=completed_steps,
+                all_steps=parsed_steps,
+                search_stdout_bytes=search_stdout_bytes,
+                read_stdout_bytes=read_stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                undecodable_reasons=undecodable_reasons,
+            )
         return ScoreableExecution(
-            completed_steps=completed_steps,
+            search_step=completed_steps[0],
+            read_step=completed_steps[1] if len(completed_steps) == 2 else None,
             all_steps=parsed_steps,
             search_stdout_bytes=search_stdout_bytes,
             read_stdout_bytes=read_stdout_bytes,
@@ -1295,7 +1649,7 @@ def score_question(
             counterexample_count=len(ce_obs),
         )
 
-    execution = _derive_execution_outcome(outcome, corpus)
+    execution = _derive_execution_outcome(outcome, corpus, question)
 
     all_citation_failures: list[dict[str, Any]] = []
     if isinstance(execution, NonScoreableExecution) and execution.undecodable_reasons:
