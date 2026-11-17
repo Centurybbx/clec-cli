@@ -313,17 +313,24 @@ def main() -> int:
                 "NOTE ignored block\r\n\r\n"
                 "id\r\n00:01.000 --> 00:03.000 position:10%\r\n<b>退休😀條件</b>\r\n第二行\r\n\r\n"
                 "id\r\n00:02.000 --> 00:04.000\r\n重疊測試 0050 與 QQQ 和 4% 法則\r\n\r\n"
+                "2562047788015:12:55.806 --> 2562047788015:12:55.807\r\n極限時間戳\r\n\r\n"
+                "2562047788015:12:55.807 --> 2562047788015:12:55.808\r\n超過有號整數上限\r\n\r\n"
+                "5124095576031:00:00.000 --> 5124095576031:00:01.000\r\n溢位時間戳\r\n\r\n"
+                "99999999999999999999:00:00.000 --> 99999999999999999999:00:01.000\r\n超大整數\r\n\r\n"
                 "00:99.000 --> 00:01.000\r\n無效時間戳\r\n"
             )
             vtt_raw = vtt_text.encode("utf-8")
             (ws / "edge.vtt").write_bytes(vtt_raw)
             cue1_payload = "<b>退休😀條件</b>\r\n第二行".encode("utf-8")
             cue2_payload = "重疊測試 0050 與 QQQ 和 4% 法則".encode("utf-8")
+            cue3_payload = "極限時間戳".encode("utf-8")
             cue1_start = vtt_raw.index(cue1_payload)
             cue2_start = vtt_raw.index(cue2_payload)
+            cue3_start = vtt_raw.index(cue3_payload)
             expected_vtt_spans = [
                 {"startByte": cue1_start, "endByte": cue1_start + len(cue1_payload), "cueOrdinal": 0},
                 {"startByte": cue2_start, "endByte": cue2_start + len(cue2_payload), "cueOrdinal": 1},
+                {"startByte": cue3_start, "endByte": cue3_start + len(cue3_payload), "cueOrdinal": 2},
             ]
 
             shared_bytes = "相同位元組在不同作品下保留各自來源身份與0050配置。\n".encode("utf-8")
@@ -396,16 +403,17 @@ def main() -> int:
 
             vtt_hits = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(edge_data), "search", "退休"], clean_env, log))
             vtt_hit = next(h for h in vtt_hits["hits"] if h["source"]["sourceId"] == vtt_sid)
-            assert len(vtt_hit["spans"]) == 2
-            assert len(vtt_hit["cues"]) == 2
+            assert len(vtt_hit["spans"]) == 3
+            assert len(vtt_hit["cues"]) == 3
             assert vtt_hit["cues"][0]["startMs"] == 1000 and vtt_hit["cues"][1]["startMs"] == 2000
-            assert vtt_hit["diagnostics"], "expected malformed timestamp diagnostic"
+            assert vtt_hit["cues"][2]["endMs"] == (1 << 63) - 1
+            assert len(vtt_hit["diagnostics"]) == 4, vtt_hit["diagnostics"]
             db_file = edge_data / f"{synced['release']}.sqlite"
             verify_spans_against_sqlite(db_file, vtt_hit["passageId"], vtt_hit["text"], vtt_hit["spans"], expected_vtt_spans)
 
-            edge_budget = assert_ok_json(
-                run_cmd(clec_bin, ["--data-dir", str(edge_data), "--max-bytes", "3500", "search", "0050", "財富"], clean_env, log)
-            )
+            edge_budget_proc = run_cmd(clec_bin, ["--data-dir", str(edge_data), "--max-bytes", "3500", "search", "0050", "財富"], clean_env, log)
+            edge_budget = assert_ok_json(edge_budget_proc)
+            assert edge_budget["budget"]["usedBytes"] == len(edge_budget_proc.stdout.encode("utf-8"))
             assert edge_budget["budget"]["usedBytes"] <= 3500
             assert edge_budget["budget"]["omittedCount"] >= 1
             assert len(edge_budget["hits"]) >= 1
@@ -413,7 +421,49 @@ def main() -> int:
                 run_cmd(clec_bin, ["--data-dir", str(edge_data), "--max-bytes", "64", "search", "0050"], clean_env, log),
                 "OUTPUT_BUDGET_TOO_SMALL",
             )
-            return "BOM/CRLF/emoji/overlaps/diagnostics, authored VTT offsets, 0050/QQQ/4%, ASR hard cuts, tight-budget omission, and shared-blob dual-work provenance verified"
+
+            pad_ws = tmp / "pad-ws"
+            pad_ws.mkdir()
+            (pad_ws / "a.txt").write_text("alpha budget boundary.", encoding="utf-8")
+            (pad_ws / "b.txt").write_text("beta budget boundary.", encoding="utf-8")
+            for pad in (416, 417, 418):
+                pad_intake = tmp / f"pad-intake-{pad}.json"
+                pad_intake.write_text(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "works": [{"key": "demo", "title": "Demo"}],
+                            "sources": [
+                                {"work": "demo", "path": "a.txt", "title": "Demo" + ("." * pad), "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                                {"work": "demo", "path": "b.txt", "title": "Beta", "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                pad_rel = tmp / f"pad-rel-{pad}"
+                assert run_cmd(pub_bin, ["--workspace", str(pad_ws), "--intake", str(pad_intake), "--output", str(pad_rel)], clean_env, log).returncode == 0
+                pad_data = tmp / f"pad-data-{pad}"
+                assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(pad_data), "sync", "--manifest", str(pad_rel / "manifest.json")], clean_env, log))
+                src_proc = run_cmd(clec_bin, ["--data-dir", str(pad_data), "sources", "--limit", "1"], clean_env, log)
+                src_res = assert_ok_json(src_proc)
+                actual_len = len(src_proc.stdout.encode("utf-8"))
+                assert src_res["budget"]["usedBytes"] == actual_len, (pad, src_res["budget"]["usedBytes"], actual_len)
+
+                cap4_proc = run_cmd(clec_bin, ["--data-dir", str(pad_data), "--max-bytes", "2000", "sources", "--limit", "1"], clean_env, log)
+                cap4_res = assert_ok_json(cap4_proc)
+                cap4_len = len(cap4_proc.stdout.encode("utf-8"))
+                assert cap4_res["budget"]["usedBytes"] == cap4_len
+                if len(str(cap4_len)) == 4 and len(str(cap4_len - 1)) == 4:
+                    exact_proc = run_cmd(clec_bin, ["--data-dir", str(pad_data), "--max-bytes", str(cap4_len), "sources", "--limit", "1"], clean_env, log)
+                    exact_res = assert_ok_json(exact_proc)
+                    assert exact_res["budget"]["usedBytes"] == len(exact_proc.stdout.encode("utf-8")) == cap4_len
+                    assert_err_json(
+                        run_cmd(clec_bin, ["--data-dir", str(pad_data), "--max-bytes", str(cap4_len - 1), "sources", "--limit", "1"], clean_env, log),
+                        "OUTPUT_BUDGET_TOO_SMALL",
+                    )
+
+            return "BOM/CRLF/emoji/overlaps/timestamp-overflow/diagnostics, authored VTT offsets, 0050/QQQ/4%, ASR hard cuts, fixed-point budget boundaries, and shared-blob dual-work provenance verified"
 
         def check_authored_ranking_and_diversity(log: list[dict[str, Any]]) -> str:
             ws = tmp / "rank-ws"
@@ -764,6 +814,26 @@ def main() -> int:
                     "INTEGRITY_MISMATCH",
                 ),
                 (
+                    "tamper-fts-stats-zero",
+                    lambda c: c.execute("UPDATE search_data SET block=x'000000' WHERE id=1"),
+                    "INTEGRITY_MISMATCH",
+                ),
+                (
+                    "tamper-fts-stats-skewed",
+                    lambda c: c.execute("UPDATE search_data SET block=x'010101' WHERE id=1"),
+                    "INTEGRITY_MISMATCH",
+                ),
+                (
+                    "tamper-fts-structure",
+                    lambda c: c.execute("UPDATE search_data SET block=x'ffffffffffffffff' WHERE id=10"),
+                    "INVALID_PACKAGE",
+                ),
+                (
+                    "tamper-fts-segment",
+                    lambda c: c.execute("UPDATE search_data SET block=x'ff00ff' WHERE id > 10"),
+                    "INVALID_PACKAGE",
+                ),
+                (
                     "tamper-misplaced-fts",
                     lambda c: c.executescript(
                         "INSERT INTO search(search) VALUES('delete-all');"
@@ -787,6 +857,62 @@ def main() -> int:
                 )
             st_after_tamper = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(atom_data), "status"], clean_env, log))
             assert st_after_tamper["activeRelease"] == sha_a
+
+            manifest_a_obj = json.loads((rel_a / "manifest.json").read_text(encoding="utf-8"))
+            expected_manifest_a = str((rel_a / "manifest.json").resolve())
+
+            invalid_zstd_dir = tmp / "invalid-zstd-reuse"
+            invalid_zstd_dir.mkdir()
+            bad_zstd_payload = b"not a zstd stream"
+            (invalid_zstd_dir / "corpus.sqlite.zst").write_bytes(bad_zstd_payload)
+            m_bad_zstd = dict(manifest_a_obj)
+            m_bad_zstd["compressedBytes"] = len(bad_zstd_payload)
+            m_bad_zstd["compressedSha256"] = hashlib.sha256(bad_zstd_payload).hexdigest()
+            (invalid_zstd_dir / "manifest.json").write_text(json.dumps(m_bad_zstd), encoding="utf-8")
+
+            assert_err_json(
+                run_cmd(clec_bin, ["--data-dir", str(atom_data), "sync", "--manifest", str(invalid_zstd_dir / "manifest.json")], clean_env, log),
+                "INVALID_PACKAGE",
+            )
+            assert_err_json(
+                run_cmd(clec_bin, ["--data-dir", str(tmp / "fresh-invalid-zstd"), "sync", "--manifest", str(invalid_zstd_dir / "manifest.json")], clean_env, log),
+                "INVALID_PACKAGE",
+            )
+            st_after_bad_zstd = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(atom_data), "status"], clean_env, log))
+            assert st_after_bad_zstd["activeRelease"] == sha_a
+            assert st_after_bad_zstd["manifestPath"] == expected_manifest_a
+
+            wrong_decomp_dir = tmp / "wrong-decomp-reuse"
+            wrong_decomp_dir.mkdir()
+            wrong_zstd_payload = py_zstd.compress(b"valid zstd stream wrong decompressed payload")
+            (wrong_decomp_dir / "corpus.sqlite.zst").write_bytes(wrong_zstd_payload)
+            m_wrong_decomp = dict(manifest_a_obj)
+            m_wrong_decomp["compressedBytes"] = len(wrong_zstd_payload)
+            m_wrong_decomp["compressedSha256"] = hashlib.sha256(wrong_zstd_payload).hexdigest()
+            (wrong_decomp_dir / "manifest.json").write_text(json.dumps(m_wrong_decomp), encoding="utf-8")
+
+            assert_err_json(
+                run_cmd(clec_bin, ["--data-dir", str(atom_data), "sync", "--manifest", str(wrong_decomp_dir / "manifest.json")], clean_env, log),
+                "INTEGRITY_MISMATCH",
+            )
+            st_after_wrong_decomp = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(atom_data), "status"], clean_env, log))
+            assert st_after_wrong_decomp["manifestPath"] == expected_manifest_a
+
+            valid_alt_dir = tmp / "valid-alt-reuse"
+            valid_alt_dir.mkdir()
+            shutil.copy2(rel_a / "corpus.sqlite.zst", valid_alt_dir / "corpus.sqlite.zst")
+            shutil.copy2(rel_a / "manifest.json", valid_alt_dir / "manifest.json")
+            reused_alt = assert_ok_json(
+                run_cmd(clec_bin, ["--data-dir", str(atom_data), "sync", "--manifest", str(valid_alt_dir / "manifest.json")], clean_env, log)
+            )
+            assert reused_alt["reused"] is True
+            (valid_alt_dir / "corpus.sqlite.zst").write_bytes(bad_zstd_payload)
+            (valid_alt_dir / "manifest.json").write_text(json.dumps(m_bad_zstd), encoding="utf-8")
+            assert_err_json(
+                run_cmd(clec_bin, ["--data-dir", str(atom_data), "sync", "--manifest", str(valid_alt_dir / "manifest.json")], clean_env, log),
+                "INVALID_PACKAGE",
+            )
+            assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(atom_data), "search", "alpha"], clean_env, log))
 
             obs_data = tmp / "obs-data"
             assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(obs_data), "sync", "--manifest", str(rel_a / "manifest.json")], clean_env, log))
