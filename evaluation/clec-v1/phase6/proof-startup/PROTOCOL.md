@@ -11,7 +11,7 @@ Unit 1 registers one narrow development tool named `clec` with a strict status-o
 - `action`: literal `"status"`
 - `additionalProperties`: `false`
 
-Unit 4 restores the closed six-action `ClecRequest` contract (`schema`, `status`, `search`, `read`, `sources`, `sync`).
+Unit 4 restores the closed six-action `ClecRequest` contract (`schema`, `help`, `status`, `search`, `read`, `sources`).
 
 ## Pinned Inputs and Runtime Environment
 

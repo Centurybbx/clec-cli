@@ -28,7 +28,7 @@ test("malformed process rows never establish absence", () => {
 });
 
 test("unsafe process identities never establish absence", () => {
-  for (const raw of [valid.replace("123 1 123", "9007199254740993 1 123"), valid.replace("123 1 123", "123 1 0")]) {
+  for (const raw of [valid.replace("123 1 123", "9007199254740993 1 123"), valid.replace("123 1 123", "123 1 9007199254740993")]) {
     withProcessTable(raw, () => assert.equal(readOsProcessTable().ok, false));
   }
 });

@@ -2,6 +2,8 @@
 
 Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. Unit 1 proved the RPC startup sequence, nonrejecting provider admission latch, outer eight-call tool budget, pre-GO detached Node group ownership, and bounded raw capture against real installed Pi 1.5.2 and pinned `clec.exe`. All 45 Unit 1 matrix checks passed on clean tested HEAD `e393d226c8cd18ca240306878ed51fdfc38ed211` against a loopback OpenAI mock. Units 2, 3, and 4 remain pending until fresh independent review accepts Unit 1.
 
+Current gate is `REQUEST CHANGES` after independent review at `910e812`. The executed matrix passed, but additional observation and cleanup-deadline probes failed. The pending-work section records the findings and limited coordinator corrections. No complete lifetime guarantee is certified by the matrix result.
+
 ## Scope and narrow tool profile
 
 Unit 1 delivers only the minimum feasibility artifact in `evaluation/clec-v1/phase6/proof-startup/` and this report:
@@ -15,7 +17,7 @@ Unit 1 delivers only the minimum feasibility artifact in `evaluation/clec-v1/pha
 - `evaluation/clec-v1/phase6/proof-startup/controller.ts` implements the outer supervisor `runUnit1Proof` and immutable per-run index entries.
 - `evaluation/clec-v1/phase6/proof-startup/fixtures.ts` and `evaluation/clec-v1/phase6/proof-startup/run-matrix.ts` run the loopback OpenAI mock server and the 45-case verification matrix.
 
-Unit 1 restricts `clec` to `{ action: "status" }` with `additionalProperties: false`. It does not claim acceptance of the six-action closed `ClecRequest` contract (`schema`, `status`, `search`, `read`, `sources`, `sync`), which Unit 4 integrates after Units 2 and 3.
+Unit 1 restricts `clec` to `{ action: "status" }` with `additionalProperties: false`. It does not claim acceptance of the six-action closed `ClecRequest` contract (`schema`, `help`, `status`, `search`, `read`, `sources`), which Unit 4 integrates after Units 2 and 3.
 
 ## Runtime findings verified during Unit 1
 
@@ -65,6 +67,8 @@ All 45 checks in `run-matrix.ts` passed (`45/45`) and left zero surviving child 
 - **Basic ownership and bounds (3/3 passed).** `ownership_exclusive_retained` kept prior run artifacts and index entries byte-identical (including 0-byte `pi.stderr.bin`). `ownership_precreated_paths_and_dup_id` rejected pre-existing `APPEND_SYSTEM.md`, `SYSTEM.md`, `settings.json`, `models.json`, and duplicate `AttemptId` without overwriting bytes or calling the provider. `bounds_caps_and_stalled_sink` verified the 32,768 native stdout prefix cap, 65,536 Pi stderr prefix cap, 63 MiB normal journal cap with 1 MiB emergency reserve, and deadline enforcement under a stalled sink.
 
 ## Pending work and open gates
+
+Independent review at `910e812353e9e43ed51aad5ecffdbc21331c5c7c` reran all 45 controls successfully but found two P1 blockers with additional probes. Synchronous process inspection delayed actual SIGKILL to 2,287 ms, and malformed process-table output established false absence while a separate OS check showed the child alive. The coordinator corrected malformed/empty process-output handling and the future-action documentation directly, with focused regression controls. Cleanup deadline isolation remains unresolved and requires a bounded design correction before Hydrogen implementation. Unit 1 is not accepted; Units 2 through 4 remain gated. Earlier 45/45 results establish only their executed controls.
 
 - **Pending Unit 1 gate.** Independent fresh review and rerun of Unit 1.
 - **Pending implementation units.** Unit 2 (canonical `PublicRunPlan`, external commitments, and unified `Prefix`/`Closed` parser/reducer in `validate`, plus mutation replay), Unit 3 (full bounded capture, split UTF-8 and binary stderr retention, and closure tamper checks), and Unit 4 (one-wave host migration and six-action `ClecRequest` integration).

@@ -31,21 +31,28 @@ export function readOsProcessTable(): { readonly ok: true; readonly entries: rea
 			encoding: "utf8",
 			timeout: 3_000,
 			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, LC_ALL: "C", LANG: "C" },
 		});
 		const entries: PsProcessEntry[] = [];
 		for (const line of raw.split("\n")) {
 			if (line.trim().length === 0) continue;
 			const m = PS_LINE_RE.exec(line);
-			if (!m) continue;
+			if (!m) return { ok: false, reason: "Unparseable OS process-table row" };
+			const pid = Number(m[1]);
+			const ppid = Number(m[2]);
+			const pgid = Number(m[3]);
+			if (![pid, ppid, pgid].every((id) => Number.isSafeInteger(id) && id >= 0)) {
+				return { ok: false, reason: "Invalid OS process-table identity" };
+			}
 			entries.push({
-				pid: Number(m[1]),
-				ppid: Number(m[2]),
-				pgid: Number(m[3]),
+				pid,
+				ppid,
+				pgid,
 				lstart: m[4].replace(/\s+/g, " ").trim(),
 				command: m[5],
 			});
 		}
-		return { ok: true, entries };
+		return entries.length > 0 ? { ok: true, entries } : { ok: false, reason: "Empty OS process table" };
 	} catch (err) {
 		return {
 			ok: false,
