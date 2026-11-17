@@ -65,7 +65,7 @@ Saved evaluation outcomes must use `outcomeSchemaVersion: 2` and preserve raw CL
 
 1. **Same-corpus algorithm comparison (`clec-native-v2`).** Compare the single-query product baseline (`clec search <query>`, labeled `single_query_product_baseline`, which runs single-query BM25 + RRF score transform + `per_work` diversity + provenance verification) against multi-query RRF (`clec search <q1> [<q2>...]`, labeled `rrf_multiquery`) on the exact same corpus, `--limit`, `--per-work`, and serialized stdout UTF-8 byte budget.
 2. **Legacy 0.3.0 baseline separation.** Any historical `0.3.0` product baseline lives in a separately labeled comparison because its corpus (`12,532` uncollapsed sources) and passage segmentation differ. It is never presented as a controlled algorithm ablation.
-3. **Runtime query isolation.** Runtime search queries come strictly from `question` or a blind rewrite file (`--query-angle blind_rewrite`). Gold quotes, evidence paths, work keys, and annotation notes never enter runtime queries.
+3. **Runtime query isolation.** Runtime search queries come strictly from `question` or a blind rewrite file (`--query-angle blind_rewrite`). `eval.py` and `bench.py` extract only `(id, question)` at the dataset boundary into immutable slotted `adapter.RuntimeQuestion` records before calling `adapter.execute_dataset_queries` or `adapter.build_runtime_queries`. Both entrypoints reject gold-bearing dicts or mappings before spawning any CLI subprocess, keeping gold quotes, evidence spans, paths, work keys, answerability, and annotation notes exclusively in validation and scoring.
 
 ## Pre-registered numerical gates
 

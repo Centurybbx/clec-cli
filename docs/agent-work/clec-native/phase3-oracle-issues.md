@@ -70,9 +70,17 @@ We replaced those boolean checks with typed structural boundaries.
 
 **Fix.** Replaced `# type: ignore[assignment]` on `CorpusIndexView._conn` in `score.py` with `sqlite3.Connection | None` and `_require_conn()`. Replaced `# type: ignore[union-attr]` suppressions in `test_phase3.py` with `_CliStepDict` (`TypedDict`).
 
+### 8. Narrow runtime question boundary for query isolation
+
+**Before.** `adapter.execute_dataset_queries` and `adapter.build_runtime_queries` accepted full gold-bearing `dict[str, Any]` question records from `eval.py` and `bench.py`. Although `build_runtime_queries` read only `id` and `question` (or `blind_map`), the adapter boundary did not structurally isolate query construction from gold annotation fields (`evidence`, `spans`, `quote`, `path`, `workKeys`, `notes`, `answerable`).
+
+**Fix.** `adapter.py` introduces `@dataclass(frozen=True, slots=True) class RuntimeQuestion` containing only `id: str` and `question: str`, plus `parse_runtime_question` and `extract_runtime_questions` boundary extractors. `eval.py`, `bench.py`, and all synthetic test callers migrate to `RuntimeQuestion` with no legacy mapping fallback. `build_runtime_queries` and `execute_dataset_queries` enforce `RuntimeQuestion` upfront and raise `TypeError` before spawning any `clec` subprocess if passed a dict, mapping, or duck-typed record.
+
+**Verification.** `test_eval_run_passes_only_narrow_runtime_questions_without_gold_fields`, `test_bench_warmup_passes_only_narrow_runtime_questions_without_gold_fields`, `test_direct_gold_record_to_query_api_rejected_before_cli_spawn`, and `test_runtime_question_structural_restrictions_poison_isolation_and_narrow_positive_controls` verify runtime isolation, `slots`/immutability, key-read isolation on boundary extraction, rejection before CLI spawn, and positive controls. Offline query-plan equivalence across all `20` non-gold `development.questions.json` + `development.rewrites.json` records (`80` plans across `2` modes x `2` angles) matched pre-fix plans byte-for-byte (`plansSha256: ab541f90d3652b449976f63fe54d1fa614d79c9fc96c0a0ab68c90df5a7d984d`) without executing retrieval.
+
 ## Verification summary and supported limits
 
-- `python3 -m unittest discover -s evaluation/clec-v1/phase2 -p "test_*.py" -v` passed `4` tests.
-- `python3 -m unittest discover -s evaluation/clec-v1/phase3 -p "test_*.py" -v` passed `16` tests (`15` migrated existing controls plus `1` new `score-outcomes` execution-grammar suite).
-- Synthetic CLI end-to-end `validate-dataset`, `run`, and `score-outcomes` passed alongside the `b481630` probe suite (`genuine` complete, all `5` invalid probe variants rejected as `inconclusive` with `null` coverage/chain/conditionLoss).
+- `python3 -m unittest discover -s evaluation/clec-v1/phase2 -p "test_*.py" -v` passed `5` tests.
+- `python3 -m unittest discover -s evaluation/clec-v1/phase3 -p "test_*.py" -v` passed `20` tests (`16` existing controls plus `4` runtime-question boundary and positive-control suites).
+- Synthetic CLI end-to-end `validate-dataset`, `run`, and `score-outcomes` passed alongside the `b481630` probe suite (`genuine` complete, all `5` invalid probe variants rejected as `inconclusive` with `null` coverage/chain/conditionLoss) and `.audit/phase3-narrow-runtime-dev-equivalence.json` (`80/80` non-gold development query plans identical without retrieval).
 - Known limits: undecodable base64 capture inside step records truncates at `65536` raw bytes while recording exact `stdoutRawByteLen` and `stdoutRawSha256`; no static type checker (`mypy` or `pyright`) is installed in this environment; real dataset scoring and retrieval quality remain unmeasured.
