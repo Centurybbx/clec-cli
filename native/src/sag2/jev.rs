@@ -19,10 +19,13 @@ use crate::http_transport::{
     is_loopback_literal_host,
 };
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DEFAULT_JEV_BASE_URL: &str = "https://openrouter.ai/api/alpha/decisions";
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DEFAULT_JEV_MODEL: &str = "~typesafe/jev-latest";
 
 pub(crate) const MAX_MODEL_NAME_BYTES: usize = 256;
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MAX_KEY_FILE_BYTES: usize = 8192;
 pub(crate) const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -59,10 +62,12 @@ pub(crate) struct ValidatedJevConfig {
 }
 
 impl ValidatedJevConfig {
+    #[allow(dead_code)]
     pub(crate) fn from_env_and_args(key_file: Option<&Path>) -> Result<Self, ClecError> {
         Self::from_lookup(key_file, |name| env::var(name).ok())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_lookup<F>(key_file: Option<&Path>, env_lookup: F) -> Result<Self, ClecError>
     where
         F: Fn(&str) -> Option<String>,
@@ -137,6 +142,7 @@ impl ValidatedJevConfig {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_and_normalize_endpoint(raw: &str) -> Result<Url, ClecError> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
@@ -223,6 +229,7 @@ fn validate_model_name(raw: &str, err_code: ErrorCode) -> Result<String, ClecErr
     Ok(trimmed.to_owned())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_bounded_key_file(path: &Path) -> Result<String, ClecError> {
     let mut file = File::open(path).map_err(|_| {
         ClecError::new(
@@ -260,6 +267,7 @@ fn read_bounded_key_file(path: &Path) -> Result<String, ClecError> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_secret_and_headers(raw: &str) -> Result<RedactedSecret, ClecError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -422,7 +430,6 @@ pub(crate) struct JevClient {
 }
 
 impl JevClient {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(config: ValidatedJevConfig, run_deadline: Instant) -> Self {
         Self {
             config,

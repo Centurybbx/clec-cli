@@ -296,7 +296,6 @@ pub(crate) struct CorpusStore {
     pub release: ReleaseHash,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ReadSnapshotGuard<'a> {
     conn: &'a Connection,
 }
@@ -364,7 +363,6 @@ impl CorpusStore {
         )
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_read_snapshot(&self) -> Result<ReadSnapshotGuard<'_>, ClecError> {
         self.conn.execute_batch("BEGIN DEFERRED;").map_err(|e| {
             ClecError::new(
@@ -380,19 +378,16 @@ impl CorpusStore {
         Ok(guard)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_deadline_progress_handler(&mut self, deadline: Instant) {
         let _ = self
             .conn
             .progress_handler(64, Some(move || Instant::now() >= deadline));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn clear_deadline_progress_handler(&mut self) {
         let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn passage_count(&self) -> Result<usize, ClecError> {
         let n: i64 = self
             .conn
@@ -402,7 +397,6 @@ impl CorpusStore {
             .map_err(|_| ClecError::new(ErrorCode::InvalidPackage, "Negative passage count"))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn body_term_document_frequency(&self, term: &str) -> Result<usize, ClecError> {
         let fts_expr = format!("body_tokens : \"{}\"", encode_fts_token(term));
         let n: i64 = self
@@ -430,7 +424,6 @@ impl CorpusStore {
         self.query_bm25_candidates_inner(fts_query, filter, &[], limit)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn query_bm25_candidates_excluding(
         &self,
         fts_query: &str,

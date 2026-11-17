@@ -25,7 +25,6 @@ use reqwest::{redirect, retry};
 
 pub(crate) const STREAM_CHUNK_BYTES: usize = 65_536;
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum HttpRequest {
     Get {
         url: Url,

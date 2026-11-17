@@ -128,7 +128,6 @@ fn segment_normalized(normalized: &str, for_index: bool) -> Vec<String> {
     tokens
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tokenize_normalized(text: &str) -> Vec<String> {
     let normalized = normalize_for_search(text);
     segment_normalized(&normalized, false)
