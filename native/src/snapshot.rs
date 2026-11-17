@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, params};
 use schemars::JsonSchema;
@@ -96,6 +97,29 @@ pub(crate) struct StatusData {
     pub counts: Option<CorpusCounts>,
     pub diagnostics: Option<DiagnosticsSummary>,
     pub storage_bytes: u64,
+}
+
+pub const VALIDATOR_KIND: &str = "clec_core_validate_staging_db";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotValidationReceipt {
+    pub schema_version: u32,
+    pub validator_kind: String,
+    pub package_version: String,
+    pub corpus_format: String,
+    pub segmentation_revision: String,
+    pub tokenization_revision: String,
+    pub normalization_revision: String,
+    pub dictionary_revision: String,
+    pub equivalence_revision: String,
+    pub db_path: String,
+    pub db_bytes: u64,
+    pub db_sha256: ReleaseHash,
+    pub valid: bool,
+    pub counts: Option<CorpusCounts>,
+    pub error_code: Option<ErrorCode>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,7 +860,122 @@ fn build_in_staging(
     Ok(manifest)
 }
 
-fn file_size_and_sha256(path: &Path) -> Result<(u64, String), ClecError> {
+static VALIDATE_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
+
+struct StagingTempDir(PathBuf);
+
+impl StagingTempDir {
+    fn create() -> Result<Self, ClecError> {
+        let base = std::env::temp_dir();
+        fs::create_dir_all(&base).map_err(map_io)?;
+        for _ in 0..32 {
+            let seq = VALIDATE_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!(".clec-validate-{}-{seq}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(map_io(e)),
+            }
+        }
+        Err(ClecError::new(
+            ErrorCode::IoError,
+            "Failed to allocate unique temporary staging directory.",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn validate_sqlite_snapshot(db_path: &Path) -> Result<SnapshotValidationReceipt, ClecError> {
+    let canonical_path = fs::canonicalize(db_path).map_err(|e| {
+        ClecError::new(
+            ErrorCode::IoError,
+            format!("Cannot resolve SQLite path {}: {e}", db_path.display()),
+        )
+    })?;
+    if !canonical_path.is_file() {
+        return Err(ClecError::new(
+            ErrorCode::IoError,
+            format!("SQLite path {} is not a file.", canonical_path.display()),
+        ));
+    }
+
+    let staging_dir = StagingTempDir::create()?;
+    let staging_sqlite = staging_dir.path().join("staging.sqlite");
+    let (db_bytes, db_sha256_str) = copy_and_hash_readonly(&canonical_path, &staging_sqlite)?;
+    let db_sha256 = ReleaseHash::parse(&db_sha256_str)?;
+
+    let validation_res = (|| -> Result<CorpusCounts, ClecError> {
+        if db_bytes == 0 || db_bytes > MAX_ARTIFACT_BYTES {
+            return Err(ClecError::new(
+                ErrorCode::InvalidPackage,
+                "SQLite snapshot byte size is zero or exceeds 2 GiB cap.",
+            ));
+        }
+        let store = CorpusStore::open_readonly(&staging_sqlite, db_sha256.clone())?;
+        let counts = store.counts()?;
+        drop(store);
+        CorpusStore::validate_staging_db(&staging_sqlite, db_sha256.clone(), &counts)?;
+        Ok(counts)
+    })();
+
+    let (valid, counts, error_code, error_message) = match validation_res {
+        Ok(c) => (true, Some(c), None, None),
+        Err(e) => (false, None, Some(e.code), Some(e.message)),
+    };
+
+    Ok(SnapshotValidationReceipt {
+        schema_version: SCHEMA_VERSION,
+        validator_kind: VALIDATOR_KIND.to_owned(),
+        package_version: env!("CARGO_PKG_VERSION").to_owned(),
+        corpus_format: CORPUS_FORMAT.to_owned(),
+        segmentation_revision: SEGMENTATION_REVISION.to_owned(),
+        tokenization_revision: TOKENIZATION_REVISION.to_owned(),
+        normalization_revision: NORMALIZATION_REVISION.to_owned(),
+        dictionary_revision: DICTIONARY_REVISION.to_owned(),
+        equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
+        db_path: canonical_path.display().to_string(),
+        db_bytes,
+        db_sha256,
+        valid,
+        counts,
+        error_code,
+        error_message,
+    })
+}
+
+fn copy_and_hash_readonly(src_path: &Path, dst_path: &Path) -> Result<(u64, String), ClecError> {
+    let mut src = File::open(src_path).map_err(map_io)?;
+    let mut dst = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(dst_path)
+        .map_err(map_io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65_536];
+    let mut total = 0u64;
+    loop {
+        let n = src.read(&mut buf).map_err(map_io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        dst.write_all(&buf[..n]).map_err(map_io)?;
+        total += n as u64;
+    }
+    dst.flush().map_err(map_io)?;
+    Ok((total, crate::domain::hex_encode(&hasher.finalize())))
+}
+
+pub fn file_size_and_sha256(path: &Path) -> Result<(u64, String), ClecError> {
     let mut file = File::open(path).map_err(map_io)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65_536];
@@ -1819,5 +1958,115 @@ mod tests {
             assert_eq!(sqlite_payloads[i], sqlite_payloads[0]);
             assert_eq!(zst_payloads[i], zst_payloads[0]);
         }
+    }
+
+    #[test]
+    fn validate_sqlite_snapshot_accepts_vacuumed_and_rejects_fts_shadow_corruptions_without_mutating_sources()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "0050與QQQ投資討論\n每年4%提領原則\n").unwrap();
+        fs::write(ws.join("b.txt"), "退休生活費規劃與資產配置\n").unwrap();
+
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            r#"{
+              "schemaVersion": 1,
+              "works": [
+                { "key": "w1", "title": "Work 1" },
+                { "key": "w2", "title": "Work 2" }
+              ],
+              "sources": [
+                {
+                  "work": "w1",
+                  "path": "a.txt",
+                  "title": "A",
+                  "role": "document",
+                  "attribution": "authored_fixture",
+                  "quality": "fixture",
+                  "status": "ready"
+                },
+                {
+                  "work": "w2",
+                  "path": "b.txt",
+                  "title": "B",
+                  "role": "document",
+                  "attribution": "authored_fixture",
+                  "quality": "fixture",
+                  "status": "ready"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let rel = tmp.path().join("rel");
+        let manifest = publish_release(&ws, &intake, &rel).unwrap();
+        let data_dir = tmp.path().join("data");
+        sync_local(
+            &data_dir,
+            Some(&rel.join("manifest.json").display().to_string()),
+        )
+        .unwrap();
+        let clean_db = data_dir.join(format!("{}.sqlite", manifest.sha256));
+        let clean_bytes = fs::read(&clean_db).unwrap();
+
+        let vac_db = tmp.path().join("vacuumed.sqlite");
+        fs::copy(&clean_db, &vac_db).unwrap();
+        {
+            let conn = Connection::open(&vac_db).unwrap();
+            conn.execute_batch("PRAGMA page_size=8192; VACUUM;")
+                .unwrap();
+        }
+        let vac_bytes = fs::read(&vac_db).unwrap();
+        assert_ne!(clean_bytes, vac_bytes);
+
+        let bad_data_db = tmp.path().join("bad_search_data.sqlite");
+        fs::copy(&clean_db, &bad_data_db).unwrap();
+        {
+            let conn = Connection::open(&bad_data_db).unwrap();
+            conn.execute("UPDATE search_data SET block=X'000000' WHERE id=1", [])
+                .unwrap();
+        }
+        let bad_data_bytes = fs::read(&bad_data_db).unwrap();
+
+        let bad_docsize_db = tmp.path().join("bad_search_docsize.sqlite");
+        fs::copy(&clean_db, &bad_docsize_db).unwrap();
+        {
+            let conn = Connection::open(&bad_docsize_db).unwrap();
+            conn.execute("UPDATE search_docsize SET sz=X'0000' WHERE id=1", [])
+                .unwrap();
+        }
+        let bad_docsize_bytes = fs::read(&bad_docsize_db).unwrap();
+
+        let clean_receipt = validate_sqlite_snapshot(&clean_db).unwrap();
+        assert!(clean_receipt.valid);
+        assert_eq!(clean_receipt.db_sha256, manifest.sha256);
+        assert_eq!(clean_receipt.counts, Some(manifest.counts.clone()));
+        assert_eq!(fs::read(&clean_db).unwrap(), clean_bytes);
+
+        let vac_receipt = validate_sqlite_snapshot(&vac_db).unwrap();
+        assert!(vac_receipt.valid);
+        assert_ne!(vac_receipt.db_sha256, clean_receipt.db_sha256);
+        assert_eq!(vac_receipt.counts, Some(manifest.counts));
+        assert_eq!(fs::read(&vac_db).unwrap(), vac_bytes);
+
+        let bad_data_receipt = validate_sqlite_snapshot(&bad_data_db).unwrap();
+        assert!(!bad_data_receipt.valid);
+        assert_eq!(
+            bad_data_receipt.error_code,
+            Some(ErrorCode::IntegrityMismatch)
+        );
+        assert_eq!(fs::read(&bad_data_db).unwrap(), bad_data_bytes);
+
+        let bad_docsize_receipt = validate_sqlite_snapshot(&bad_docsize_db).unwrap();
+        assert!(!bad_docsize_receipt.valid);
+        assert_eq!(
+            bad_docsize_receipt.error_code,
+            Some(ErrorCode::IntegrityMismatch)
+        );
+        assert_eq!(fs::read(&bad_docsize_db).unwrap(), bad_docsize_bytes);
     }
 }

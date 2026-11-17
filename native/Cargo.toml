@@ -17,6 +17,10 @@ path = "src/bin/clec.rs"
 name = "clec-publish"
 path = "src/bin/clec-publish.rs"
 
+[[bin]]
+name = "clec-validate"
+path = "src/bin/clec-validate.rs"
+
 [dependencies]
 clap = { version = "4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 ferrous-opencc = "0.4.0"
