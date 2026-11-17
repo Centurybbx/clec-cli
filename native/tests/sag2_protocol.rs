@@ -344,13 +344,13 @@ fn handle_connection(
             );
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.flush();
-            for chunk in chunks {
-                if !delay_between.is_zero() {
+            for (idx, chunk) in chunks.iter().enumerate() {
+                if idx > 0 && !delay_between.is_zero() {
                     thread::sleep(delay_between);
                 }
                 let prefix = format!("{:x}\r\n", chunk.len());
                 if stream.write_all(prefix.as_bytes()).is_err()
-                    || stream.write_all(&chunk).is_err()
+                    || stream.write_all(chunk).is_err()
                     || stream.write_all(b"\r\n").is_err()
                 {
                     return;
@@ -1680,6 +1680,36 @@ fn group4_usage_and_cost_overflow_fail_closed() {
             > 0
     );
 
+    let srv_out_overflow = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut body = score_all_answers(req, if seq == 1 { 0.9 } else { 0.8 }, "m");
+            body["usage"] = serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": u64::MAX,
+                "cost": 0.1
+            });
+            MockReply::Json {
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let out_err = assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_out_overflow.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("JEV_INVALID_RESPONSE"),
+    );
+    assert_eq!(out_err["error"]["sag2Stage"]["httpAttempts"], 2);
+    assert_eq!(out_err["error"]["sag2Stage"]["successfulBatches"], 1);
+
     let srv_cost_overflow = MockJevServer::start(
         SENTINEL_KEY,
         Arc::new(|seq, _, req| {
@@ -1750,6 +1780,8 @@ fn group4_usage_and_cost_overflow_fail_closed() {
             if seq == 1 {
                 body["usage"] =
                     serde_json::json!({"input_tokens": 10, "output_tokens": 2, "cost": 0.1});
+            } else {
+                body.as_object_mut().unwrap().remove("usage");
             }
             MockReply::Json {
                 status: 200,
@@ -1769,6 +1801,37 @@ fn group4_usage_and_cost_overflow_fail_closed() {
     assert!(missing_ok["data"]["usage"]["inputTokens"].is_null());
     assert_eq!(missing_ok["data"]["usage"]["costStatus"], "unknown");
     assert!(missing_ok["data"]["usage"]["costUsd"].is_null());
+
+    let srv_null_cost = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut body = score_all_answers(req, if seq == 1 { 0.9 } else { 0.8 }, "m");
+            if seq == 1 {
+                body["usage"] =
+                    serde_json::json!({"input_tokens": 10, "output_tokens": 2, "cost": 0.1});
+            } else {
+                body["usage"] =
+                    serde_json::json!({"input_tokens": 20, "output_tokens": 3, "cost": null});
+            }
+            MockReply::Json {
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let null_cost_ok = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &srv_null_cost.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(null_cost_ok["data"]["usage"]["status"], "reported");
+    assert_eq!(null_cost_ok["data"]["usage"]["inputTokens"], 30);
+    assert_eq!(null_cost_ok["data"]["usage"]["outputTokens"], 5);
+    assert_eq!(null_cost_ok["data"]["usage"]["costStatus"], "unknown");
+    assert!(null_cost_ok["data"]["usage"]["costUsd"].is_null());
 }
 
 #[test]
@@ -2801,6 +2864,27 @@ srv.serve_forever()
 
     let _ = tls_child.kill();
     let _ = tls_child.wait();
+
+    let timeout_prefix_srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, _| MockReply::ChunkedRaw {
+            status: 200,
+            chunks: vec![vec![b'p'; 65_536], vec![b'q'; 1024]],
+            delay_between: Duration::from_millis(600),
+        }),
+    );
+    let timeout_prefix_out = Command::new(&fixture_bin)
+        .args(["--data-dir", &dir_s, "search", "超時與憑證測試", "--sag2"])
+        .env("JEV_BASE_URL", timeout_prefix_srv.url("/decisions"))
+        .env("JEV_API_KEY", SENTINEL_KEY)
+        .env("CLEC_TEST_JEV_TIMEOUT_MS", "200")
+        .output()
+        .expect("run clec_test_fixture timeout prefix");
+    let timeout_prefix_err = assert_err_json(&timeout_prefix_out, 4, Some("TRANSFER_TIMEOUT"));
+    assert_eq!(
+        timeout_prefix_err["error"]["sag2Stage"]["responseBytes"],
+        65_536
+    );
 }
 
 #[test]

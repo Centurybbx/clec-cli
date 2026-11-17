@@ -104,7 +104,7 @@ impl ValidatedJevConfig {
             })?
         };
 
-        let secret = validate_secret_and_headers(&raw_secret)?;
+        let secret = validate_secret_and_headers(&endpoint, &raw_secret)?;
         Ok(Self {
             endpoint,
             model,
@@ -260,7 +260,7 @@ fn read_bounded_key_file(path: &Path) -> Result<String, ClecError> {
     })
 }
 
-fn validate_secret_and_headers(raw: &str) -> Result<RedactedSecret, ClecError> {
+fn validate_secret_and_headers(endpoint: &Url, raw: &str) -> Result<RedactedSecret, ClecError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(ClecError::new(
@@ -275,22 +275,57 @@ fn validate_secret_and_headers(raw: &str) -> Result<RedactedSecret, ClecError> {
             "Selected Jev API credential is not a valid HTTP header value.",
         ));
     }
-    let ua_len = concat!("clec/", env!("CARGO_PKG_VERSION")).len();
-    let total_header_bytes = "authorization".len()
-        + auth_value.len()
+    let min_header_bytes = canonical_http1_header_block_bytes(endpoint, trimmed, 0)?;
+    if min_header_bytes > MAX_REQUEST_HEADER_BYTES {
+        return Err(ClecError::new(
+            ErrorCode::InvalidJevConfig,
+            "Request headers exceed 8 KiB canonical HTTP/1.1 header block limit.",
+        ));
+    }
+    Ok(RedactedSecret(trimmed.to_owned()))
+}
+
+fn canonical_host_header_value(endpoint: &Url) -> Result<String, ClecError> {
+    let host = endpoint
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            ClecError::new(
+                ErrorCode::InvalidJevConfig,
+                "JEV_BASE_URL must include a non-empty host.",
+            )
+        })?;
+    Ok(match endpoint.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+pub(crate) fn canonical_http1_header_block_bytes(
+    endpoint: &Url,
+    secret: &str,
+    body_len: usize,
+) -> Result<usize, ClecError> {
+    let host_val = canonical_host_header_value(endpoint)?;
+    let auth_val = format!("Bearer {secret}");
+    let cl_digits = body_len.to_string().len();
+    let ua_val = concat!("clec/", env!("CARGO_PKG_VERSION"));
+    let field_bytes = "authorization".len()
+        + auth_val.len()
         + "content-type".len()
         + "application/json".len()
         + "accept-encoding".len()
         + "identity".len()
+        + "content-length".len()
+        + cl_digits
+        + "accept".len()
+        + "*/*".len()
         + "user-agent".len()
-        + ua_len;
-    if total_header_bytes > MAX_REQUEST_HEADER_BYTES {
-        return Err(ClecError::new(
-            ErrorCode::InvalidJevConfig,
-            "Request headers exceed 8 KiB limit.",
-        ));
-    }
-    Ok(RedactedSecret(trimmed.to_owned()))
+        + ua_val.len()
+        + "host".len()
+        + host_val.len();
+    let framing_bytes = 7 * 4 + 2;
+    Ok(field_bytes + framing_bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +593,17 @@ impl JevClient {
     }
 
     fn reserve_attempt(&mut self, batch: &PreparedBatch) -> Result<(), ClecError> {
+        let header_bytes = canonical_http1_header_block_bytes(
+            &self.config.endpoint,
+            &self.config.secret.0,
+            batch.body.len(),
+        )?;
+        if header_bytes > MAX_REQUEST_HEADER_BYTES {
+            return Err(ClecError::new(
+                ErrorCode::Sag2BudgetExhausted,
+                "Prepared request headers exceed 8 KiB canonical HTTP/1.1 header block limit.",
+            ));
+        }
         let next_attempts = self.http_attempts + 1;
         if next_attempts > MAX_HTTP_ATTEMPTS {
             return Err(ClecError::new(
@@ -671,14 +717,14 @@ impl JevClient {
         loop {
             match transfer.recv_event().map_err(map_post_transport_failure)? {
                 TransferEvent::Chunk(chunk) => {
+                    self.response_bytes = self.response_bytes.saturating_add(chunk.len());
                     if raw_body.len() + chunk.len() > MAX_RESPONSE_BYTES {
                         return Err(ClecError::new(
                             ErrorCode::JevInvalidResponse,
                             "Jev response body exceeds 128 KiB limit.",
                         ));
                     }
-                    let projected_total = self.response_bytes + raw_body.len() + chunk.len();
-                    if projected_total > MAX_TOTAL_RESPONSE_BYTES {
+                    if self.response_bytes > MAX_TOTAL_RESPONSE_BYTES {
                         return Err(ClecError::new(
                             ErrorCode::Sag2BudgetExhausted,
                             "SAG2 total response byte budget of 4 MiB exhausted.",
@@ -698,41 +744,59 @@ impl JevClient {
         }
         drop(transfer);
 
-        self.response_bytes = self.response_bytes.saturating_add(raw_body.len());
-
         let expected_keys: BTreeSet<String> = batch.key_to_passage.keys().cloned().collect();
         let validated =
             parse_and_validate_response(&raw_body, &expected_keys, self.actual_model.as_deref())?;
+
+        let (next_usage_seen, next_input, next_output, next_cost_seen, next_cost) =
+            match (validated.input_tokens, validated.output_tokens) {
+                (Some(inp), Some(out)) => {
+                    let sum_inp = self.total_input_tokens.checked_add(inp).ok_or_else(|| {
+                        ClecError::new(
+                            ErrorCode::JevInvalidResponse,
+                            "Jev usage input_tokens total overflowed u64.",
+                        )
+                    })?;
+                    let sum_out = self.total_output_tokens.checked_add(out).ok_or_else(|| {
+                        ClecError::new(
+                            ErrorCode::JevInvalidResponse,
+                            "Jev usage output_tokens total overflowed u64.",
+                        )
+                    })?;
+                    let next_u = Some(self.usage_seen_all.unwrap_or(true));
+                    let (next_cs, sum_cost) = match validated.cost_usd {
+                        Some(cost) => {
+                            let total = self.total_cost_usd + cost;
+                            if !total.is_finite() {
+                                return Err(ClecError::new(
+                                    ErrorCode::JevInvalidResponse,
+                                    "Jev usage cost total overflowed finite f64.",
+                                ));
+                            }
+                            (Some(self.cost_seen_all.unwrap_or(true)), total)
+                        }
+                        None => (Some(false), self.total_cost_usd),
+                    };
+                    (next_u, sum_inp, sum_out, next_cs, sum_cost)
+                }
+                _ => (
+                    Some(false),
+                    self.total_input_tokens,
+                    self.total_output_tokens,
+                    Some(false),
+                    self.total_cost_usd,
+                ),
+            };
 
         if self.actual_model.is_none() {
             self.actual_model = Some(validated.model);
         }
         self.successful_batches += 1;
-
-        match (validated.input_tokens, validated.output_tokens) {
-            (Some(inp), Some(out)) => {
-                if self.usage_seen_all.is_none() {
-                    self.usage_seen_all = Some(true);
-                }
-                self.total_input_tokens = self.total_input_tokens.saturating_add(inp);
-                self.total_output_tokens = self.total_output_tokens.saturating_add(out);
-                match validated.cost_usd {
-                    Some(cost) => {
-                        if self.cost_seen_all.is_none() {
-                            self.cost_seen_all = Some(true);
-                        }
-                        self.total_cost_usd += cost;
-                    }
-                    None => {
-                        self.cost_seen_all = Some(false);
-                    }
-                }
-            }
-            _ => {
-                self.usage_seen_all = Some(false);
-                self.cost_seen_all = Some(false);
-            }
-        }
+        self.usage_seen_all = next_usage_seen;
+        self.total_input_tokens = next_input;
+        self.total_output_tokens = next_output;
+        self.cost_seen_all = next_cost_seen;
+        self.total_cost_usd = next_cost;
 
         Ok(validated.scores)
     }
@@ -1635,5 +1699,75 @@ mod tests {
         let drift_err = client.score_round("q", &[], &cands).unwrap_err();
         assert_eq!(drift_err.code, ErrorCode::JevInvalidResponse);
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn canonical_header_accounting_and_private_cap_guards_enforce_limits() {
+        let u_default = Url::parse("https://openrouter.ai/api/alpha/decisions").unwrap();
+        let u_port = Url::parse("http://127.0.0.1:52494/systemone").unwrap();
+        let u_v6 = Url::parse("http://[::1]:8080/systemone").unwrap();
+
+        let b_port =
+            canonical_http1_header_block_bytes(&u_port, "synthetic-review-sentinel", 5462).unwrap();
+        assert_eq!(b_port, 192);
+        let b_v6 = canonical_http1_header_block_bytes(&u_v6, "k", 10).unwrap();
+        assert!(b_v6 > 0);
+        let b_def = canonical_http1_header_block_bytes(&u_default, "k", 100).unwrap();
+        assert!(b_def > 0);
+
+        let cfg = ValidatedJevConfig::from_lookup(None, |k| match k {
+            "JEV_BASE_URL" => Some("http://127.0.0.1:52494/decisions".to_owned()),
+            "JEV_API_KEY" => Some("k".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+
+        let pid = PassageId::parse("p_0000000000000001").unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("candidate_p_0000000000000001".to_owned(), pid);
+
+        let mut c_req = JevClient::new(cfg.clone(), Instant::now() + Duration::from_secs(5));
+        let big_batch = PreparedBatch {
+            key_to_passage: map.clone(),
+            body: vec![b'a'; MAX_TOTAL_REQUEST_BYTES],
+            estimated_tokens: 1,
+        };
+        c_req.reserve_attempt(&big_batch).unwrap();
+        let err_req = c_req
+            .reserve_attempt(&PreparedBatch {
+                key_to_passage: map.clone(),
+                body: vec![b'a'; 1],
+                estimated_tokens: 1,
+            })
+            .unwrap_err();
+        assert_eq!(err_req.code, ErrorCode::Sag2BudgetExhausted);
+
+        let mut c_tok = JevClient::new(cfg.clone(), Instant::now() + Duration::from_secs(5));
+        c_tok
+            .reserve_attempt(&PreparedBatch {
+                key_to_passage: map.clone(),
+                body: vec![b'a'; 10],
+                estimated_tokens: MAX_RUN_ESTIMATED_TOKENS,
+            })
+            .unwrap();
+        let err_tok = c_tok
+            .reserve_attempt(&PreparedBatch {
+                key_to_passage: map.clone(),
+                body: vec![b'a'; 10],
+                estimated_tokens: 1,
+            })
+            .unwrap_err();
+        assert_eq!(err_tok.code, ErrorCode::Sag2BudgetExhausted);
+
+        let mut c_resp = JevClient::new(cfg, Instant::now() + Duration::from_secs(5));
+        c_resp.response_bytes = MAX_TOTAL_RESPONSE_BYTES;
+        let err_resp = c_resp
+            .reserve_attempt(&PreparedBatch {
+                key_to_passage: map,
+                body: vec![b'a'; 10],
+                estimated_tokens: 1,
+            })
+            .unwrap_err();
+        assert_eq!(err_resp.code, ErrorCode::Sag2BudgetExhausted);
     }
 }
