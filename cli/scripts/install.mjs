@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -177,8 +178,16 @@ export function installFromRoot(pkgRoot, options = {}) {
   };
 }
 
-const isEntrypoint =
-  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isEntrypoint = (() => {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  }
+})();
 
 if (isEntrypoint) {
   const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');

@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -314,8 +315,16 @@ export function stageRelease(opts, cliRoot) {
   };
 }
 
-const isEntrypoint =
-  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isEntrypoint = (() => {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  }
+})();
 
 if (isEntrypoint) {
   const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
