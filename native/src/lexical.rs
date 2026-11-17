@@ -128,6 +128,12 @@ fn segment_normalized(normalized: &str, for_index: bool) -> Vec<String> {
     tokens
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tokenize_normalized(text: &str) -> Vec<String> {
+    let normalized = normalize_for_search(text);
+    segment_normalized(&normalized, false)
+}
+
 pub(crate) fn index_tokens_string(text: &str) -> String {
     let normalized = normalize_for_search(text);
     segment_normalized(&normalized, true)
@@ -206,5 +212,11 @@ mod tests {
         assert!(idx.contains(&encode_fts_token("0050")));
         assert!(idx.contains(&encode_fts_token("qqq")));
         assert!(idx.contains(&encode_fts_token("4%")));
+
+        let long_passage = "0050 與 QQQ 配置 ".repeat(60);
+        assert!(long_passage.len() > MAX_QUERY_BYTES);
+        let toks = tokenize_normalized(&long_passage);
+        assert!(!toks.is_empty());
+        assert_eq!(toks[0], "0050");
     }
 }

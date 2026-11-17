@@ -3,8 +3,9 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, params, types::ToSql};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,7 @@ use crate::ingest::{
     SubtitleCue, compute_equivalence_projection, extract_source, is_subtitle_path,
     reconstruct_passage_text, segment_source,
 };
-use crate::lexical::{index_tokens_string, normalize_for_search};
+use crate::lexical::{encode_fts_token, index_tokens_string, normalize_for_search};
 
 pub(crate) const SCHEMA_SQL: &str = "
 PRAGMA journal_mode=DELETE;
@@ -276,6 +277,7 @@ pub(crate) struct VerifiedPassageCore {
     pub continued_to: Option<PassageId>,
 }
 
+#[derive(Debug)]
 pub(crate) struct Bm25Candidate {
     pub passage_id: PassageId,
     pub work_id: WorkId,
@@ -292,6 +294,17 @@ pub(crate) struct CandidateFilter<'a> {
 pub(crate) struct CorpusStore {
     conn: Connection,
     pub release: ReleaseHash,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ReadSnapshotGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for ReadSnapshotGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("ROLLBACK;");
+    }
 }
 
 impl CorpusStore {
@@ -351,68 +364,150 @@ impl CorpusStore {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn begin_read_snapshot(&self) -> Result<ReadSnapshotGuard<'_>, ClecError> {
+        self.conn.execute_batch("BEGIN DEFERRED;").map_err(|e| {
+            ClecError::new(
+                ErrorCode::InvalidPackage,
+                format!("Failed to start SQLite read snapshot: {e}"),
+            )
+        })?;
+        let guard = ReadSnapshotGuard { conn: &self.conn };
+        let _: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM metadata", [], |r| r.get(0))
+            .map_err(|e| map_sql_query_err(e, "Failed to pin SQLite read snapshot"))?;
+        Ok(guard)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_deadline_progress_handler(&mut self, deadline: Instant) {
+        let _ = self
+            .conn
+            .progress_handler(64, Some(move || Instant::now() >= deadline));
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn clear_deadline_progress_handler(&mut self) {
+        let _ = self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn passage_count(&self) -> Result<usize, ClecError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM passages", [], |r| r.get(0))
+            .map_err(|e| map_sql_query_err(e, "Passage count failed"))?;
+        usize::try_from(n)
+            .map_err(|_| ClecError::new(ErrorCode::InvalidPackage, "Negative passage count"))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn body_term_document_frequency(&self, term: &str) -> Result<usize, ClecError> {
+        let fts_expr = format!("body_tokens : \"{}\"", encode_fts_token(term));
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM search WHERE search MATCH ?1",
+                [fts_expr],
+                |r| r.get(0),
+            )
+            .map_err(|e| map_sql_query_err(e, "Term document frequency query failed"))?;
+        usize::try_from(n).map_err(|_| {
+            ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Negative term document frequency",
+            )
+        })
+    }
+
     pub(crate) fn query_bm25_candidates(
         &self,
         fts_query: &str,
         filter: &CandidateFilter<'_>,
         limit: usize,
     ) -> Result<Vec<Bm25Candidate>, ClecError> {
+        self.query_bm25_candidates_inner(fts_query, filter, &[], limit)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn query_bm25_candidates_excluding(
+        &self,
+        fts_query: &str,
+        filter: &CandidateFilter<'_>,
+        excluded_ids: &[PassageId],
+        limit: usize,
+    ) -> Result<Vec<Bm25Candidate>, ClecError> {
+        self.query_bm25_candidates_inner(fts_query, filter, excluded_ids, limit)
+    }
+
+    fn query_bm25_candidates_inner(
+        &self,
+        fts_query: &str,
+        filter: &CandidateFilter<'_>,
+        excluded_ids: &[PassageId],
+        limit: usize,
+    ) -> Result<Vec<Bm25Candidate>, ClecError> {
+        let mut sql = String::from(
+            "SELECT p.id, p.work_id, bm25(search, 4.0, 1.0) AS score
+             FROM search
+             JOIN passages p ON p.rowid = search.rowid
+             JOIN sources s ON s.id = p.source_id
+             WHERE search MATCH ?1
+               AND (?2 IS NULL OR p.work_id = ?2)
+               AND (?3 IS NULL OR p.source_id = ?3)
+               AND (?4 IS NULL OR s.role = ?4)
+               AND (?5 IS NULL OR s.date >= ?5)
+               AND (?6 IS NULL OR s.date <= ?6)",
+        );
+        if !excluded_ids.is_empty() {
+            sql.push_str(" AND p.id NOT IN (");
+            for idx in 0..excluded_ids.len() {
+                if idx > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                sql.push_str(&(8 + idx).to_string());
+            }
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY score ASC, p.id ASC LIMIT ?7");
+
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT p.id, p.work_id, bm25(search, 4.0, 1.0) AS score
-                 FROM search
-                 JOIN passages p ON p.rowid = search.rowid
-                 JOIN sources s ON s.id = p.source_id
-                 WHERE search MATCH ?1
-                   AND (?2 IS NULL OR p.work_id = ?2)
-                   AND (?3 IS NULL OR p.source_id = ?3)
-                   AND (?4 IS NULL OR s.role = ?4)
-                   AND (?5 IS NULL OR s.date >= ?5)
-                   AND (?6 IS NULL OR s.date <= ?6)
-                 ORDER BY score ASC, p.id ASC
-                 LIMIT ?7",
-            )
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InternalError,
-                    format!("Search query failed: {e}"),
-                )
-            })?;
+            .prepare(&sql)
+            .map_err(|e| map_sql_query_err(e, "Search query failed"))?;
 
         let work_arg = filter.work_filter.map(WorkId::as_str);
         let source_arg = filter.source_filter.map(SourceId::as_str);
         let role_arg = filter.role_filter.map(SourceRole::as_str);
         let from_arg = filter.date_from.map(DateYmd::as_str);
         let to_arg = filter.date_to.map(DateYmd::as_str);
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let mut bound: Vec<&dyn ToSql> = Vec::with_capacity(7 + excluded_ids.len());
+        bound.push(&fts_query);
+        bound.push(&work_arg);
+        bound.push(&source_arg);
+        bound.push(&role_arg);
+        bound.push(&from_arg);
+        bound.push(&to_arg);
+        bound.push(&limit_i64);
+        for pid in excluded_ids {
+            bound.push(pid.as_str_ref());
+        }
 
         let mut rows = stmt
-            .query(params![
-                fts_query,
-                work_arg,
-                source_arg,
-                role_arg,
-                from_arg,
-                to_arg,
-                i64::try_from(limit).unwrap_or(i64::MAX)
-            ])
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InternalError,
-                    format!("Search execution failed: {e}"),
-                )
-            })?;
+            .query(rusqlite::params_from_iter(bound))
+            .map_err(|e| map_sql_query_err(e, "Search execution failed"))?;
 
         let mut candidates = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| {
-            ClecError::new(ErrorCode::InternalError, format!("Search row error: {e}"))
-        })? {
-            let pid_str: String = row.get(0).map_err(|e| {
-                ClecError::new(ErrorCode::InvalidPackage, format!("Row error: {e}"))
-            })?;
-            let wid_str: String = row.get(1).map_err(|e| {
-                ClecError::new(ErrorCode::InvalidPackage, format!("Row error: {e}"))
-            })?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| map_sql_query_err(e, "Search row error"))?
+        {
+            let pid_str: String = row.get(0).map_err(map_sql_pkg)?;
+            let wid_str: String = row.get(1).map_err(map_sql_pkg)?;
             candidates.push(Bm25Candidate {
                 passage_id: PassageId::parse(&pid_str)?,
                 work_id: WorkId::parse(&wid_str)?,
@@ -2240,7 +2335,23 @@ fn collect_schema_rows(conn: &Connection) -> Result<BTreeMap<String, (String, St
 }
 
 fn map_sql_pkg(err: rusqlite::Error) -> ClecError {
+    if err.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
+        return ClecError::new(
+            ErrorCode::TransferTimeout,
+            "Local search deadline exceeded during SQLite query.",
+        );
+    }
     ClecError::new(ErrorCode::InvalidPackage, format!("SQLite error: {err}"))
+}
+
+fn map_sql_query_err(err: rusqlite::Error, context: &str) -> ClecError {
+    if err.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
+        return ClecError::new(
+            ErrorCode::TransferTimeout,
+            "Local search deadline exceeded during SQLite query.",
+        );
+    }
+    ClecError::new(ErrorCode::InternalError, format!("{context}: {err}"))
 }
 
 fn bad_cue() -> ClecError {
@@ -3275,5 +3386,70 @@ mod tests {
                 .code,
             ErrorCode::InvalidPackage
         );
+    }
+
+    #[test]
+    fn df_passage_count_excluded_search_and_read_snapshot_behave_per_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db_path, counts) = publish_and_extract_sqlite(
+            tmp.path(),
+            &[
+                ("a.txt", "UniqueTitleOnly", "alpha common body"),
+                ("b.txt", "SecondTitle", "beta common body"),
+                ("c.txt", "ThirdTitle", "gamma only body"),
+            ],
+        );
+        let release = ReleaseHash::parse(&"7".repeat(64)).unwrap();
+        CorpusStore::validate_staging_db(&db_path, release.clone(), &counts).unwrap();
+        let mut store = CorpusStore::open_readonly(&db_path, release).unwrap();
+
+        let snap = store.begin_read_snapshot().unwrap();
+        assert_eq!(store.passage_count().unwrap(), 3);
+        assert_eq!(store.body_term_document_frequency("common").unwrap(), 2);
+        assert_eq!(store.body_term_document_frequency("alpha").unwrap(), 1);
+        assert_eq!(
+            store
+                .body_term_document_frequency("uniquetitleonly")
+                .unwrap(),
+            0
+        );
+
+        let filter = CandidateFilter {
+            work_filter: None,
+            source_filter: None,
+            role_filter: None,
+            date_from: None,
+            date_to: None,
+        };
+        let fts_common = format!("\"{}\"", encode_fts_token("common"));
+        let all_common = store
+            .query_bm25_candidates(&fts_common, &filter, 10)
+            .unwrap();
+        assert_eq!(all_common.len(), 2);
+
+        let excluded = vec![all_common[0].passage_id.clone()];
+        let remaining = store
+            .query_bm25_candidates_excluding(&fts_common, &filter, &excluded, 10)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].passage_id, all_common[1].passage_id);
+
+        let writer = Connection::open(&db_path).unwrap();
+        assert!(
+            writer
+                .execute("DELETE FROM passages WHERE rowid = 1", [])
+                .is_err()
+        );
+        assert_eq!(store.passage_count().unwrap(), 3);
+        drop(snap);
+
+        let expired = Instant::now() - std::time::Duration::from_millis(1);
+        store.set_deadline_progress_handler(expired);
+        let err = store
+            .query_bm25_candidates(&fts_common, &filter, 10)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::TransferTimeout);
+        store.clear_deadline_progress_handler();
+        assert_eq!(store.passage_count().unwrap(), 3);
     }
 }

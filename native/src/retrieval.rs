@@ -85,12 +85,12 @@ pub(crate) struct SearchData {
     pub budget: BudgetReport,
 }
 
-struct RankedCandidate {
-    passage_id: PassageId,
-    work_id: WorkId,
-    rrf_score: f64,
-    best_rank: usize,
-    matched_queries: Vec<String>,
+pub(crate) struct RankedCandidate {
+    pub passage_id: PassageId,
+    pub work_id: WorkId,
+    pub rrf_score: f64,
+    pub best_rank: usize,
+    pub matched_queries: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,10 +157,10 @@ impl PreparedSearch {
     }
 }
 
-pub(crate) fn execute_search(
+pub(crate) fn collect_rrf_candidates(
     store: &CorpusStore,
     req: &PreparedSearch,
-) -> Result<SearchData, ClecError> {
+) -> Result<Vec<RankedCandidate>, ClecError> {
     if let Some(pin) = &req.release_pin
         && pin != &store.release
     {
@@ -222,29 +222,52 @@ pub(crate) fn execute_search(
             .then_with(|| a.best_rank.cmp(&b.best_rank))
             .then_with(|| a.passage_id.cmp(&b.passage_id))
     });
+    Ok(ranked)
+}
 
+pub(crate) fn materialize_passage_hit(
+    store: &CorpusStore,
+    passage_id: &PassageId,
+    rrf_score: f64,
+    matched_queries: Vec<String>,
+) -> Result<SearchHit, ClecError> {
+    let item = store.read_passage(passage_id, 0, None)?;
+    Ok(SearchHit {
+        passage_id: item.passage_id,
+        work: item.work,
+        source: item.source,
+        ordinal: item.ordinal,
+        spans: item.spans,
+        cues: item.cues,
+        diagnostics: item.diagnostics,
+        previous: item.previous,
+        next: item.next,
+        continued_from: item.continued_from,
+        continued_to: item.continued_to,
+        text: item.text,
+        rrf_score,
+        matched_queries,
+    })
+}
+
+pub(crate) fn execute_search(
+    store: &CorpusStore,
+    req: &PreparedSearch,
+) -> Result<SearchData, ClecError> {
+    let ranked = collect_rrf_candidates(store, req)?;
     let total_candidates = ranked.len();
-    let diverse_selected = apply_work_diversity(&ranked, req.limit, req.per_work);
+    let selected_indices =
+        apply_work_diversity_indices(&ranked, req.limit, req.per_work, |c| &c.work_id);
 
-    let mut hits = Vec::with_capacity(diverse_selected.len());
-    for candidate in diverse_selected {
-        let item = store.read_passage(&candidate.passage_id, 0, None)?;
-        hits.push(SearchHit {
-            passage_id: item.passage_id,
-            work: item.work,
-            source: item.source,
-            ordinal: item.ordinal,
-            spans: item.spans,
-            cues: item.cues,
-            diagnostics: item.diagnostics,
-            previous: item.previous,
-            next: item.next,
-            continued_from: item.continued_from,
-            continued_to: item.continued_to,
-            text: item.text,
-            rrf_score: candidate.rrf_score,
-            matched_queries: candidate.matched_queries.clone(),
-        });
+    let mut hits = Vec::with_capacity(selected_indices.len());
+    for idx in selected_indices {
+        let candidate = &ranked[idx];
+        hits.push(materialize_passage_hit(
+            store,
+            &candidate.passage_id,
+            candidate.rrf_score,
+            candidate.matched_queries.clone(),
+        )?);
     }
 
     Ok(SearchData {
@@ -262,11 +285,15 @@ pub(crate) fn execute_search(
     })
 }
 
-fn apply_work_diversity(
-    ranked: &[RankedCandidate],
+pub(crate) fn apply_work_diversity_indices<T, F>(
+    ranked: &[T],
     limit: usize,
     per_work: usize,
-) -> Vec<&RankedCandidate> {
+    work_of: F,
+) -> Vec<usize>
+where
+    F: Fn(&T) -> &WorkId,
+{
     let mut selected = Vec::with_capacity(limit.min(ranked.len()));
     let mut used_indices = vec![false; ranked.len()];
     let mut work_counts: HashMap<&str, usize> = HashMap::new();
@@ -275,21 +302,21 @@ fn apply_work_diversity(
         if selected.len() == limit {
             break;
         }
-        let count = work_counts.entry(candidate.work_id.as_str()).or_insert(0);
+        let count = work_counts.entry(work_of(candidate).as_str()).or_insert(0);
         if *count < per_work {
             *count += 1;
             used_indices[idx] = true;
-            selected.push(candidate);
+            selected.push(idx);
         }
     }
 
     if selected.len() < limit {
-        for (idx, candidate) in ranked.iter().enumerate() {
+        for (idx, used) in used_indices.iter().enumerate() {
             if selected.len() == limit {
                 break;
             }
-            if !used_indices[idx] {
-                selected.push(candidate);
+            if !used {
+                selected.push(idx);
             }
         }
     }
@@ -592,5 +619,38 @@ mod tests {
         assert_eq!(res_4pct.hits.len(), 2);
         assert_eq!(res_4pct.hits[0].work.work_key, "w2");
         assert_eq!(res_4pct.hits[0].matched_queries, vec!["4%", "qqq"]);
+
+        let req = PreparedSearch::prepare(SearchRequest {
+            queries: vec!["0050".to_owned(), "4%".to_owned()],
+            match_mode: MatchMode::Any,
+            limit: 5,
+            per_work: 2,
+            work_filter: None,
+            source_filter: None,
+            role_filter: None,
+            date_from: None,
+            date_to: None,
+            release_pin: None,
+        })
+        .unwrap();
+        let full = execute_search(&store, &req).unwrap();
+        let candidates = collect_rrf_candidates(&store, &req).unwrap();
+        let indices =
+            apply_work_diversity_indices(&candidates, req.limit, req.per_work, |c| &c.work_id);
+        let materialized: Vec<SearchHit> = indices
+            .into_iter()
+            .map(|idx| {
+                let c = &candidates[idx];
+                materialize_passage_hit(
+                    &store,
+                    &c.passage_id,
+                    c.rrf_score,
+                    c.matched_queries.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(full.total_candidates, candidates.len());
+        assert_eq!(full.hits, materialized);
     }
 }

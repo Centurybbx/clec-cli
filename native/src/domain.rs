@@ -291,6 +291,10 @@ impl PassageId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn as_str_ref(&self) -> &String {
+        &self.0
+    }
 }
 
 impl fmt::Display for PassageId {
