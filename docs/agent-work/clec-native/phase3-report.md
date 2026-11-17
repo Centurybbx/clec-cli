@@ -32,7 +32,7 @@ The two unanswerable records retain null chain and evidence-coverage values. The
 
 There are 12 search steps and no reads. All executions complete without errors or timeouts. The retained validation reports zero citation, provenance, and budget failures. Raw search stdout totals 377,940 UTF-8 bytes, with a maximum of 47,283 bytes against the 65,536-byte per-call cap. The adapter read cap is 65,536 bytes, but no read occurs. Effective read and cumulative byte caps are null. No cumulative-cap guarantee follows from this run.
 
-The fixed configuration is `single_query_product_baseline`, original-question angle, top five, at most two results per work, `any` matching, and a 30-second timeout. The audit compared every recorded command against this configuration and the frozen original question strings. It did not generate query plans or inspect annotations to tune retrieval.
+The fixed configuration is `single_query_product_baseline`, original-question angle, top five, `per-work 2`, `any` matching, and a 30-second timeout. Work diversity applies before backfilling remaining result slots. The audit compared every recorded command against this configuration and the frozen original question strings. It did not generate query plans or inspect annotations to tune retrieval.
 
 ## Receipt verification and identities
 
