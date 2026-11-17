@@ -29,14 +29,14 @@ Host: macOS arm64 (`16 GiB` physical RAM, `37 GiB` free disk before original bui
 
 ## Verification summary
 
-All checks below ran against committed clean code head `39a12b77e6c8398a7d1536216f853b372e755ec2` (`gitDirty: false`):
+All checks below ran against committed clean code head `83f77389272b9fb963a111b2d80fc0833cb38aca` (`gitDirty: false`):
 
 - `cd native && cargo fmt --check`: pass.
 - `cd native && cargo clippy --locked --all-targets -- -D warnings`: pass.
-- `cd native && cargo test --locked`: `26` of `26` `clec_core` tests plus `1` of `1` `clec-publish` test pass (including `validates_and_rejects_corruptions_on_2001_passage_64_bucket_path` exercising `2,001` passages, row `64`/`65` boundary swap, last-row `2,001` missing/duplicate postings, global FTS stats corruption, and bucket temp cleanup).
-- `cd native && cargo build --release --locked`: pass (`clec` SHA-256 `806142ad7423d90071b6b2f76feb9387c44af7027f6bd368ba3a725d3e728a2f`, `clec-publish` SHA-256 `dea84b86e6dab56f73b19eb2f833ef9be75d7b4e99183e0fc4f2577516d4f1bb`).
-- `python3 -m unittest evaluation/clec-v1/phase2/test_capture_capacity.py -v`: `2` of `2` pass.
-- `python3 evaluation/clec-v1/phase2/verify_phase2.py --clec native/target/release/clec --publish native/target/release/clec-publish --report .cache/phase2/verify-phase2-report.json`: `9` of `9` blackbox suites pass (including `large_64_bucket_2001_regression` covering `2,001`-passage publish/sync, `64`/`65` swap, row `2,001` missing/duplicate postings, global stats corruption, unchanged active release, and clean temp-dir state on failure).
+- `cd native && cargo test --locked`: `27` of `27` `clec_core` tests plus `1` of `1` `clec-publish` test pass (including `publish_is_byte_deterministic_across_repeats_and_input_permutations` and `validates_and_rejects_corruptions_on_2001_passage_64_bucket_path`).
+- `cd native && cargo build --release --locked`: pass (`clec` SHA-256 `969ea9926b06acd9384191a81cfe51dcb4c16ac7f4d9afe058ef94505cd09bca`, `clec-publish` SHA-256 `7dff9ba66f41bcc429b803abcececbc13785a0dec7d4bd41a97210e2134936a7`).
+- `python3 -m unittest evaluation/clec-v1/phase2/test_capture_capacity.py -v`: `4` of `4` pass.
+- `python3 evaluation/clec-v1/phase2/verify_phase2.py --clec native/target/release/clec --publish native/target/release/clec-publish --report .cache/phase2/verify-phase2-report.json`: `10` of `10` blackbox suites pass (including `deterministic_repeat_publish` and `large_64_bucket_2001_regression`).
 
 ## Known limitations
 
