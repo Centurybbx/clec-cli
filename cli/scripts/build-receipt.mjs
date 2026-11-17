@@ -1,8 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  CONTROLLED_BUILD_RECEIPT_KIND,
+  ESTABLISHED_BUILD,
+  ESTABLISHED_SOURCE,
+  INSPECTED_PREBUILT_RECEIPT_KIND,
+  NOT_VERIFIED_UNKNOWN,
+  RECEIPT_SCHEMA_VERSION,
   assertExecutableMatchesTarget,
   assertNonEmptyKnownString,
   extractEmbeddedBuildIdentity,
@@ -11,16 +17,19 @@ import {
 } from './artifact-admission.mjs';
 import { PACKAGE_NAME, PACKAGE_VERSION, findTargetByTuple } from './targets.mjs';
 
+const DEFAULT_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
 function parseArgs(argv) {
   const opts = {
     tuple: null,
     targetDir: null,
     out: null,
-    repoRoot: resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
+    repoRoot: undefined,
     runBuild: false,
     toolchain: null,
+    cargoLockPath: null,
     buildCommand: null,
-    hostBaseline: `${process.platform}-${process.arch}`,
+    hostBaseline: null,
     clec: null,
     clecPublish: null,
     clecValidate: null,
@@ -40,6 +49,8 @@ function parseArgs(argv) {
       opts.runBuild = true;
     } else if (arg === '--toolchain') {
       opts.toolchain = argv[++i];
+    } else if (arg === '--cargo-lock') {
+      opts.cargoLockPath = argv[++i];
     } else if (arg === '--build-command') {
       opts.buildCommand = argv[++i];
     } else if (arg === '--host-baseline') {
@@ -58,7 +69,7 @@ function parseArgs(argv) {
   }
   if (!opts.tuple || (!opts.targetDir && !opts.clec) || !opts.out) {
     throw new Error(
-      'Usage: build-receipt.mjs --tuple <tuple> (--target-dir <dir> | --clec <path>) --out <receipt.json> [--run-build] [--toolchain <ver>] [--build-command <cmd>] [--host-baseline <str>] [--repo-root <dir>]',
+      'Usage: build-receipt.mjs --tuple <tuple> (--target-dir <dir> | --clec <path>) --out <receipt.json> [--run-build] [--toolchain <ver>] [--cargo-lock <path>] [--build-command <cmd>] [--host-baseline <str>] [--repo-root <dir>]',
     );
   }
   return opts;
@@ -72,32 +83,156 @@ function execText(cmd, args, cwd) {
   }).trim();
 }
 
+function readGitState(repoRoot) {
+  const commit = execText('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], repoRoot);
+  if (!/^[0-9a-f]{40}$/.test(commit)) {
+    throw new Error(`Unexpected git HEAD SHA: ${commit}`);
+  }
+  const statusRaw = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).replace(/\r?\n$/, '');
+  return {
+    commit,
+    dirty: statusRaw.length > 0,
+    statusRaw,
+  };
+}
+
+function inspectArtifacts(slotDefs, targetMeta, expectedRustcVersion, expectedCargoLockSha256) {
+  const artifacts = {};
+  let referenceIdentity = null;
+
+  for (const slot of slotDefs) {
+    const bytes = readRegularFile(slot.path, { nonEmpty: true });
+    assertExecutableMatchesTarget(bytes, targetMeta);
+    const embedded = extractEmbeddedBuildIdentity(bytes);
+    if (embedded.artifactKind !== slot.expectedKind) {
+      throw new Error(
+        `Artifact ${slot.path} embedded artifactKind '${embedded.artifactKind}' != '${slot.expectedKind}'.`,
+      );
+    }
+    if (embedded.packageVersion !== PACKAGE_VERSION) {
+      throw new Error(
+        `Artifact ${slot.path} packageVersion '${embedded.packageVersion}' != '${PACKAGE_VERSION}'.`,
+      );
+    }
+    if (embedded.target !== targetMeta.rustTarget) {
+      throw new Error(
+        `Artifact ${slot.path} embedded target '${embedded.target}' != '${targetMeta.rustTarget}'.`,
+      );
+    }
+    if (expectedCargoLockSha256 && embedded.cargoLockSha256 !== expectedCargoLockSha256) {
+      throw new Error(
+        `Artifact ${slot.path} embedded cargoLockSha256 '${embedded.cargoLockSha256}' != '${expectedCargoLockSha256}'.`,
+      );
+    }
+    if (expectedRustcVersion && embedded.rustcVersion !== expectedRustcVersion) {
+      throw new Error(
+        `Artifact ${slot.path} embedded rustcVersion '${embedded.rustcVersion}' != '${expectedRustcVersion}'.`,
+      );
+    }
+    if (referenceIdentity === null) {
+      referenceIdentity = embedded;
+    } else if (
+      referenceIdentity.profile !== embedded.profile ||
+      referenceIdentity.testHooks !== embedded.testHooks ||
+      referenceIdentity.rustcVersion !== embedded.rustcVersion ||
+      referenceIdentity.cargoLockSha256 !== embedded.cargoLockSha256 ||
+      JSON.stringify(referenceIdentity.features) !== JSON.stringify(embedded.features)
+    ) {
+      throw new Error(`Artifact ${slot.path} build identity disagrees with clec binary.`);
+    }
+
+    artifacts[slot.key] = {
+      kind: embedded.artifactKind,
+      binaryName: slot.binaryName,
+      bytes: bytes.length,
+      sha256: sha256Hex(bytes),
+      embeddedMetadata: embedded,
+    };
+  }
+
+  return { artifacts, referenceIdentity };
+}
+
+function writeReceiptIfRequested(out, receipt) {
+  if (out) {
+    const outPath = resolve(out);
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+  }
+  return receipt;
+}
+
 export function captureBuildReceipt(opts) {
   const targetMeta = findTargetByTuple(opts.tuple);
   if (!targetMeta) {
     throw new Error(`Unknown target tuple: ${opts.tuple}`);
   }
-  const repoRoot = resolve(opts.repoRoot ?? join(dirname(fileURLToPath(import.meta.url)), '../..'));
-  const manifestPath = join(repoRoot, 'native', 'Cargo.toml');
-  const cargoLockPath = join(repoRoot, 'native', 'Cargo.lock');
-  const cargoLockSha256 = sha256Hex(readRegularFile(cargoLockPath, { nonEmpty: true }));
-
-  const sourceCommit = execText('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], repoRoot);
-  if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
-    throw new Error(`Unexpected git HEAD SHA: ${sourceCommit}`);
-  }
-  const gitStatus = execText('git', ['-C', repoRoot, 'status', '--porcelain'], repoRoot);
-  const sourceDirty = gitStatus.length > 0;
-
-  const toolchainArgs = opts.toolchain ? [`+${opts.toolchain}`] : [];
-  const rustcVersion = execText('rustc', [...toolchainArgs, '--version'], repoRoot);
-
-  let buildCommand = opts.buildCommand;
   const targetDir = opts.targetDir ? resolve(opts.targetDir) : null;
+  const toolchainArgs = opts.toolchain ? [`+${opts.toolchain}`] : [];
+
   if (opts.runBuild) {
     if (!targetDir) {
       throw new Error('--run-build requires --target-dir.');
     }
+    if (opts.clec || opts.clecPublish || opts.clecValidate) {
+      throw new Error(
+        'Cannot override --clec, --clec-publish, or --clec-validate when --run-build is enabled; controlled builds bind strictly to outputs produced in --target-dir.',
+      );
+    }
+    if (opts.buildCommand !== undefined && opts.buildCommand !== null) {
+      throw new Error(
+        'Cannot combine --run-build with --build-command; controlled builds record the exact executed cargo argv.',
+      );
+    }
+
+    const repoRoot = resolve(opts.repoRoot ?? DEFAULT_REPO_ROOT);
+    const manifestPath = join(repoRoot, 'native', 'Cargo.toml');
+    const cargoLockPath = join(repoRoot, 'native', 'Cargo.lock');
+    readRegularFile(manifestPath, { nonEmpty: true });
+    const cargoLockShaBefore = sha256Hex(readRegularFile(cargoLockPath, { nonEmpty: true }));
+    if (opts.cargoLockPath) {
+      const explicitLockSha = sha256Hex(readRegularFile(resolve(opts.cargoLockPath), { nonEmpty: true }));
+      if (explicitLockSha !== cargoLockShaBefore) {
+        throw new Error(`--cargo-lock SHA-256 ${explicitLockSha} disagrees with ${cargoLockPath} (${cargoLockShaBefore}).`);
+      }
+    }
+
+    const gitBefore = readGitState(repoRoot);
+    const rustcVersion = execText('rustc', [...toolchainArgs, '--version'], repoRoot);
+    const hostBaseline = assertNonEmptyKnownString(
+      opts.hostBaseline ?? `${process.platform}-${process.arch}`,
+      'hostBaseline',
+    );
+
+    const releaseDir = join(targetDir, 'release');
+    const slotDefs = [
+      { key: 'clec', path: join(releaseDir, targetMeta.binaryName), expectedKind: 'clec', binaryName: targetMeta.binaryName },
+    ];
+    if (opts.requireMaintainer !== false) {
+      slotDefs.push(
+        {
+          key: 'clecPublish',
+          path: join(releaseDir, targetMeta.maintainerBinaries[0]),
+          expectedKind: 'clec-publish',
+          binaryName: targetMeta.maintainerBinaries[0],
+        },
+        {
+          key: 'clecValidate',
+          path: join(releaseDir, targetMeta.maintainerBinaries[1]),
+          expectedKind: 'clec-validate',
+          binaryName: targetMeta.maintainerBinaries[1],
+        },
+      );
+    }
+
+    for (const slot of slotDefs) {
+      rmSync(slot.path, { force: true });
+    }
+
     const cargoArgs = [
       ...toolchainArgs,
       'build',
@@ -114,10 +249,66 @@ export function captureBuildReceipt(opts) {
       env: { ...process.env, CARGO_TARGET_DIR: targetDir },
       stdio: 'inherit',
     });
-    buildCommand = `cargo ${cargoArgs.join(' ')}`;
+
+    const gitAfter = readGitState(repoRoot);
+    if (gitAfter.commit !== gitBefore.commit) {
+      throw new Error(
+        `Source commit changed during controlled build (before=${gitBefore.commit}, after=${gitAfter.commit}).`,
+      );
+    }
+    if (gitAfter.statusRaw !== gitBefore.statusRaw) {
+      throw new Error('Source working tree changed during controlled build.');
+    }
+    const cargoLockShaAfter = sha256Hex(readRegularFile(cargoLockPath, { nonEmpty: true }));
+    if (cargoLockShaAfter !== cargoLockShaBefore) {
+      throw new Error('Cargo.lock changed during controlled build.');
+    }
+
+    const { artifacts, referenceIdentity } = inspectArtifacts(
+      slotDefs,
+      targetMeta,
+      rustcVersion,
+      cargoLockShaAfter,
+    );
+
+    const receipt = {
+      schemaVersion: RECEIPT_SCHEMA_VERSION,
+      receiptKind: CONTROLLED_BUILD_RECEIPT_KIND,
+      trustModel: 'unsigned-local-controlled-build-receipt',
+      packageName: PACKAGE_NAME,
+      packageVersion: PACKAGE_VERSION,
+      tuple: targetMeta.tuple,
+      rustTarget: targetMeta.rustTarget,
+      provenance: {
+        source: {
+          status: ESTABLISHED_SOURCE,
+          sourceCommit: gitAfter.commit,
+          sourceDirty: gitAfter.dirty,
+        },
+        buildInvocation: {
+          status: ESTABLISHED_BUILD,
+          executable: 'cargo',
+          argv: cargoArgs,
+          command: ['cargo', ...cargoArgs].join(' '),
+          hostBaseline,
+        },
+      },
+      verifiedEmbeddedMetadata: {
+        cargoLockSha256: referenceIdentity.cargoLockSha256,
+        rustcVersion: referenceIdentity.rustcVersion,
+        profile: referenceIdentity.profile,
+        features: referenceIdentity.features,
+        testHooksIncluded: referenceIdentity.testHooks,
+      },
+      artifacts,
+    };
+
+    return writeReceiptIfRequested(opts.out, receipt);
   }
-  const verifiedBuildCommand = assertNonEmptyKnownString(buildCommand, 'buildCommand');
-  const hostBaseline = assertNonEmptyKnownString(opts.hostBaseline, 'hostBaseline');
+
+  if (!targetDir && !opts.clec) {
+    throw new Error('Inspected prebuilt receipt requires --target-dir or --clec.');
+  }
 
   const releaseDir = targetDir ? join(targetDir, 'release') : null;
   const clecPath = opts.clec ? resolve(opts.clec) : join(releaseDir, targetMeta.binaryName);
@@ -136,7 +327,7 @@ export function captureBuildReceipt(opts) {
     { key: 'clec', path: clecPath, expectedKind: 'clec', binaryName: targetMeta.binaryName },
   ];
   const includeMaintainer =
-    opts.requireMaintainer || Boolean(opts.clecPublish || opts.clecValidate || (pubPath && existsSync(pubPath)));
+    opts.requireMaintainer === true || Boolean(opts.clecPublish || opts.clecValidate || (pubPath && existsSync(pubPath)));
   if (includeMaintainer) {
     if (!pubPath || !valPath) {
       throw new Error(`Maintainer binaries required for tuple '${targetMeta.tuple}'.`);
@@ -157,78 +348,72 @@ export function captureBuildReceipt(opts) {
     );
   }
 
-  const artifacts = {};
-  let referenceIdentity = null;
+  const expectedRustc = opts.toolchain
+    ? execText('rustc', [...toolchainArgs, '--version'], process.cwd())
+    : null;
+  const expectedCargoLockSha = opts.cargoLockPath
+    ? sha256Hex(readRegularFile(resolve(opts.cargoLockPath), { nonEmpty: true }))
+    : null;
 
-  for (const slot of slotDefs) {
-    const bytes = readRegularFile(slot.path, { nonEmpty: true });
-    assertExecutableMatchesTarget(bytes, targetMeta);
-    const embedded = extractEmbeddedBuildIdentity(bytes);
-    if (embedded.packageVersion !== PACKAGE_VERSION) {
-      throw new Error(
-        `Artifact ${slot.path} packageVersion '${embedded.packageVersion}' != '${PACKAGE_VERSION}'.`,
-      );
-    }
-    if (embedded.target !== targetMeta.rustTarget) {
-      throw new Error(
-        `Artifact ${slot.path} embedded target '${embedded.target}' != '${targetMeta.rustTarget}'.`,
-      );
-    }
-    if (embedded.cargoLockSha256 !== cargoLockSha256) {
-      throw new Error(
-        `Artifact ${slot.path} embedded cargoLockSha256 '${embedded.cargoLockSha256}' != '${cargoLockSha256}'.`,
-      );
-    }
-    if (embedded.rustcVersion !== rustcVersion) {
-      throw new Error(
-        `Artifact ${slot.path} embedded rustcVersion '${embedded.rustcVersion}' != '${rustcVersion}'.`,
-      );
-    }
-    if (referenceIdentity === null) {
-      referenceIdentity = embedded;
-    } else if (
-      referenceIdentity.profile !== embedded.profile ||
-      referenceIdentity.testHooks !== embedded.testHooks ||
-      JSON.stringify(referenceIdentity.features) !== JSON.stringify(embedded.features)
-    ) {
-      throw new Error(`Artifact ${slot.path} profile/features disagree with clec binary.`);
-    }
+  const { artifacts, referenceIdentity } = inspectArtifacts(
+    slotDefs,
+    targetMeta,
+    expectedRustc,
+    expectedCargoLockSha,
+  );
 
-    artifacts[slot.key] = {
-      kind: embedded.artifactKind,
-      binaryName: slot.binaryName,
-      bytes: bytes.length,
-      sha256: sha256Hex(bytes),
-      embeddedMetadata: embedded,
-    };
+  let observedGit = null;
+  if (opts.repoRoot !== undefined && opts.repoRoot !== null) {
+    const gitState = readGitState(resolve(opts.repoRoot));
+    observedGit = { commit: gitState.commit, dirty: gitState.dirty };
+  } else if (opts.repoRoot === undefined && existsSync(join(DEFAULT_REPO_ROOT, '.git'))) {
+    const gitState = readGitState(DEFAULT_REPO_ROOT);
+    observedGit = { commit: gitState.commit, dirty: gitState.dirty };
   }
 
+  const declaredBuildCommand =
+    opts.buildCommand !== undefined && opts.buildCommand !== null
+      ? assertNonEmptyKnownString(opts.buildCommand, 'declaredBuildCommand')
+      : null;
+  const declaredHostBaseline =
+    opts.hostBaseline !== undefined && opts.hostBaseline !== null
+      ? assertNonEmptyKnownString(opts.hostBaseline, 'declaredHostBaseline')
+      : null;
+
   const receipt = {
-    schemaVersion: 1,
-    receiptKind: 'clec-build-receipt',
-    trustModel: 'unsigned-local-build-receipt',
+    schemaVersion: RECEIPT_SCHEMA_VERSION,
+    receiptKind: INSPECTED_PREBUILT_RECEIPT_KIND,
+    trustModel: 'unsigned-inspected-prebuilt-receipt',
     packageName: PACKAGE_NAME,
     packageVersion: PACKAGE_VERSION,
     tuple: targetMeta.tuple,
     rustTarget: targetMeta.rustTarget,
-    sourceCommit,
-    sourceDirty,
-    cargoLockSha256,
-    rustcVersion,
-    profile: referenceIdentity.profile,
-    features: referenceIdentity.features,
-    testHooksIncluded: referenceIdentity.testHooks,
-    buildCommand: verifiedBuildCommand,
-    hostBaseline,
+    provenance: {
+      source: {
+        status: NOT_VERIFIED_UNKNOWN,
+        reason: 'inspected_prebuilt_without_controlled_build',
+      },
+      buildInvocation: {
+        status: NOT_VERIFIED_UNKNOWN,
+        reason: 'inspected_prebuilt_without_controlled_build',
+      },
+    },
+    captureObservation: {
+      observedGit,
+      declaredBuildCommand,
+      declaredHostBaseline,
+    },
+    verifiedEmbeddedMetadata: {
+      cargoLockSha256: referenceIdentity.cargoLockSha256,
+      rustcVersion: referenceIdentity.rustcVersion,
+      profile: referenceIdentity.profile,
+      features: referenceIdentity.features,
+      testHooksIncluded: referenceIdentity.testHooks,
+    },
     artifacts,
   };
 
-  if (opts.out) {
-    const outPath = resolve(opts.out);
-    mkdirSync(dirname(outPath), { recursive: true });
-    writeFileSync(outPath, `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
-  }
-  return receipt;
+  return writeReceiptIfRequested(opts.out, receipt);
 }
 
 const isEntrypoint = (() => {

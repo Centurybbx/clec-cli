@@ -3,10 +3,18 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDeterministicTarGz, createDeterministicZip } from './archive.mjs';
 import {
+  CONTROLLED_BUILD_RECEIPT_KIND,
+  ESTABLISHED_BUILD,
+  ESTABLISHED_SOURCE,
+  INSPECTED_PREBUILT_RECEIPT_KIND,
+  INVENTORY_SCHEMA_VERSION,
+  NOT_VERIFIED_UNKNOWN,
+  PROVENANCE_SCHEMA_VERSION,
   admitTargetArtifacts,
   assertNonEmptyKnownString,
   readRegularFile,
   sha256Hex,
+  validateProvenanceDocument,
 } from './artifact-admission.mjs';
 import {
   BIN_TARGET_REL,
@@ -157,31 +165,90 @@ export function stageRelease(opts, cliRoot) {
   }
 
   const admittedReceipts = [...admittedByTuple.values()].map((item) => item.receipt);
-  const sourceCommits = [...new Set(admittedReceipts.map((r) => r.sourceCommit))];
-  if (sourceCommits.length !== 1) {
-    throw new Error(`Admitted build receipts disagree on sourceCommit: ${sourceCommits.join(', ')}.`);
-  }
-  const cargoLocks = [...new Set(admittedReceipts.map((r) => r.cargoLockSha256))];
+  const cargoLocks = [...new Set(admittedReceipts.map((r) => r.verifiedEmbeddedMetadata.cargoLockSha256))];
   if (cargoLocks.length !== 1) {
     throw new Error(`Admitted build receipts disagree on cargoLockSha256: ${cargoLocks.join(', ')}.`);
   }
 
-  assertOptionalCliMatches(opts.sourceCommit, sourceCommits, 'source-commit');
+  const allControlled = admittedReceipts.every((r) => r.receiptKind === CONTROLLED_BUILD_RECEIPT_KIND);
+  const allInspected = admittedReceipts.every((r) => r.receiptKind === INSPECTED_PREBUILT_RECEIPT_KIND);
+  const provenanceClassification = allControlled
+    ? 'controlled-executed-build'
+    : allInspected
+      ? 'inspected-prebuilt'
+      : 'mixed-controlled-and-inspected-prebuilt';
+
   assertOptionalCliMatches(
     opts.rustcVersion,
-    admittedReceipts.map((r) => r.rustcVersion),
+    admittedReceipts.map((r) => r.verifiedEmbeddedMetadata.rustcVersion),
     'rustc-version',
   );
-  assertOptionalCliMatches(
-    opts.buildCommand,
-    admittedReceipts.map((r) => r.buildCommand),
-    'build-command',
-  );
-  assertOptionalCliMatches(
-    opts.hostBaseline,
-    admittedReceipts.map((r) => r.hostBaseline),
-    'host-baseline',
-  );
+
+  if (opts.sourceCommit !== undefined && opts.sourceCommit !== null) {
+    if (!allControlled) {
+      throw new Error(
+        `Cannot assert --source-commit when admitted targets include inspected-prebuilt receipts (${NOT_VERIFIED_UNKNOWN}).`,
+      );
+    }
+    assertOptionalCliMatches(
+      opts.sourceCommit,
+      admittedReceipts.map((r) => r.provenance.source.sourceCommit),
+      'source-commit',
+    );
+  }
+  if (opts.buildCommand !== undefined && opts.buildCommand !== null) {
+    if (!allControlled) {
+      throw new Error(
+        `Cannot assert --build-command when admitted targets include inspected-prebuilt receipts (${NOT_VERIFIED_UNKNOWN}).`,
+      );
+    }
+    assertOptionalCliMatches(
+      opts.buildCommand,
+      admittedReceipts.map((r) => r.provenance.buildInvocation.command),
+      'build-command',
+    );
+  }
+  if (opts.hostBaseline !== undefined && opts.hostBaseline !== null) {
+    if (!allControlled) {
+      throw new Error(
+        `Cannot assert --host-baseline when admitted targets include inspected-prebuilt receipts (${NOT_VERIFIED_UNKNOWN}).`,
+      );
+    }
+    assertOptionalCliMatches(
+      opts.hostBaseline,
+      admittedReceipts.map((r) => r.provenance.buildInvocation.hostBaseline),
+      'host-baseline',
+    );
+  }
+
+  let topProvenance;
+  if (allControlled) {
+    const sourceCommits = [...new Set(admittedReceipts.map((r) => r.provenance.source.sourceCommit))];
+    if (sourceCommits.length !== 1) {
+      throw new Error(`Admitted controlled build receipts disagree on sourceCommit: ${sourceCommits.join(', ')}.`);
+    }
+    topProvenance = {
+      source: {
+        status: ESTABLISHED_SOURCE,
+        sourceCommit: sourceCommits[0],
+        sourceDirty: admittedReceipts.some((r) => r.provenance.source.sourceDirty),
+      },
+      buildInvocation: {
+        status: ESTABLISHED_BUILD,
+        command: uniformOrPerTarget(admittedReceipts.map((r) => r.provenance.buildInvocation.command)),
+        hostBaseline: uniformOrPerTarget(admittedReceipts.map((r) => r.provenance.buildInvocation.hostBaseline)),
+      },
+    };
+  } else {
+    const reason =
+      provenanceClassification === 'mixed-controlled-and-inspected-prebuilt'
+        ? 'mixed_controlled_and_inspected_prebuilt_targets'
+        : 'inspected_prebuilt_without_controlled_build';
+    topProvenance = {
+      source: { status: NOT_VERIFIED_UNKNOWN, reason },
+      buildInvocation: { status: NOT_VERIFIED_UNKNOWN, reason },
+    };
+  }
 
   const targetsInventory = {};
   const provenanceTargets = {};
@@ -220,21 +287,23 @@ export function stageRelease(opts, cliRoot) {
       sha256: clecSha,
       structuralIdentity: admitted.structuralIdentity,
       executionEvidence: admitted.executionEvidence,
+      provenance: admitted.receipt.provenance,
     };
+
+    const targetReceiptSummary = {
+      receiptKind: admitted.receipt.receiptKind,
+      trustModel: admitted.receipt.trustModel,
+      verifiedEmbeddedMetadata: admitted.receipt.verifiedEmbeddedMetadata,
+      provenance: admitted.receipt.provenance,
+      artifacts: admitted.receipt.artifacts,
+    };
+    if (admitted.receipt.receiptKind === INSPECTED_PREBUILT_RECEIPT_KIND) {
+      targetReceiptSummary.captureObservation = admitted.receipt.captureObservation;
+    }
 
     provenanceTargets[meta.tuple] = {
       ...targetsInventory[meta.tuple],
-      buildReceipt: {
-        receiptKind: admitted.receipt.receiptKind,
-        trustModel: admitted.receipt.trustModel,
-        sourceCommit: admitted.receipt.sourceCommit,
-        sourceDirty: admitted.receipt.sourceDirty,
-        cargoLockSha256: admitted.receipt.cargoLockSha256,
-        rustcVersion: admitted.receipt.rustcVersion,
-        buildCommand: admitted.receipt.buildCommand,
-        hostBaseline: admitted.receipt.hostBaseline,
-        artifacts: admitted.receipt.artifacts,
-      },
+      buildReceipt: targetReceiptSummary,
     };
 
     npmPayloadEntries.push({
@@ -303,7 +372,7 @@ export function stageRelease(opts, cliRoot) {
   }
 
   const inventory = {
-    schemaVersion: 1,
+    schemaVersion: INVENTORY_SCHEMA_VERSION,
     packageName: PACKAGE_NAME,
     packageVersion: PACKAGE_VERSION,
     complete,
@@ -313,27 +382,28 @@ export function stageRelease(opts, cliRoot) {
   const inventoryBytes = Buffer.from(`${JSON.stringify(inventory, null, 2)}\n`, 'utf8');
   writeFileSync(join(outputDir, 'inventory.json'), inventoryBytes);
 
-  const provenance = {
-    schemaVersion: 1,
+  const provenance = validateProvenanceDocument({
+    schemaVersion: PROVENANCE_SCHEMA_VERSION,
     packageName: PACKAGE_NAME,
     packageVersion: PACKAGE_VERSION,
     complete,
     publishable: false,
+    provenanceClassification,
     trustBoundary:
-      'Unsigned local build receipts bind payload SHA-256 hashes to observed compiler, Cargo.lock, and embedded compile metadata; they do not authenticate a remote publisher or certify execution on unexecuted target OSes.',
-    sourceCommit: sourceCommits[0],
-    sourceDirty: admittedReceipts.some((r) => r.sourceDirty),
-    cargoLockSha256: cargoLocks[0],
-    rustcVersion: uniformOrPerTarget(admittedReceipts.map((r) => r.rustcVersion)),
-    features: [],
-    testHooksIncluded: false,
-    buildCommand: uniformOrPerTarget(admittedReceipts.map((r) => r.buildCommand)),
-    hostBaseline: uniformOrPerTarget(admittedReceipts.map((r) => r.hostBaseline)),
+      'Structural executable headers and embedded compile metadata (target, profile, features, rustcVersion, cargoLockSha256) are verified against exact payload bytes. Build source and invocation are established only for controlled-executed-build receipts; inspected-prebuilt receipts leave build source and invocation as not_verified_unknown and isolate captureObservation as unverified capture metadata. Unsigned local receipts do not provide publisher authentication, hermetic build certification, or cross-OS execution proof.',
+    verifiedEmbeddedMetadata: {
+      cargoLockSha256: cargoLocks[0],
+      rustcVersion: uniformOrPerTarget(admittedReceipts.map((r) => r.verifiedEmbeddedMetadata.rustcVersion)),
+      profile: 'release',
+      features: [],
+      testHooksIncluded: false,
+    },
+    provenance: topProvenance,
     licenseStatus: 'unassigned_pending_maintainer_confirmation',
     repositoryNote:
       'Recorded metadata Centurybbx/clec-cli returned 404 and root git has no remotes; no public release URL assumed.',
     targets: provenanceTargets,
-  };
+  });
   const provenanceBytes = Buffer.from(`${JSON.stringify(provenance, null, 2)}\n`, 'utf8');
   writeFileSync(join(outputDir, 'provenance.json'), provenanceBytes);
 

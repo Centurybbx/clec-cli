@@ -20,11 +20,20 @@ import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { createDeterministicTarGz, createDeterministicZip } from '../scripts/archive.mjs';
 import {
+  CONTROLLED_BUILD_RECEIPT_KIND,
+  ESTABLISHED_BUILD,
+  ESTABLISHED_SOURCE,
   IDENTITY_PREFIX,
   IDENTITY_SUFFIX,
+  INSPECTED_PREBUILT_RECEIPT_KIND,
+  INVENTORY_SCHEMA_VERSION,
+  NOT_VERIFIED_UNKNOWN,
+  RECEIPT_SCHEMA_VERSION,
+  admitTargetArtifacts,
   assertExecutableMatchesTarget,
   extractEmbeddedBuildIdentity,
   inspectExecutableContainer,
+  validateProvenanceDocument,
 } from '../scripts/artifact-admission.mjs';
 import { captureBuildReceipt } from '../scripts/build-receipt.mjs';
 import { installFromRoot } from '../scripts/install.mjs';
@@ -137,7 +146,7 @@ function makeSyntheticBinary({
     : Buffer.concat([header, marker]);
 }
 
-function makeBoundReceipt(tuple, artifactMap, overrides = {}) {
+function makeBoundReceipt(tuple, artifactMap, options = {}) {
   const meta = findTargetByTuple(tuple);
   const artifacts = {};
   for (const [slotKey, info] of Object.entries(artifactMap)) {
@@ -150,25 +159,63 @@ function makeBoundReceipt(tuple, artifactMap, overrides = {}) {
       embeddedMetadata: embedded,
     };
   }
-  return {
-    schemaVersion: 1,
-    receiptKind: 'clec-build-receipt',
-    trustModel: 'unsigned-local-build-receipt',
-    packageName: PACKAGE_NAME,
-    packageVersion: PACKAGE_VERSION,
-    tuple: meta.tuple,
-    rustTarget: meta.rustTarget,
-    sourceCommit: DEFAULT_COMMIT,
-    sourceDirty: false,
+  const verifiedEmbeddedMetadata = {
     cargoLockSha256: DEFAULT_LOCK_SHA,
     rustcVersion: DEFAULT_RUSTC,
     profile: 'release',
     features: [],
     testHooksIncluded: false,
-    buildCommand: 'cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins -j 2',
-    hostBaseline: `${meta.platform}-${meta.arch}-synthetic`,
+    ...(options.verifiedEmbeddedMetadata ?? {}),
+  };
+
+  if (options.mode === 'inspected-prebuilt') {
+    return {
+      schemaVersion: RECEIPT_SCHEMA_VERSION,
+      receiptKind: INSPECTED_PREBUILT_RECEIPT_KIND,
+      trustModel: 'unsigned-inspected-prebuilt-receipt',
+      packageName: PACKAGE_NAME,
+      packageVersion: PACKAGE_VERSION,
+      tuple: meta.tuple,
+      rustTarget: meta.rustTarget,
+      provenance: {
+        source: { status: NOT_VERIFIED_UNKNOWN, reason: 'inspected_prebuilt_without_controlled_build' },
+        buildInvocation: { status: NOT_VERIFIED_UNKNOWN, reason: 'inspected_prebuilt_without_controlled_build' },
+      },
+      captureObservation: {
+        observedGit: options.observedGit ?? { commit: DEFAULT_COMMIT, dirty: false },
+        declaredBuildCommand: options.declaredBuildCommand ?? null,
+        declaredHostBaseline: options.declaredHostBaseline ?? `${meta.platform}-${meta.arch}-synthetic`,
+      },
+      verifiedEmbeddedMetadata,
+      artifacts,
+    };
+  }
+
+  const argv = options.argv ?? ['+1.89.0', 'build', '--manifest-path', 'native/Cargo.toml', '--locked', '--release', '--bins', '-j', '2'];
+  return {
+    schemaVersion: RECEIPT_SCHEMA_VERSION,
+    receiptKind: CONTROLLED_BUILD_RECEIPT_KIND,
+    trustModel: 'unsigned-local-controlled-build-receipt',
+    packageName: PACKAGE_NAME,
+    packageVersion: PACKAGE_VERSION,
+    tuple: meta.tuple,
+    rustTarget: meta.rustTarget,
+    provenance: {
+      source: {
+        status: ESTABLISHED_SOURCE,
+        sourceCommit: options.sourceCommit ?? DEFAULT_COMMIT,
+        sourceDirty: options.sourceDirty ?? false,
+      },
+      buildInvocation: {
+        status: ESTABLISHED_BUILD,
+        executable: 'cargo',
+        argv,
+        command: ['cargo', ...argv].join(' '),
+        hostBaseline: options.hostBaseline ?? `${meta.platform}-${meta.arch}-synthetic`,
+      },
+    },
+    verifiedEmbeddedMetadata,
     artifacts,
-    ...overrides,
   };
 }
 
@@ -186,7 +233,7 @@ function makeFakeStagingPackage(root, tuple, payloadBytes, entryOverrides = {}) 
   writeFileSync(
     join(root, 'inventory.json'),
     JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: INVENTORY_SCHEMA_VERSION,
       packageName: PACKAGE_NAME,
       packageVersion: PACKAGE_VERSION,
       complete: false,
@@ -210,6 +257,10 @@ function makeFakeStagingPackage(root, tuple, payloadBytes, entryOverrides = {}) 
             packageVersion: PACKAGE_VERSION,
             features: [],
             testHooksIncluded: false,
+          },
+          provenance: {
+            source: { status: NOT_VERIFIED_UNKNOWN, reason: 'inspected_prebuilt_without_controlled_build' },
+            buildInvocation: { status: NOT_VERIFIED_UNKNOWN, reason: 'inspected_prebuilt_without_controlled_build' },
           },
           ...entryOverrides,
         },
@@ -397,6 +448,7 @@ test('stageRelease validates bound receipts, rejects incomplete/wrong/hook/unkno
   const tmp = mkdtempSync(join(tmpdir(), 'clec-stage-unit-'));
   try {
     const fullTargets = {};
+    const prebuiltTargets = {};
     for (const meta of TARGET_MATRIX) {
       const dir = join(tmp, 'bins', meta.tuple);
       mkdirSync(dir, { recursive: true });
@@ -413,22 +465,36 @@ test('stageRelease validates bound receipts, rejects incomplete/wrong/hook/unkno
       chmodSync(pubPath, 0o755);
       chmodSync(valPath, 0o755);
 
+      const artifactMap = {
+        clec: { bytes: clecBytes, binaryName: meta.binaryName },
+        clecPublish: { bytes: pubBytes, binaryName: meta.maintainerBinaries[0] },
+        clecValidate: { bytes: valBytes, binaryName: meta.maintainerBinaries[1] },
+      };
+
       const receiptPath = join(dir, 'build-receipt.json');
-      writeFileSync(
-        receiptPath,
-        JSON.stringify(
-          makeBoundReceipt(meta.tuple, {
-            clec: { bytes: clecBytes, binaryName: meta.binaryName },
-            clecPublish: { bytes: pubBytes, binaryName: meta.maintainerBinaries[0] },
-            clecValidate: { bytes: valBytes, binaryName: meta.maintainerBinaries[1] },
-          }),
-        ),
-      );
+      writeFileSync(receiptPath, JSON.stringify(makeBoundReceipt(meta.tuple, artifactMap)));
       fullTargets[meta.tuple] = {
         clec: clecPath,
         clecPublish: pubPath,
         clecValidate: valPath,
         buildReceipt: receiptPath,
+      };
+
+      const prebuiltReceiptPath = join(dir, 'prebuilt-receipt.json');
+      writeFileSync(
+        prebuiltReceiptPath,
+        JSON.stringify(
+          makeBoundReceipt(meta.tuple, artifactMap, {
+            mode: 'inspected-prebuilt',
+            declaredBuildCommand: 'cargo build --never-observed',
+          }),
+        ),
+      );
+      prebuiltTargets[meta.tuple] = {
+        clec: clecPath,
+        clecPublish: pubPath,
+        clecValidate: valPath,
+        buildReceipt: prebuiltReceiptPath,
       };
     }
 
@@ -443,11 +509,51 @@ test('stageRelease validates bound receipts, rejects incomplete/wrong/hook/unkno
     assert.equal(fullRes1.sha256sumsSha256, fullRes2.sha256sumsSha256);
 
     const fullInv = JSON.parse(readFileSync(join(fullOut1, 'inventory.json'), 'utf8'));
+    assert.equal(fullInv.schemaVersion, INVENTORY_SCHEMA_VERSION);
     assert.equal(fullInv.complete, true);
     assert.equal(fullInv.publishable, false);
     assert.equal(fullInv.targets['linux-x64'].executionEvidence.status, 'unverified');
     assert.equal(fullInv.targets['linux-x64'].structuralIdentity.containerFormat, 'elf-64');
     assert.equal(fullInv.targets['linux-x64'].structuralIdentity.testHooksIncluded, false);
+    assert.equal(fullInv.targets['linux-x64'].provenance.source.status, ESTABLISHED_SOURCE);
+
+    const fullProv = validateProvenanceDocument(
+      JSON.parse(readFileSync(join(fullOut1, 'provenance.json'), 'utf8')),
+    );
+    assert.equal(fullProv.provenanceClassification, 'controlled-executed-build');
+    assert.equal(fullProv.provenance.source.sourceCommit, DEFAULT_COMMIT);
+
+    const prebuiltFullInput = join(tmp, 'prebuilt-full.json');
+    writeFileSync(prebuiltFullInput, JSON.stringify({ targets: prebuiltTargets }));
+    const prebuiltFullOut = join(tmp, 'prebuilt-full-out');
+    const prebuiltRes = stageRelease({ input: prebuiltFullInput, output: prebuiltFullOut }, CLI_ROOT);
+    assert.equal(prebuiltRes.complete, true);
+    assert.equal(prebuiltRes.publishable, false);
+    const prebuiltProv = validateProvenanceDocument(
+      JSON.parse(readFileSync(join(prebuiltFullOut, 'provenance.json'), 'utf8')),
+    );
+    assert.equal(prebuiltProv.provenanceClassification, 'inspected-prebuilt');
+    assert.equal(prebuiltProv.provenance.source.status, NOT_VERIFIED_UNKNOWN);
+    assert.equal(prebuiltProv.provenance.buildInvocation.status, NOT_VERIFIED_UNKNOWN);
+
+    const mixedInput = join(tmp, 'mixed.json');
+    writeFileSync(
+      mixedInput,
+      JSON.stringify({
+        targets: {
+          ...fullTargets,
+          'win32-x64': prebuiltTargets['win32-x64'],
+        },
+      }),
+    );
+    const mixedOut = join(tmp, 'mixed-out');
+    stageRelease({ input: mixedInput, output: mixedOut }, CLI_ROOT);
+    const mixedProv = validateProvenanceDocument(
+      JSON.parse(readFileSync(join(mixedOut, 'provenance.json'), 'utf8')),
+    );
+    assert.equal(mixedProv.provenanceClassification, 'mixed-controlled-and-inspected-prebuilt');
+    assert.equal(mixedProv.provenance.source.status, NOT_VERIFIED_UNKNOWN);
+    assert.equal(mixedProv.provenance.buildInvocation.status, NOT_VERIFIED_UNKNOWN);
 
     const partialInput = join(tmp, 'partial.json');
     writeFileSync(
@@ -502,7 +608,7 @@ test('stageRelease validates bound receipts, rejects incomplete/wrong/hook/unkno
     const dirtyReceiptPath = join(tmp, 'dirty-receipt.json');
     const armTarget = fullTargets['darwin-arm64'];
     const dirtyReceipt = JSON.parse(readFileSync(armTarget.buildReceipt, 'utf8'));
-    dirtyReceipt.sourceDirty = true;
+    dirtyReceipt.provenance.source.sourceDirty = true;
     writeFileSync(dirtyReceiptPath, JSON.stringify(dirtyReceipt));
     const dirtyFull = {
       targets: { ...fullTargets, 'darwin-arm64': { ...armTarget, buildReceipt: dirtyReceiptPath } },
@@ -529,7 +635,12 @@ test('stageRelease validates bound receipts, rejects incomplete/wrong/hook/unkno
         makeBoundReceipt(
           'darwin-arm64',
           { clec: { bytes: hookBytes, binaryName: 'clec' } },
-          { features: ['test-hooks'], testHooksIncluded: true },
+          {
+            verifiedEmbeddedMetadata: {
+              features: ['test-hooks'],
+              testHooksIncluded: true,
+            },
+          },
         ),
       ),
     );
@@ -543,7 +654,7 @@ test('stageRelease validates bound receipts, rejects incomplete/wrong/hook/unkno
     const hookOut = join(tmp, 'hook-out');
     assert.throws(
       () => stageRelease({ input: hookInput, output: hookOut, allowPartial: true }, CLI_ROOT),
-      /testHooksIncluded must be false|test-hooks/,
+      /features must be empty|testHooksIncluded|test-hooks/,
     );
     assert.equal(existsSync(join(hookOut, 'clec-cli-1.0.0-dev.0.tgz')), false);
 
@@ -622,8 +733,10 @@ test(
           'cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins -j 2',
         hostBaseline: 'darwin-arm64',
       });
-      assert.equal(receipt.testHooksIncluded, false);
-      assert.deepEqual(receipt.features, []);
+      assert.equal(receipt.receiptKind, INSPECTED_PREBUILT_RECEIPT_KIND);
+      assert.equal(receipt.verifiedEmbeddedMetadata.testHooksIncluded, false);
+      assert.deepEqual(receipt.verifiedEmbeddedMetadata.features, []);
+      assert.equal(receipt.provenance.source.status, NOT_VERIFIED_UNKNOWN);
 
       const validInput = join(tmp, 'valid.json');
       writeFileSync(
@@ -883,6 +996,16 @@ path = "src/bin/clec-validate.rs"
     execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init minimal crate']);
     const headCommit = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 
+    const hasMsrv = (() => {
+      try {
+        execFileSync('rustc', ['+1.89.0', '--version'], { stdio: 'ignore' });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    const toolchain = hasMsrv ? '1.89.0' : null;
+
     const targetDir = join(tmp, 'target');
     const receiptPath = join(tmp, 'controlled-receipt.json');
     const receipt = captureBuildReceipt({
@@ -890,7 +1013,7 @@ path = "src/bin/clec-validate.rs"
       targetDir,
       repoRoot: repo,
       runBuild: true,
-      toolchain: '1.89.0',
+      toolchain,
       hostBaseline: `${hostMeta.tuple}-test`,
       out: receiptPath,
     });
@@ -971,7 +1094,7 @@ path = "src/bin/clec-validate.rs"
           targetDir,
           repoRoot: repo,
           runBuild: true,
-          toolchain: '1.89.0',
+          toolchain,
         }),
       /Source working tree changed during controlled build/,
     );
@@ -983,7 +1106,7 @@ path = "src/bin/clec-validate.rs"
         targetDir,
         repoRoot: repo,
         runBuild: true,
-        toolchain: '1.89.0',
+        toolchain,
       }),
     );
     assert.equal(existsSync(builtClec), false);
@@ -992,8 +1115,7 @@ path = "src/bin/clec-validate.rs"
   }
 });
 
-test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP ELFs, legacy receipt shapes, and promoted unknown provenance', async () => {
-  const { admitTargetArtifacts } = await import('../scripts/artifact-admission.mjs');
+test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP ELFs, legacy receipt shapes, and promoted unknown provenance', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'clec-union-boundary-'));
   try {
     for (const tuple of ['linux-x64', 'linux-arm64']) {
@@ -1005,40 +1127,9 @@ test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP 
         writeFileSync(binPath, binBytes);
         writeFileSync(
           receiptPath,
-          JSON.stringify({
-            schemaVersion: 2,
-            receiptKind: 'clec-inspected-prebuilt-receipt',
-            trustModel: 'unsigned-inspected-prebuilt-receipt',
-            packageName: PACKAGE_NAME,
-            packageVersion: PACKAGE_VERSION,
-            tuple: meta.tuple,
-            rustTarget: meta.rustTarget,
-            provenance: {
-              source: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
-              buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
-            },
-            captureObservation: {
-              observedGit: null,
-              declaredBuildCommand: null,
-              declaredHostBaseline: null,
-            },
-            verifiedEmbeddedMetadata: {
-              cargoLockSha256: DEFAULT_LOCK_SHA,
-              rustcVersion: DEFAULT_RUSTC,
-              profile: 'release',
-              features: [],
-              testHooksIncluded: false,
-            },
-            artifacts: {
-              clec: {
-                kind: 'clec',
-                binaryName: meta.binaryName,
-                bytes: binBytes.length,
-                sha256: sha256(binBytes),
-                embeddedMetadata: extractEmbeddedBuildIdentity(binBytes),
-              },
-            },
-          }),
+          JSON.stringify(
+            makeBoundReceipt(tuple, { clec: { bytes: binBytes, binaryName: meta.binaryName } }, { mode: 'inspected-prebuilt' }),
+          ),
         );
         assert.throws(
           () =>
@@ -1065,40 +1156,9 @@ test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP 
       writeFileSync(zeroPath, zeroLenElf);
       writeFileSync(
         zeroReceiptPath,
-        JSON.stringify({
-          schemaVersion: 2,
-          receiptKind: 'clec-inspected-prebuilt-receipt',
-          trustModel: 'unsigned-inspected-prebuilt-receipt',
-          packageName: PACKAGE_NAME,
-          packageVersion: PACKAGE_VERSION,
-          tuple: meta.tuple,
-          rustTarget: meta.rustTarget,
-          provenance: {
-            source: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
-            buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
-          },
-          captureObservation: {
-            observedGit: null,
-            declaredBuildCommand: null,
-            declaredHostBaseline: null,
-          },
-          verifiedEmbeddedMetadata: {
-            cargoLockSha256: DEFAULT_LOCK_SHA,
-            rustcVersion: DEFAULT_RUSTC,
-            profile: 'release',
-            features: [],
-            testHooksIncluded: false,
-          },
-          artifacts: {
-            clec: {
-              kind: 'clec',
-              binaryName: meta.binaryName,
-              bytes: zeroLenElf.length,
-              sha256: sha256(zeroLenElf),
-              embeddedMetadata: id,
-            },
-          },
-        }),
+        JSON.stringify(
+          makeBoundReceipt(tuple, { clec: { bytes: zeroLenElf, binaryName: meta.binaryName } }, { mode: 'inspected-prebuilt' }),
+        ),
       );
       assert.throws(
         () =>
@@ -1118,41 +1178,23 @@ test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP 
     const legacyReceiptPath = join(tmp, 'legacy-v1.json');
     writeFileSync(
       legacyReceiptPath,
-      JSON.stringify(makeBoundReceipt('darwin-arm64', { clec: { bytes: macBytes, binaryName: 'clec' } })),
-    );
-    assert.throws(
-      () =>
-        admitTargetArtifacts(
-          macMeta,
-          { clec: macPath, buildReceipt: legacyReceiptPath },
-          { packageVersion: PACKAGE_VERSION, allowPartial: true },
-        ),
-      /schemaVersion|legacy|clec-inspected-prebuilt-receipt/,
-    );
-
-    const fakePromotedReceiptPath = join(tmp, 'fake-promoted.json');
-    writeFileSync(
-      fakePromotedReceiptPath,
       JSON.stringify({
-        schemaVersion: 2,
-        receiptKind: 'clec-inspected-prebuilt-receipt',
-        trustModel: 'unsigned-inspected-prebuilt-receipt',
+        schemaVersion: 1,
+        receiptKind: 'clec-build-receipt',
+        trustModel: 'unsigned-local-build-receipt',
         packageName: PACKAGE_NAME,
         packageVersion: PACKAGE_VERSION,
         tuple: 'darwin-arm64',
         rustTarget: 'aarch64-apple-darwin',
-        provenance: {
-          source: { status: 'established_local_git_checkout', sourceCommit: DEFAULT_COMMIT, sourceDirty: false },
-          buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
-        },
-        captureObservation: { observedGit: null, declaredBuildCommand: null, declaredHostBaseline: null },
-        verifiedEmbeddedMetadata: {
-          cargoLockSha256: DEFAULT_LOCK_SHA,
-          rustcVersion: DEFAULT_RUSTC,
-          profile: 'release',
-          features: [],
-          testHooksIncluded: false,
-        },
+        sourceCommit: DEFAULT_COMMIT,
+        sourceDirty: false,
+        cargoLockSha256: DEFAULT_LOCK_SHA,
+        rustcVersion: DEFAULT_RUSTC,
+        profile: 'release',
+        features: [],
+        testHooksIncluded: false,
+        buildCommand: 'fake',
+        hostBaseline: 'darwin-arm64',
         artifacts: {
           clec: {
             kind: 'clec',
@@ -1168,6 +1210,28 @@ test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP 
       () =>
         admitTargetArtifacts(
           macMeta,
+          { clec: macPath, buildReceipt: legacyReceiptPath },
+          { packageVersion: PACKAGE_VERSION, allowPartial: true },
+        ),
+      /Legacy unverified build receipt shape is unsupported/,
+    );
+
+    const fakePromotedReceiptPath = join(tmp, 'fake-promoted.json');
+    const fakePromoted = makeBoundReceipt(
+      'darwin-arm64',
+      { clec: { bytes: macBytes, binaryName: 'clec' } },
+      { mode: 'inspected-prebuilt' },
+    );
+    fakePromoted.provenance.source = {
+      status: ESTABLISHED_SOURCE,
+      sourceCommit: DEFAULT_COMMIT,
+      sourceDirty: false,
+    };
+    writeFileSync(fakePromotedReceiptPath, JSON.stringify(fakePromoted));
+    assert.throws(
+      () =>
+        admitTargetArtifacts(
+          macMeta,
           { clec: macPath, buildReceipt: fakePromotedReceiptPath },
           { packageVersion: PACKAGE_VERSION, allowPartial: true },
         ),
@@ -1177,17 +1241,42 @@ test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP 
     const badInvPkg = join(tmp, 'bad-inv-pkg');
     makeFakeStagingPackage(badInvPkg, 'darwin-arm64', macBytes);
     const badInv = JSON.parse(readFileSync(join(badInvPkg, 'inventory.json'), 'utf8'));
-    badInv.schemaVersion = 2;
     badInv.targets['darwin-arm64'].provenance = {
       source: { status: 'unknown', reason: 'invalid' },
-      buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+      buildInvocation: { status: NOT_VERIFIED_UNKNOWN, reason: 'inspected_prebuilt_without_controlled_build' },
     };
     writeFileSync(join(badInvPkg, 'inventory.json'), JSON.stringify(badInv));
     assert.throws(
       () => installFromRoot(badInvPkg, { platform: 'darwin', arch: 'arm64' }),
-      /provenance|status/,
+      /must be 'established_local_git_checkout' or 'not_verified_unknown'/,
     );
     assert.equal(readFileSync(join(badInvPkg, 'bin', 'clec.exe'))[0], 0);
+
+    assert.throws(
+      () =>
+        validateProvenanceDocument({
+          schemaVersion: 2,
+          packageName: PACKAGE_NAME,
+          packageVersion: PACKAGE_VERSION,
+          complete: false,
+          publishable: false,
+          provenanceClassification: 'inspected-prebuilt',
+          trustBoundary: 'test',
+          verifiedEmbeddedMetadata: {
+            cargoLockSha256: DEFAULT_LOCK_SHA,
+            rustcVersion: DEFAULT_RUSTC,
+            profile: 'release',
+            features: [],
+            testHooksIncluded: false,
+          },
+          provenance: {
+            source: { status: ESTABLISHED_SOURCE, sourceCommit: DEFAULT_COMMIT, sourceDirty: false },
+            buildInvocation: { status: NOT_VERIFIED_UNKNOWN, reason: 'inspected_prebuilt_without_controlled_build' },
+          },
+          targets: {},
+        }),
+      /must not promote top-level source or buildInvocation/,
+    );
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

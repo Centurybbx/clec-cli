@@ -5,6 +5,19 @@ import { NATIVE_CRATE_NAME, PACKAGE_NAME, PACKAGE_VERSION } from './targets.mjs'
 
 export const IDENTITY_PREFIX = Buffer.from('\0CLEC_BUILD_IDENTITY_V1\0', 'utf8');
 export const IDENTITY_SUFFIX = Buffer.from('\0END_CLEC_BUILD_IDENTITY_V1\0', 'utf8');
+export const RECEIPT_SCHEMA_VERSION = 2;
+export const INVENTORY_SCHEMA_VERSION = 2;
+export const PROVENANCE_SCHEMA_VERSION = 2;
+export const INSPECTED_PREBUILT_RECEIPT_KIND = 'clec-inspected-prebuilt-receipt';
+export const CONTROLLED_BUILD_RECEIPT_KIND = 'clec-controlled-build-receipt';
+export const NOT_VERIFIED_UNKNOWN = 'not_verified_unknown';
+export const ESTABLISHED_SOURCE = 'established_local_git_checkout';
+export const ESTABLISHED_BUILD = 'established_local_cargo_execution';
+export const PROVENANCE_CLASSIFICATIONS = new Set([
+  'controlled-executed-build',
+  'inspected-prebuilt',
+  'mixed-controlled-and-inspected-prebuilt',
+]);
 
 const VALID_ARTIFACT_KINDS = new Set(['clec', 'clec-publish', 'clec-validate', 'clec_test_fixture']);
 const HEX_40 = /^[0-9a-f]{40}$/;
@@ -355,15 +368,198 @@ function identitiesEqual(a, b) {
   );
 }
 
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function parseSourceProvenance(raw, fieldName = 'provenance.source') {
+  if (!isPlainObject(raw)) {
+    throw new Error(`${fieldName} must be an object.`);
+  }
+  if (raw.status === NOT_VERIFIED_UNKNOWN) {
+    if ('sourceCommit' in raw || 'sourceDirty' in raw) {
+      throw new Error(`${fieldName} with status '${NOT_VERIFIED_UNKNOWN}' must not include sourceCommit or sourceDirty.`);
+    }
+    return {
+      status: NOT_VERIFIED_UNKNOWN,
+      reason: assertNonEmptyKnownString(raw.reason, `${fieldName}.reason`),
+    };
+  }
+  if (raw.status === ESTABLISHED_SOURCE) {
+    if (typeof raw.sourceCommit !== 'string' || !HEX_40.test(raw.sourceCommit)) {
+      throw new Error(`${fieldName}.sourceCommit must be a 40-char lowercase hex SHA: '${raw.sourceCommit}'.`);
+    }
+    if (typeof raw.sourceDirty !== 'boolean') {
+      throw new Error(`${fieldName}.sourceDirty must be a boolean.`);
+    }
+    return {
+      status: ESTABLISHED_SOURCE,
+      sourceCommit: raw.sourceCommit,
+      sourceDirty: raw.sourceDirty,
+    };
+  }
+  throw new Error(`${fieldName}.status must be '${ESTABLISHED_SOURCE}' or '${NOT_VERIFIED_UNKNOWN}', got '${raw.status}'.`);
+}
+
+export function parseBuildInvocationProvenance(
+  raw,
+  fieldName = 'provenance.buildInvocation',
+  { requireArgv = true } = {},
+) {
+  if (!isPlainObject(raw)) {
+    throw new Error(`${fieldName} must be an object.`);
+  }
+  if (raw.status === NOT_VERIFIED_UNKNOWN) {
+    if ('executable' in raw || 'argv' in raw || 'command' in raw || 'hostBaseline' in raw) {
+      throw new Error(
+        `${fieldName} with status '${NOT_VERIFIED_UNKNOWN}' must not include executable, argv, command, or hostBaseline.`,
+      );
+    }
+    return {
+      status: NOT_VERIFIED_UNKNOWN,
+      reason: assertNonEmptyKnownString(raw.reason, `${fieldName}.reason`),
+    };
+  }
+  if (raw.status === ESTABLISHED_BUILD) {
+    const command = assertNonEmptyKnownString(raw.command, `${fieldName}.command`);
+    const hostBaseline = assertNonEmptyKnownString(raw.hostBaseline, `${fieldName}.hostBaseline`);
+    if (requireArgv) {
+      if (raw.executable !== 'cargo') {
+        throw new Error(`${fieldName}.executable must be 'cargo', got '${raw.executable}'.`);
+      }
+      if (
+        !Array.isArray(raw.argv) ||
+        raw.argv.length === 0 ||
+        !raw.argv.every((arg) => typeof arg === 'string' && arg.length > 0 && arg.trim().toLowerCase() !== 'unknown')
+      ) {
+        throw new Error(`${fieldName}.argv must be a non-empty array of known command arguments.`);
+      }
+      const expectedCommand = ['cargo', ...raw.argv].join(' ');
+      if (command !== expectedCommand) {
+        throw new Error(`${fieldName}.command must match executed cargo argv.`);
+      }
+      return {
+        status: ESTABLISHED_BUILD,
+        executable: 'cargo',
+        argv: [...raw.argv],
+        command,
+        hostBaseline,
+      };
+    }
+    return {
+      status: ESTABLISHED_BUILD,
+      command,
+      hostBaseline,
+    };
+  }
+  throw new Error(`${fieldName}.status must be '${ESTABLISHED_BUILD}' or '${NOT_VERIFIED_UNKNOWN}', got '${raw.status}'.`);
+}
+
+export function parseTargetProvenance(raw, fieldName = 'provenance', options = {}) {
+  if (!isPlainObject(raw)) {
+    throw new Error(`${fieldName} must be an object.`);
+  }
+  return {
+    source: parseSourceProvenance(raw.source, `${fieldName}.source`),
+    buildInvocation: parseBuildInvocationProvenance(raw.buildInvocation, `${fieldName}.buildInvocation`, options),
+  };
+}
+
+function parseCaptureObservation(raw) {
+  if (!isPlainObject(raw)) {
+    throw new Error('Inspected prebuilt receipt must contain a captureObservation object.');
+  }
+  let observedGit = null;
+  if (raw.observedGit !== null && raw.observedGit !== undefined) {
+    if (!isPlainObject(raw.observedGit)) {
+      throw new Error('captureObservation.observedGit must be null or an object.');
+    }
+    if (typeof raw.observedGit.commit !== 'string' || !HEX_40.test(raw.observedGit.commit)) {
+      throw new Error('captureObservation.observedGit.commit must be a 40-char lowercase hex SHA.');
+    }
+    if (typeof raw.observedGit.dirty !== 'boolean') {
+      throw new Error('captureObservation.observedGit.dirty must be a boolean.');
+    }
+    observedGit = {
+      commit: raw.observedGit.commit,
+      dirty: raw.observedGit.dirty,
+    };
+  }
+  const declaredBuildCommand =
+    raw.declaredBuildCommand === null || raw.declaredBuildCommand === undefined
+      ? null
+      : assertNonEmptyKnownString(raw.declaredBuildCommand, 'captureObservation.declaredBuildCommand');
+  const declaredHostBaseline =
+    raw.declaredHostBaseline === null || raw.declaredHostBaseline === undefined
+      ? null
+      : assertNonEmptyKnownString(raw.declaredHostBaseline, 'captureObservation.declaredHostBaseline');
+  return {
+    observedGit,
+    declaredBuildCommand,
+    declaredHostBaseline,
+  };
+}
+
+function parseVerifiedEmbeddedMetadata(raw, expectedCargoLockSha256 = null) {
+  if (!isPlainObject(raw)) {
+    throw new Error('verifiedEmbeddedMetadata must be an object.');
+  }
+  if (typeof raw.cargoLockSha256 !== 'string' || !HEX_64.test(raw.cargoLockSha256)) {
+    throw new Error('verifiedEmbeddedMetadata.cargoLockSha256 must be a 64-char lowercase hex SHA-256.');
+  }
+  if (expectedCargoLockSha256 && raw.cargoLockSha256 !== expectedCargoLockSha256) {
+    throw new Error(
+      `verifiedEmbeddedMetadata.cargoLockSha256 mismatch: expected ${expectedCargoLockSha256}, got ${raw.cargoLockSha256}.`,
+    );
+  }
+  const rustcVersion = assertNonEmptyKnownString(
+    raw.rustcVersion,
+    'verifiedEmbeddedMetadata.rustcVersion',
+  );
+  if (!rustcVersion.startsWith('rustc ')) {
+    throw new Error(
+      `verifiedEmbeddedMetadata.rustcVersion must be a real rustc --version string, got '${rustcVersion}'.`,
+    );
+  }
+  if (raw.profile !== 'release') {
+    throw new Error(`verifiedEmbeddedMetadata.profile must be 'release', got '${raw.profile}'.`);
+  }
+  if (!Array.isArray(raw.features) || raw.features.length !== 0) {
+    throw new Error(
+      `verifiedEmbeddedMetadata.features must be empty for release staging, got ${JSON.stringify(raw.features)}.`,
+    );
+  }
+  if (raw.testHooksIncluded !== false) {
+    throw new Error('verifiedEmbeddedMetadata.testHooksIncluded must be false for release staging.');
+  }
+  return {
+    cargoLockSha256: raw.cargoLockSha256,
+    rustcVersion,
+    profile: raw.profile,
+    features: [],
+    testHooksIncluded: false,
+  };
+}
+
 export function validateBuildReceipt(receipt, targetMeta, expectedPackageVersion, expectedCargoLockSha256 = null) {
+  if (!isPlainObject(receipt)) {
+    throw new Error('Build receipt must be a JSON object.');
+  }
   if (
-    typeof receipt !== 'object' ||
-    receipt === null ||
-    receipt.schemaVersion !== 1 ||
-    receipt.receiptKind !== 'clec-build-receipt' ||
-    receipt.trustModel !== 'unsigned-local-build-receipt'
+    'sourceCommit' in receipt ||
+    'sourceDirty' in receipt ||
+    'buildCommand' in receipt ||
+    'hostBaseline' in receipt ||
+    receipt.receiptKind === 'clec-build-receipt'
   ) {
-    throw new Error('Build receipt must declare schemaVersion=1, receiptKind="clec-build-receipt", trustModel="unsigned-local-build-receipt".');
+    throw new Error(
+      `Legacy unverified build receipt shape is unsupported; expected schemaVersion=${RECEIPT_SCHEMA_VERSION} '${INSPECTED_PREBUILT_RECEIPT_KIND}' or '${CONTROLLED_BUILD_RECEIPT_KIND}'.`,
+    );
+  }
+  if (receipt.schemaVersion !== RECEIPT_SCHEMA_VERSION) {
+    throw new Error(
+      `Build receipt schemaVersion must be ${RECEIPT_SCHEMA_VERSION}, got '${receipt.schemaVersion}'.`,
+    );
   }
   if (receipt.packageName !== PACKAGE_NAME || receipt.packageVersion !== expectedPackageVersion) {
     throw new Error(
@@ -375,39 +571,65 @@ export function validateBuildReceipt(receipt, targetMeta, expectedPackageVersion
       `Build receipt target mismatch: expected ${targetMeta.tuple}/${targetMeta.rustTarget}, got ${receipt.tuple}/${receipt.rustTarget}.`,
     );
   }
-  if (typeof receipt.sourceCommit !== 'string' || !HEX_40.test(receipt.sourceCommit)) {
-    throw new Error(`Build receipt sourceCommit must be a 40-char lowercase hex SHA: '${receipt.sourceCommit}'.`);
-  }
-  if (typeof receipt.sourceDirty !== 'boolean') {
-    throw new Error('Build receipt must include boolean sourceDirty.');
-  }
-  if (typeof receipt.cargoLockSha256 !== 'string' || !HEX_64.test(receipt.cargoLockSha256)) {
-    throw new Error('Build receipt cargoLockSha256 must be a 64-char lowercase hex SHA-256.');
-  }
-  if (expectedCargoLockSha256 && receipt.cargoLockSha256 !== expectedCargoLockSha256) {
-    throw new Error(
-      `Build receipt cargoLockSha256 mismatch: expected ${expectedCargoLockSha256}, got ${receipt.cargoLockSha256}.`,
-    );
-  }
-  const rustcVersion = assertNonEmptyKnownString(receipt.rustcVersion, 'buildReceipt.rustcVersion');
-  if (!rustcVersion.startsWith('rustc ')) {
-    throw new Error(`Build receipt rustcVersion must be a real rustc --version string, got '${rustcVersion}'.`);
-  }
-  assertNonEmptyKnownString(receipt.buildCommand, 'buildReceipt.buildCommand');
-  assertNonEmptyKnownString(receipt.hostBaseline, 'buildReceipt.hostBaseline');
-  if (receipt.profile !== 'release') {
-    throw new Error(`Build receipt profile must be 'release', got '${receipt.profile}'.`);
-  }
-  if (!Array.isArray(receipt.features) || receipt.features.length !== 0) {
-    throw new Error(`Build receipt features must be empty for release staging, got ${JSON.stringify(receipt.features)}.`);
-  }
-  if (receipt.testHooksIncluded !== false) {
-    throw new Error('Build receipt testHooksIncluded must be false for release staging.');
-  }
+  const verifiedEmbeddedMetadata = parseVerifiedEmbeddedMetadata(
+    receipt.verifiedEmbeddedMetadata,
+    expectedCargoLockSha256,
+  );
   if (typeof receipt.artifacts !== 'object' || receipt.artifacts === null || !receipt.artifacts.clec) {
     throw new Error('Build receipt must contain artifacts.clec binding.');
   }
-  return receipt;
+
+  const provenance = parseTargetProvenance(receipt.provenance, 'buildReceipt.provenance');
+
+  if (receipt.receiptKind === INSPECTED_PREBUILT_RECEIPT_KIND) {
+    if (receipt.trustModel !== 'unsigned-inspected-prebuilt-receipt') {
+      throw new Error(
+        `Inspected prebuilt receipt trustModel must be 'unsigned-inspected-prebuilt-receipt', got '${receipt.trustModel}'.`,
+      );
+    }
+    if (
+      provenance.source.status !== NOT_VERIFIED_UNKNOWN ||
+      provenance.buildInvocation.status !== NOT_VERIFIED_UNKNOWN
+    ) {
+      throw new Error(
+        `Inspected prebuilt receipt must keep provenance.source and provenance.buildInvocation as '${NOT_VERIFIED_UNKNOWN}'.`,
+      );
+    }
+    return {
+      ...receipt,
+      provenance,
+      captureObservation: parseCaptureObservation(receipt.captureObservation),
+      verifiedEmbeddedMetadata,
+    };
+  }
+
+  if (receipt.receiptKind === CONTROLLED_BUILD_RECEIPT_KIND) {
+    if (receipt.trustModel !== 'unsigned-local-controlled-build-receipt') {
+      throw new Error(
+        `Controlled build receipt trustModel must be 'unsigned-local-controlled-build-receipt', got '${receipt.trustModel}'.`,
+      );
+    }
+    if ('captureObservation' in receipt && receipt.captureObservation !== undefined) {
+      throw new Error('Controlled build receipt must not contain captureObservation.');
+    }
+    if (
+      provenance.source.status !== ESTABLISHED_SOURCE ||
+      provenance.buildInvocation.status !== ESTABLISHED_BUILD
+    ) {
+      throw new Error(
+        `Controlled build receipt must establish provenance.source ('${ESTABLISHED_SOURCE}') and provenance.buildInvocation ('${ESTABLISHED_BUILD}').`,
+      );
+    }
+    return {
+      ...receipt,
+      provenance,
+      verifiedEmbeddedMetadata,
+    };
+  }
+
+  throw new Error(
+    `Build receipt receiptKind must be '${INSPECTED_PREBUILT_RECEIPT_KIND}' or '${CONTROLLED_BUILD_RECEIPT_KIND}', got '${receipt.receiptKind}'.`,
+  );
 }
 
 function normalizeExecutionEvidence(raw) {
@@ -450,14 +672,14 @@ function admitSingleBinary(slotKey, binaryPath, expectedKind, expectedBinaryName
   const embedded = extractEmbeddedBuildIdentity(bytes);
   assertReleaseBuildIdentity(embedded, expectedKind, expectedPackageVersion, targetMeta.rustTarget);
 
-  if (embedded.rustcVersion !== receipt.rustcVersion) {
+  if (embedded.rustcVersion !== receipt.verifiedEmbeddedMetadata.rustcVersion) {
     throw new Error(
-      `Compiler mismatch for ${targetMeta.tuple}.${slotKey}: binary embedded '${embedded.rustcVersion}', receipt declared '${receipt.rustcVersion}'.`,
+      `Compiler mismatch for ${targetMeta.tuple}.${slotKey}: binary embedded '${embedded.rustcVersion}', receipt declared '${receipt.verifiedEmbeddedMetadata.rustcVersion}'.`,
     );
   }
-  if (embedded.cargoLockSha256 !== receipt.cargoLockSha256) {
+  if (embedded.cargoLockSha256 !== receipt.verifiedEmbeddedMetadata.cargoLockSha256) {
     throw new Error(
-      `Cargo.lock SHA-256 mismatch for ${targetMeta.tuple}.${slotKey}: binary embedded '${embedded.cargoLockSha256}', receipt declared '${receipt.cargoLockSha256}'.`,
+      `Cargo.lock SHA-256 mismatch for ${targetMeta.tuple}.${slotKey}: binary embedded '${embedded.cargoLockSha256}', receipt declared '${receipt.verifiedEmbeddedMetadata.cargoLockSha256}'.`,
     );
   }
 
@@ -518,7 +740,11 @@ export function admitTargetArtifacts(targetMeta, supplied, options) {
     options.packageVersion,
     options.expectedCargoLockSha256 ?? null,
   );
-  if (!options.allowPartial && receipt.sourceDirty) {
+  if (
+    !options.allowPartial &&
+    receipt.provenance.source.status === ESTABLISHED_SOURCE &&
+    receipt.provenance.source.sourceDirty
+  ) {
     throw new Error(
       `Refusing production staging from dirty git working tree for '${targetMeta.tuple}'.`,
     );
@@ -584,15 +810,13 @@ export function admitTargetArtifacts(targetMeta, supplied, options) {
 
 export function validateInventoryHeader(inventory) {
   if (
-    typeof inventory !== 'object' ||
-    inventory === null ||
-    inventory.schemaVersion !== 1 ||
+    !isPlainObject(inventory) ||
+    inventory.schemaVersion !== INVENTORY_SCHEMA_VERSION ||
     inventory.packageName !== PACKAGE_NAME ||
     inventory.packageVersion !== PACKAGE_VERSION ||
     typeof inventory.complete !== 'boolean' ||
-    typeof inventory.publishable !== 'boolean' ||
-    typeof inventory.targets !== 'object' ||
-    inventory.targets === null
+    inventory.publishable !== false ||
+    !isPlainObject(inventory.targets)
   ) {
     throw new Error('Invalid inventory.json header or version mismatch.');
   }
@@ -644,4 +868,59 @@ export function validateInventoryTargetEntry(entry, targetMeta) {
       throw new Error(`Invalid structuralIdentity metadata for tuple '${targetMeta.tuple}'.`);
     }
   }
+  parseTargetProvenance(entry.provenance, `inventory.targets['${targetMeta.tuple}'].provenance`);
+}
+
+export function validateProvenanceDocument(doc) {
+  if (
+    !isPlainObject(doc) ||
+    doc.schemaVersion !== PROVENANCE_SCHEMA_VERSION ||
+    doc.packageName !== PACKAGE_NAME ||
+    doc.packageVersion !== PACKAGE_VERSION ||
+    typeof doc.complete !== 'boolean' ||
+    doc.publishable !== false ||
+    !PROVENANCE_CLASSIFICATIONS.has(doc.provenanceClassification) ||
+    !isPlainObject(doc.targets)
+  ) {
+    throw new Error('Invalid provenance.json header or classification.');
+  }
+  if ('sourceCommit' in doc || 'sourceDirty' in doc || 'buildCommand' in doc || 'hostBaseline' in doc) {
+    throw new Error('provenance.json must not emit legacy top-level unverified provenance fields.');
+  }
+  assertNonEmptyKnownString(doc.trustBoundary, 'provenance.trustBoundary');
+  const embedded = doc.verifiedEmbeddedMetadata;
+  if (
+    !isPlainObject(embedded) ||
+    typeof embedded.cargoLockSha256 !== 'string' ||
+    !HEX_64.test(embedded.cargoLockSha256) ||
+    embedded.profile !== 'release' ||
+    !Array.isArray(embedded.features) ||
+    embedded.features.length !== 0 ||
+    embedded.testHooksIncluded !== false
+  ) {
+    throw new Error('Invalid provenance.json verifiedEmbeddedMetadata.');
+  }
+  assertNonEmptyKnownString(embedded.rustcVersion, 'provenance.verifiedEmbeddedMetadata.rustcVersion');
+  const topProvenance = parseTargetProvenance(doc.provenance, 'provenance.provenance', {
+    requireArgv: false,
+  });
+  if (doc.provenanceClassification === 'controlled-executed-build') {
+    if (
+      topProvenance.source.status !== ESTABLISHED_SOURCE ||
+      topProvenance.buildInvocation.status !== ESTABLISHED_BUILD
+    ) {
+      throw new Error('controlled-executed-build provenance must establish source and buildInvocation.');
+    }
+  } else if (
+    topProvenance.source.status !== NOT_VERIFIED_UNKNOWN ||
+    topProvenance.buildInvocation.status !== NOT_VERIFIED_UNKNOWN
+  ) {
+    throw new Error(`${doc.provenanceClassification} provenance must not promote top-level source or buildInvocation.`);
+  }
+  for (const [tuple, entry] of Object.entries(doc.targets)) {
+    if (isPlainObject(entry) && entry.status === 'present') {
+      parseTargetProvenance(entry.provenance, `provenance.targets['${tuple}'].provenance`);
+    }
+  }
+  return doc;
 }
