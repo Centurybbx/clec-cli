@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +16,14 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_capacity as cc
 import semantic_compare as sc
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class CaptureCapacityTests(unittest.TestCase):
@@ -167,11 +177,336 @@ class CaptureCapacityTests(unittest.TestCase):
             make_db(db_bad, reverse_map=False, alter_posting=True)
 
             eq_res = sc.compare_databases(db_a, db_b)
-            self.assertTrue(eq_res["semanticallyEqual"], eq_res["mismatches"])
+            self.assertTrue(eq_res["contentEqual"], eq_res.get("contentMismatches"))
+            self.assertFalse(eq_res["usableSemanticEquivalence"])
+            self.assertFalse(eq_res["semanticallyEqual"])
+            self.assertEqual(eq_res["verdict"], "content_only_validity_inconclusive")
+            self.assertEqual(eq_res["structuralValidity"]["left"]["status"], "inconclusive")
+            self.assertEqual(eq_res["structuralValidity"]["right"]["status"], "inconclusive")
 
             bad_res = sc.compare_databases(db_a, db_bad)
+            self.assertFalse(bad_res["contentEqual"])
+            self.assertFalse(bad_res["usableSemanticEquivalence"])
             self.assertFalse(bad_res["semanticallyEqual"])
-            self.assertEqual([m["section"] for m in bad_res["mismatches"]], ["ftsPostings"])
+            self.assertEqual([m["section"] for m in bad_res["contentMismatches"]], ["ftsPostings"])
+
+    def test_semantic_compare_requires_native_validity_and_rejects_fts_shadow_corruptions_and_stale_receipts(
+        self,
+    ) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        pub_bin = repo_root / "native" / "target" / "release" / "clec-publish"
+        clec_bin = repo_root / "native" / "target" / "release" / "clec"
+        val_bin = repo_root / "native" / "target" / "release" / "clec-validate"
+        sem_script = Path(__file__).resolve().parent / "semantic_compare.py"
+        self.assertTrue(val_bin.is_file(), f"missing clec-validate binary: {val_bin}")
+
+        with tempfile.TemporaryDirectory(prefix="clec-sem-native-") as tmp_str:
+            tmp = Path(tmp_str)
+            ws = tmp / "ws"
+            ws.mkdir()
+            (ws / "a.txt").write_text("0050與QQQ投資討論\n每年4%提領原則\n", encoding="utf-8")
+            (ws / "b.txt").write_text("退休生活費規劃與資產配置\n保留適當現金緩衝\n", encoding="utf-8")
+            intake = tmp / "intake.json"
+            intake.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "works": [
+                            {"key": "w1", "title": "Work 1"},
+                            {"key": "w2", "title": "Work 2"},
+                        ],
+                        "sources": [
+                            {
+                                "work": "w1",
+                                "path": "a.txt",
+                                "title": "A",
+                                "role": "document",
+                                "attribution": "authored_fixture",
+                                "quality": "fixture",
+                                "status": "ready",
+                            },
+                            {
+                                "work": "w2",
+                                "path": "b.txt",
+                                "title": "B",
+                                "role": "document",
+                                "attribution": "authored_fixture",
+                                "quality": "fixture",
+                                "status": "ready",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rel = tmp / "rel"
+            subprocess.run(
+                [str(pub_bin), "--workspace", str(ws), "--intake", str(intake), "--output", str(rel)],
+                check=True,
+                capture_output=True,
+            )
+            manifest = json.loads((rel / "manifest.json").read_text(encoding="utf-8"))
+            data_dir = tmp / "data"
+            subprocess.run(
+                [str(clec_bin), "--data-dir", str(data_dir), "sync", "--manifest", str(rel / "manifest.json")],
+                check=True,
+                capture_output=True,
+            )
+            clean_db = data_dir / f"{manifest['sha256']}.sqlite"
+            clean_sha = _sha256_file(clean_db)
+
+            vacuumed_db = tmp / "vacuumed.sqlite"
+            shutil.copy2(clean_db, vacuumed_db)
+            with sqlite3.connect(vacuumed_db) as conn:
+                conn.execute("PRAGMA page_size=8192")
+                conn.execute("VACUUM")
+            vac_sha = _sha256_file(vacuumed_db)
+            self.assertNotEqual(clean_sha, vac_sha)
+
+            bad_data_db = tmp / "bad_search_data.sqlite"
+            shutil.copy2(clean_db, bad_data_db)
+            with sqlite3.connect(bad_data_db) as conn:
+                conn.execute("UPDATE search_data SET block=X'000000' WHERE id=1")
+                conn.commit()
+            bad_data_sha = _sha256_file(bad_data_db)
+
+            bad_docsize_db = tmp / "bad_search_docsize.sqlite"
+            shutil.copy2(clean_db, bad_docsize_db)
+            with sqlite3.connect(bad_docsize_db) as conn:
+                conn.execute("UPDATE search_docsize SET sz=X'0000' WHERE id=1")
+                conn.commit()
+            bad_docsize_sha = _sha256_file(bad_docsize_db)
+
+            left_receipt = tmp / "left-receipt.json"
+            right_receipt = tmp / "right-receipt.json"
+            ok_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--write-left-receipt",
+                    str(left_receipt),
+                    "--write-right-receipt",
+                    str(right_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ok_proc.returncode, 0, ok_proc.stderr)
+            ok_out = json.loads(ok_proc.stdout)
+            self.assertTrue(ok_out["contentEqual"])
+            self.assertTrue(ok_out["usableSemanticEquivalence"])
+            self.assertTrue(ok_out["semanticallyEqual"])
+            self.assertEqual(ok_out["verdict"], "usable_semantic_equivalence")
+            self.assertTrue(ok_out["structuralValidity"]["bothValid"])
+            self.assertEqual(_sha256_file(clean_db), clean_sha)
+            self.assertEqual(_sha256_file(vacuumed_db), vac_sha)
+
+            for bad_db, bad_sha in ((bad_data_db, bad_data_sha), (bad_docsize_db, bad_docsize_sha)):
+                bad_proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(sem_script),
+                        "--left",
+                        str(clean_db),
+                        "--right",
+                        str(bad_db),
+                        "--validator",
+                        str(val_bin),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(bad_proc.returncode, 0)
+                bad_out = json.loads(bad_proc.stdout)
+                self.assertTrue(bad_out["contentEqual"])
+                self.assertFalse(bad_out["usableSemanticEquivalence"])
+                self.assertFalse(bad_out["semanticallyEqual"])
+                self.assertEqual(bad_out["verdict"], "structural_validation_failed")
+                self.assertEqual(bad_out["structuralValidity"]["left"]["status"], "valid")
+                self.assertEqual(bad_out["structuralValidity"]["right"]["status"], "invalid")
+                self.assertEqual(_sha256_file(clean_db), clean_sha)
+                self.assertEqual(_sha256_file(bad_db), bad_sha)
+
+            content_only_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--content-only",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(content_only_proc.returncode, 0)
+            co_out = json.loads(content_only_proc.stdout)
+            self.assertTrue(co_out["contentEqual"])
+            self.assertFalse(co_out["usableSemanticEquivalence"])
+            self.assertFalse(co_out["semanticallyEqual"])
+            self.assertEqual(co_out["verdict"], "content_only_validity_inconclusive")
+
+            reuse_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--left-receipt",
+                    str(left_receipt),
+                    "--right-receipt",
+                    str(right_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(reuse_proc.returncode, 0, reuse_proc.stderr)
+
+            swapped_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--left-receipt",
+                    str(left_receipt),
+                    "--right-receipt",
+                    str(left_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(swapped_proc.returncode, 0)
+            swapped_out = json.loads(swapped_proc.stdout)
+            self.assertFalse(swapped_out["usableSemanticEquivalence"])
+            self.assertFalse(swapped_out["semanticallyEqual"])
+            self.assertEqual(swapped_out["structuralValidity"]["right"]["status"], "stale_receipt")
+
+            stale_bin_receipt = tmp / "stale-bin-receipt.json"
+            r_obj = json.loads(right_receipt.read_text(encoding="utf-8"))
+            r_obj["binarySha256"] = "0" * 64
+            stale_bin_receipt.write_text(json.dumps(r_obj), encoding="utf-8")
+            stale_bin_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--left-receipt",
+                    str(left_receipt),
+                    "--right-receipt",
+                    str(stale_bin_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(stale_bin_proc.returncode, 0)
+            stale_bin_out = json.loads(stale_bin_proc.stdout)
+            self.assertFalse(stale_bin_out["usableSemanticEquivalence"])
+            self.assertEqual(stale_bin_out["structuralValidity"]["right"]["status"], "stale_receipt")
+
+            stale_git_receipt = tmp / "stale-git-receipt.json"
+            g_obj = json.loads(right_receipt.read_text(encoding="utf-8"))
+            g_obj["gitHead"] = "0" * 40
+            stale_git_receipt.write_text(json.dumps(g_obj), encoding="utf-8")
+            stale_git_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--left-receipt",
+                    str(left_receipt),
+                    "--right-receipt",
+                    str(stale_git_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(stale_git_proc.returncode, 0)
+            stale_git_out = json.loads(stale_git_proc.stdout)
+            self.assertFalse(stale_git_out["usableSemanticEquivalence"])
+            self.assertEqual(stale_git_out["structuralValidity"]["right"]["status"], "stale_receipt")
+
+            invalid_flag_receipt = tmp / "invalid-flag-receipt.json"
+            inv_obj = json.loads(right_receipt.read_text(encoding="utf-8"))
+            inv_obj["valid"] = False
+            inv_obj["errorCode"] = "INTEGRITY_MISMATCH"
+            inv_obj["errorMessage"] = "synthetic invalid flag"
+            invalid_flag_receipt.write_text(json.dumps(inv_obj), encoding="utf-8")
+            inv_flag_res = sc.compare_databases(
+                clean_db,
+                vacuumed_db,
+                validator_bin=val_bin,
+                left_receipt_path=left_receipt,
+                right_receipt_path=invalid_flag_receipt,
+            )
+            self.assertFalse(inv_flag_res["usableSemanticEquivalence"])
+            self.assertEqual(inv_flag_res["structuralValidity"]["right"]["status"], "invalid")
+
+            no_val_receipt_res = sc.compare_databases(
+                clean_db,
+                vacuumed_db,
+                validator_bin=None,
+                left_receipt_path=left_receipt,
+                right_receipt_path=right_receipt,
+            )
+            self.assertTrue(no_val_receipt_res["contentEqual"])
+            self.assertFalse(no_val_receipt_res["usableSemanticEquivalence"])
+            self.assertEqual(no_val_receipt_res["structuralValidity"]["left"]["status"], "inconclusive")
+            self.assertEqual(no_val_receipt_res["structuralValidity"]["right"]["status"], "inconclusive")
+
+            changed_db = tmp / "changed.sqlite"
+            shutil.copy2(vacuumed_db, changed_db)
+            with sqlite3.connect(changed_db) as conn:
+                conn.execute("UPDATE works SET title='Changed Title' WHERE work_key='w1'")
+                conn.commit()
+            changed_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(changed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--left-receipt",
+                    str(left_receipt),
+                    "--right-receipt",
+                    str(right_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(changed_proc.returncode, 0)
+            changed_out = json.loads(changed_proc.stdout)
+            self.assertFalse(changed_out["contentEqual"])
+            self.assertFalse(changed_out["usableSemanticEquivalence"])
+            self.assertEqual(changed_out["structuralValidity"]["right"]["status"], "stale_receipt")
 
 
 if __name__ == "__main__":
