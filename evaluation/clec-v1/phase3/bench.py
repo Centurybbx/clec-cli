@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interleaved runtime benchmark separating whole-process CLI vs SQLite-only FTS latency."""
+"""Interleaved runtime benchmark separating whole-process CLI vs question-matched SQLite FTS probe."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adapter
+import score
 
 
 def _summary_stats(values: list[float]) -> dict[str, Any]:
@@ -29,8 +30,35 @@ def _summary_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _apply_work_diversity(
+    candidates: list[tuple[str, str]],
+    limit: int,
+    per_work: int,
+) -> list[tuple[str, str]]:
+    selected: list[tuple[str, str]] = []
+    used = [False] * len(candidates)
+    work_counts: dict[str, int] = {}
+    for idx, (pid, wid) in enumerate(candidates):
+        if len(selected) == limit:
+            break
+        cnt = work_counts.get(wid, 0)
+        if cnt < per_work:
+            work_counts[wid] = cnt + 1
+            used[idx] = True
+            selected.append((pid, wid))
+    if len(selected) < limit:
+        for idx, pair in enumerate(candidates):
+            if len(selected) == limit:
+                break
+            if not used[idx]:
+                selected.append(pair)
+    return selected
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Interleaved Phase 3 runtime bench (whole CLI vs SQLite-only)")
+    parser = argparse.ArgumentParser(
+        description="Interleaved Phase 3 runtime bench (whole CLI vs question-matched SQLite FTS probe)"
+    )
     parser.add_argument("--clec", required=True, type=Path)
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--corpus-sha256", required=True)
@@ -57,104 +85,216 @@ def main() -> int:
     if not ok_status:
         raise SystemExit(status_info["error"])
 
+    db_path = data_dir / f"{args.corpus_sha256}.sqlite"
+    actual_sha = score.stream_sha256(db_path)
+    if actual_sha != args.corpus_sha256:
+        raise SystemExit(f"Corpus SQLite SHA-256 mismatch: expected {args.corpus_sha256}, actual {actual_sha}")
+
     dataset = json.loads(args.dataset.read_text(encoding="utf-8"))
     blind_map = adapter.load_blind_queries(args.blind_queries.resolve()) if args.blind_queries else None
     questions = dataset["questions"]
-    db_path = data_dir / f"{args.corpus_sha256}.sqlite"
+
+    effective_angle = args.query_angle if blind_map is not None else "question"
+    plan_by_qid: dict[str, dict[str, list[str]]] = {}
+    has_distinct_plans = True
+    for q in questions:
+        qid = q["id"]
+        q_base = adapter.build_runtime_queries(
+            q, mode="single_query_product_baseline", query_angle=effective_angle, blind_map=blind_map
+        )
+        q_rrf = adapter.build_runtime_queries(
+            q, mode="rrf_multiquery", query_angle=effective_angle, blind_map=blind_map
+        )
+        plan_by_qid[qid] = {
+            "single_query_product_baseline": q_base,
+            "rrf_multiquery": q_rrf,
+        }
+        if len(q_rrf) < 2 or q_rrf == q_base:
+            has_distinct_plans = False
+
+    comparison_status = "DISTINCT_QUERY_PLANS" if has_distinct_plans else "IDENTICAL_QUERY_PLANS"
+
+    question_fts_queries: dict[str, str] = {}
+    for q in questions:
+        qid = q["id"]
+        modes_to_warm = (
+            ("single_query_product_baseline", "rrf_multiquery")
+            if has_distinct_plans
+            else ("single_query_product_baseline",)
+        )
+        for mode in modes_to_warm:
+            queries = plan_by_qid[qid][mode]
+            warm_rec = adapter.run_clec_command(
+                clec_bin,
+                [
+                    "search",
+                    *queries,
+                    "--limit",
+                    str(args.limit),
+                    "--per-work",
+                    str(args.per_work),
+                    "--release",
+                    args.corpus_sha256,
+                ],
+                data_dir=data_dir,
+                max_bytes=args.max_bytes,
+                timeout_sec=args.timeout_sec,
+            )
+            if mode == "single_query_product_baseline" and not warm_rec["timedOut"] and warm_rec["exitCode"] == 0:
+                warm_data = json.loads(warm_rec["stdout"])["data"]
+                terms = warm_data["queries"][0]["terms"]
+                question_fts_queries[qid] = " OR ".join(
+                    f'"t{t.encode("utf-8").hex()}"' for t in terms
+                )
+
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        for fts_q in question_fts_queries.values():
+            if fts_q:
+                conn.execute(
+                    "SELECT p.id, p.work_id, bm25(search, 4.0, 1.0) AS sc FROM search "
+                    "JOIN passages p ON p.rowid = search.rowid "
+                    "WHERE search MATCH ? ORDER BY sc ASC, p.id ASC LIMIT 100",
+                    (fts_q,),
+                ).fetchall()
 
     load_before = os.getloadavg() if hasattr(os, "getloadavg") else None
-    cli_records: dict[str, list[dict[str, Any]]] = {"default_bm25": [], "rrf_multiquery": []}
+    cli_records: dict[str, list[dict[str, Any]]] = {
+        "single_query_product_baseline": [],
+        "rrf_multiquery": [],
+    }
     sqlite_only_records: list[dict[str, Any]] = []
 
     for rep in range(args.repeats):
-        order = ["default_bm25", "rrf_multiquery"] if rep % 2 == 0 else ["rrf_multiquery", "default_bm25"]
+        if has_distinct_plans:
+            order = (
+                ["single_query_product_baseline", "rrf_multiquery"]
+                if rep % 2 == 0
+                else ["rrf_multiquery", "single_query_product_baseline"]
+            )
+        else:
+            order = ["single_query_product_baseline"]
+
         for q in questions:
+            qid = q["id"]
             for mode in order:
-                if mode == "rrf_multiquery" and blind_map is None:
-                    queries = adapter.build_runtime_queries(q, mode="default_bm25", query_angle="question", blind_map=None)
-                else:
-                    queries = adapter.build_runtime_queries(
-                        q,
-                        mode=mode,
-                        query_angle=args.query_angle if blind_map is not None else "question",
-                        blind_map=blind_map,
-                    )
+                queries = plan_by_qid[qid][mode]
                 rec = adapter.run_clec_command(
                     clec_bin,
-                    ["search", *queries, "--limit", str(args.limit), "--per-work", str(args.per_work), "--release", args.corpus_sha256],
+                    [
+                        "search",
+                        *queries,
+                        "--limit",
+                        str(args.limit),
+                        "--per-work",
+                        str(args.per_work),
+                        "--release",
+                        args.corpus_sha256,
+                    ],
                     data_dir=data_dir,
                     max_bytes=args.max_bytes,
                     timeout_sec=args.timeout_sec,
                 )
                 ok = not rec["timedOut"] and rec["exitCode"] == 0
                 work_keys: list[str] = []
+                total_candidates = 0
+                returned_hits = 0
                 if ok:
-                    hits = json.loads(rec["stdout"])["data"]["hits"]
+                    data = json.loads(rec["stdout"])["data"]
+                    hits = data["hits"]
+                    total_candidates = int(data.get("totalCandidates", 0))
+                    returned_hits = len(hits)
                     work_keys = sorted({h["work"]["workKey"] for h in hits})
                 cli_records[mode].append(
                     {
                         "repeat": rep,
-                        "questionId": q["id"],
+                        "questionId": qid,
+                        "queryCount": len(queries),
                         "elapsedSeconds": rec["elapsedSeconds"],
                         "ok": ok,
+                        "totalCandidates": total_candidates,
+                        "returnedHitCount": returned_hits,
                         "distinctWorkCount": len(work_keys),
                         "timedOut": rec["timedOut"],
                         "exitCode": rec["exitCode"],
                     }
                 )
 
-        # Measure SQLite-only FTS5 BM25 query separately from whole-process CLI startup + tokenization + read.
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
-            conn.execute("CREATE VIRTUAL TABLE temp.__v_bench USING fts5vocab(main, search, instance)")
-            sample_term_row = conn.execute("SELECT term FROM temp.__v_bench LIMIT 1").fetchone()
-            conn.execute("DROP TABLE temp.__v_bench")
-            probe_term = sample_term_row[0] if sample_term_row else None
             for q in questions:
+                qid = q["id"]
+                fts_q = question_fts_queries.get(qid, "")
                 t0 = time.monotonic()
-                if probe_term is not None:
+                if fts_q:
                     rows = conn.execute(
-                        "SELECT p.id, bm25(search, 4.0, 1.0) AS sc FROM search "
+                        "SELECT p.id, p.work_id, bm25(search, 4.0, 1.0) AS sc FROM search "
                         "JOIN passages p ON p.rowid = search.rowid "
-                        "WHERE search MATCH ? ORDER BY sc ASC LIMIT 100",
-                        (f'"{probe_term}"',),
+                        "WHERE search MATCH ? ORDER BY sc ASC, p.id ASC LIMIT 100",
+                        (fts_q,),
                     ).fetchall()
-                    hit_len = len(rows)
+                    candidates = [(r[0], r[1]) for r in rows]
+                    selected = _apply_work_diversity(candidates, args.limit, args.per_work)
+                    candidate_count = len(candidates)
+                    selected_count = len(selected)
+                    distinct_works = len({w for _, w in selected})
                 else:
-                    hit_len = 0
+                    candidate_count = 0
+                    selected_count = 0
+                    distinct_works = 0
                 sqlite_only_records.append(
                     {
                         "repeat": rep,
-                        "questionId": q["id"],
+                        "questionId": qid,
                         "elapsedSeconds": round(time.monotonic() - t0, 6),
-                        "candidateRowCount": hit_len,
+                        "candidateRowCount": candidate_count,
+                        "selectedCount": selected_count,
+                        "distinctWorkCount": distinct_works,
                     }
                 )
 
     load_after = os.getloadavg() if hasattr(os, "getloadavg") else None
+
+    whole_process_cli = {}
+    for mode, rows in cli_records.items():
+        ok_rows = [r for r in rows if r["ok"]]
+        whole_process_cli[mode] = {
+            "runCount": len(rows),
+            "errorCount": sum(1 for r in rows if not r["ok"]),
+            "timeoutCount": sum(1 for r in rows if r["timedOut"]),
+            "elapsedSeconds": _summary_stats([r["elapsedSeconds"] for r in ok_rows]),
+            "medianCandidateCount": statistics.median([r["totalCandidates"] for r in ok_rows]) if ok_rows else None,
+            "medianReturnedHits": statistics.median([r["returnedHitCount"] for r in ok_rows]) if ok_rows else None,
+            "medianDistinctWorks": statistics.median([r["distinctWorkCount"] for r in ok_rows]) if ok_rows else None,
+            "runs": rows,
+        }
+
+    total_cli_errors = sum(v["errorCount"] for v in whole_process_cli.values())
+    if not has_distinct_plans:
+        comparison_verdict = "no_comparison_identical_query_plans"
+    elif args.repeats < 5:
+        comparison_verdict = "inconclusive_under_5_repeats"
+    elif total_cli_errors > 0:
+        comparison_verdict = "inconclusive_errors_present"
+    else:
+        comparison_verdict = "valid_interleaved_latency_comparison"
+
     report = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "measurementScope": "runtime_latency_only_no_quality_claim",
         "corpusSha256": args.corpus_sha256,
+        "actualCorpusSha256": actual_sha,
+        "comparisonStatus": comparison_status,
+        "comparisonVerdict": comparison_verdict,
         "repeats": args.repeats,
         "questionCount": len(questions),
         "hostLoadBefore": list(load_before) if load_before else None,
         "hostLoadAfter": list(load_after) if load_after else None,
-        "wholeProcessCli": {
-            mode: {
-                "elapsedSeconds": _summary_stats([r["elapsedSeconds"] for r in rows if r["ok"]]),
-                "errorCount": sum(1 for r in rows if not r["ok"]),
-                "medianDistinctWorks": (
-                    statistics.median([r["distinctWorkCount"] for r in rows if r["ok"]])
-                    if any(r["ok"] for r in rows)
-                    else None
-                ),
-                "runs": rows,
-            }
-            for mode, rows in cli_records.items()
-        },
-        "sqliteOnlyProbe": {
-            "note": "In-process read-only SQLite query excluding CLI startup, jieba/OpenCC tokenization, and stdout JSON serialization.",
+        "wholeProcessCli": whole_process_cli,
+        "sqliteOnlyQuestionMatchedProbe": {
+            "note": (
+                "Question-matched read-only SQLite FTS5 + per_work diversity diagnostic using pre-extracted CLI tokens; "
+                "excludes CLI startup, OpenCC/jieba dictionary load, blob SHA-256 verification, and JSON serialization."
+            ),
             "elapsedSeconds": _summary_stats([r["elapsedSeconds"] for r in sqlite_only_records]),
             "runs": sqlite_only_records,
         },
@@ -164,10 +304,12 @@ def main() -> int:
     print(
         json.dumps(
             {
+                "comparisonStatus": comparison_status,
+                "comparisonVerdict": comparison_verdict,
                 "repeats": args.repeats,
-                "wholeProcessDefaultBm25": report["wholeProcessCli"]["default_bm25"]["elapsedSeconds"],
+                "wholeProcessBaseline": report["wholeProcessCli"]["single_query_product_baseline"]["elapsedSeconds"],
                 "wholeProcessRrfMultiquery": report["wholeProcessCli"]["rrf_multiquery"]["elapsedSeconds"],
-                "sqliteOnlyProbe": report["sqliteOnlyProbe"]["elapsedSeconds"],
+                "sqliteOnlyQuestionMatchedProbe": report["sqliteOnlyQuestionMatchedProbe"]["elapsedSeconds"],
             },
             indent=2,
         )

@@ -10,9 +10,10 @@ import time
 from typing import Any
 
 
-VALID_MODES = frozenset({"default_bm25", "rrf_multiquery"})
+VALID_MODES = frozenset({"single_query_product_baseline", "rrf_multiquery"})
 VALID_QUERY_ANGLES = frozenset({"question", "blind_rewrite"})
 FORBIDDEN_QUERY_FIELDS = frozenset({"evidence", "quote", "quotes", "workKeys", "notes", "spans"})
+OUTCOME_SCHEMA_VERSION = 2
 
 
 def _clean_env() -> dict[str, str]:
@@ -39,7 +40,9 @@ def load_blind_queries(path: Path) -> dict[str, list[str]]:
         if not isinstance(row, dict):
             continue
         if any(k in row for k in FORBIDDEN_QUERY_FIELDS):
-            raise ValueError(f"Blind query file contains forbidden gold fields: {sorted(FORBIDDEN_QUERY_FIELDS & set(row))}")
+            raise ValueError(
+                f"Blind query file contains forbidden gold fields: {sorted(FORBIDDEN_QUERY_FIELDS & set(row))}"
+            )
         qid = str(row["id"])
         queries = row.get("queries")
         if not isinstance(queries, list) or not queries:
@@ -71,7 +74,7 @@ def build_runtime_queries(
     queries = [q.strip() for q in blind_map[question["id"]] if q.strip()]
     if not queries:
         raise ValueError(f"Empty blind rewrite queries for question {question['id']!r}")
-    if mode == "default_bm25":
+    if mode == "single_query_product_baseline":
         return [queries[0]]
     return queries[:4]
 
@@ -132,6 +135,17 @@ def verify_active_corpus(
     expected_corpus_sha256: str,
     timeout_sec: float,
 ) -> tuple[bool, dict[str, Any]]:
+    active_json = data_dir / "active.json"
+    if active_json.is_file():
+        try:
+            active_obj = json.loads(active_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return False, {"error": f"Invalid active.json in {data_dir}: {exc}"}
+        if active_obj.get("release") != expected_corpus_sha256:
+            return False, {
+                "error": f"active.json release {active_obj.get('release')!r} != expected {expected_corpus_sha256!r}"
+            }
+
     rec = run_clec_command(
         clec_bin,
         ["status"],
@@ -158,13 +172,25 @@ def verify_active_corpus(
     return True, {"record": rec, "status": data}
 
 
+def _step_record(step_name: str, rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "step": step_name,
+        "argv": rec["argv"],
+        "exitCode": rec["exitCode"],
+        "timedOut": rec["timedOut"],
+        "elapsedSeconds": rec["elapsedSeconds"],
+        "stdoutUtf8": rec["stdout"],
+        "stderrUtf8": rec["stderr"],
+    }
+
+
 def execute_dataset_queries(
     *,
     clec_bin: Path,
     data_dir: Path,
     corpus_sha256: str,
     questions: list[dict[str, Any]],
-    mode: str = "default_bm25",
+    mode: str = "single_query_product_baseline",
     query_angle: str = "question",
     blind_queries_path: Path | None = None,
     limit: int = 5,
@@ -202,18 +228,19 @@ def execute_dataset_queries(
             timeout_sec=timeout_sec,
         )
         raw_logs.append({"questionId": qid, "step": "search", **search_rec})
+        steps = [_step_record("search", search_rec)]
 
         if search_rec["timedOut"]:
             outcomes.append(
                 {
+                    "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
                     "id": qid,
                     "mode": mode,
                     "queryAngle": query_angle,
                     "queries": queries,
                     "status": "timeout",
                     "stopReason": f"search_timeout_{timeout_sec}s",
-                    "hits": [],
-                    "reads": [],
+                    "steps": steps,
                 }
             )
             continue
@@ -226,14 +253,14 @@ def execute_dataset_queries(
                 pass
             outcomes.append(
                 {
+                    "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
                     "id": qid,
                     "mode": mode,
                     "queryAngle": query_angle,
                     "queries": queries,
                     "status": "error",
                     "stopReason": f"cli_error:{err_code or search_rec['exitCode']}",
-                    "hits": [],
-                    "reads": [],
+                    "steps": steps,
                 }
             )
             continue
@@ -244,19 +271,18 @@ def execute_dataset_queries(
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             outcomes.append(
                 {
+                    "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
                     "id": qid,
                     "mode": mode,
                     "queryAngle": query_angle,
                     "queries": queries,
                     "status": "error",
                     "stopReason": f"invalid_search_json:{exc}",
-                    "hits": [],
-                    "reads": [],
+                    "steps": steps,
                 }
             )
             continue
 
-        reads: list[dict[str, Any]] = []
         read_error: str | None = None
         if read_top_n > 0 and hits:
             read_ids = [h["passageId"] for h in hits[:read_top_n]]
@@ -268,42 +294,48 @@ def execute_dataset_queries(
                 timeout_sec=timeout_sec,
             )
             raw_logs.append({"questionId": qid, "step": "read", **read_rec})
+            steps.append(_step_record("read", read_rec))
             if read_rec["timedOut"]:
                 read_error = f"read_timeout_{timeout_sec}s"
             elif read_rec["exitCode"] != 0:
-                read_error = f"read_cli_error:{read_rec['exitCode']}"
+                err_code = None
+                try:
+                    err_code = json.loads(read_rec["stderr"]).get("error", {}).get("code")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                read_error = f"read_cli_error:{err_code or read_rec['exitCode']}"
             else:
                 try:
                     read_json = json.loads(read_rec["stdout"])
-                    reads = read_json["data"]["items"]
+                    _ = read_json["data"]["items"]
                 except (json.JSONDecodeError, KeyError, TypeError) as exc:
                     read_error = f"invalid_read_json:{exc}"
 
         if read_error is not None:
             outcomes.append(
                 {
+                    "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
                     "id": qid,
                     "mode": mode,
                     "queryAngle": query_angle,
                     "queries": queries,
                     "status": "error",
                     "stopReason": read_error,
-                    "hits": hits,
-                    "reads": [],
+                    "steps": steps,
                 }
             )
             continue
 
         outcomes.append(
             {
+                "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
                 "id": qid,
                 "mode": mode,
                 "queryAngle": query_angle,
                 "queries": queries,
                 "status": "completed",
                 "stopReason": None,
-                "hits": hits,
-                "reads": reads,
+                "steps": steps,
             }
         )
 
