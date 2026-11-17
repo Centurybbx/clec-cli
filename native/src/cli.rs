@@ -15,7 +15,9 @@ use crate::retrieval::{
     BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, MatchMode, SearchData, SearchRequest,
     execute_search,
 };
-use crate::snapshot::{StatusData, SyncData, data_dir_status, open_current_store, sync_local};
+use crate::snapshot::{
+    StatusData, SyncData, data_dir_status, open_current_store, sync_local_with_prepare,
+};
 use crate::store::{PassageReadItem, SourceListEntry, SourceOriginalItem, SourceOverviewItem};
 
 #[derive(Debug, Parser)]
@@ -38,7 +40,7 @@ struct Cli {
     #[arg(long, global = true)]
     pub offline: bool,
 
-    /// Maximum UTF-8 byte budget for serialized stdout output
+    /// Maximum UTF-8 byte budget for stdout output (including help and version)
     #[arg(long, global = true, default_value_t = DEFAULT_MAX_BYTES, value_name = "N")]
     pub max_bytes: usize,
 
@@ -293,7 +295,34 @@ pub(crate) fn run_cli_with_args(args: &[String]) -> i32 {
         Ok(cli) => cli,
         Err(err) => match err.kind() {
             ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion => {
-                let _ = write_stdout_safe(&err.to_string());
+                let max_bytes = match parse_max_bytes_for_early_exit(args) {
+                    Ok(n) => n,
+                    Err(clec_err) => {
+                        emit_error(&clec_err, None);
+                        return clec_err.code.exit_code();
+                    }
+                };
+                if max_bytes == 0 {
+                    let clec_err = ClecError::new(
+                        ErrorCode::OutputBudgetTooSmall,
+                        "--max-bytes must be at least 1.",
+                    );
+                    emit_error(&clec_err, None);
+                    return clec_err.code.exit_code();
+                }
+                let text = err.to_string();
+                if text.len() > max_bytes {
+                    let clec_err = ClecError::new(
+                        ErrorCode::OutputBudgetTooSmall,
+                        format!(
+                            "Output requires {} UTF-8 bytes, exceeding --max-bytes {max_bytes}.",
+                            text.len()
+                        ),
+                    );
+                    emit_error(&clec_err, None);
+                    return clec_err.code.exit_code();
+                }
+                let _ = write_stdout_safe(&text);
                 return 0;
             }
             _ => {
@@ -339,6 +368,41 @@ pub(crate) fn run_cli_with_args(args: &[String]) -> i32 {
     }
 }
 
+fn parse_max_bytes_for_early_exit(args: &[String]) -> Result<usize, ClecError> {
+    let mut max_bytes = DEFAULT_MAX_BYTES;
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            break;
+        }
+        if let Some(val) = arg.strip_prefix("--max-bytes=") {
+            max_bytes = val.parse::<usize>().map_err(|_| {
+                ClecError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("Invalid value '{val}' for '--max-bytes <N>'."),
+                )
+            })?;
+        } else if arg == "--max-bytes" {
+            let next = args.get(i + 1).ok_or_else(|| {
+                ClecError::new(
+                    ErrorCode::InvalidArgument,
+                    "a value is required for '--max-bytes <N>' but none was supplied",
+                )
+            })?;
+            max_bytes = next.parse::<usize>().map_err(|_| {
+                ClecError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("Invalid value '{next}' for '--max-bytes <N>'."),
+                )
+            })?;
+            i += 1;
+        }
+        i += 1;
+    }
+    Ok(max_bytes)
+}
+
 fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
         Commands::Sync(_) => "sync",
@@ -379,8 +443,9 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
             serialize_fixed("status", &data, use_json, max_bytes, format_status_text)
         }
         Commands::Sync(args) => {
-            let data = sync_local(&data_dir, args.manifest.as_deref())?;
-            serialize_fixed("sync", &data, use_json, max_bytes, format_sync_text)
+            sync_local_with_prepare(&data_dir, args.manifest.as_deref(), |data| {
+                serialize_fixed("sync", data, use_json, max_bytes, format_sync_text)
+            })
         }
         Commands::Search(args) => {
             let store = open_current_store(&data_dir, None)?;
@@ -881,5 +946,44 @@ mod tests {
         let msg = err.to_string();
         assert!(!msg.contains("similar"));
         assert!(!msg.contains("Did you mean"));
+    }
+
+    #[test]
+    fn max_bytes_enforced_consistently_on_help_and_version() {
+        assert_eq!(
+            run_cli_with_args(&[
+                "clec".to_owned(),
+                "--max-bytes".to_owned(),
+                "1".to_owned(),
+                "--help".to_owned(),
+            ]),
+            ErrorCode::OutputBudgetTooSmall.exit_code()
+        );
+        assert_eq!(
+            run_cli_with_args(&[
+                "clec".to_owned(),
+                "--max-bytes=1".to_owned(),
+                "--version".to_owned(),
+            ]),
+            ErrorCode::OutputBudgetTooSmall.exit_code()
+        );
+        assert_eq!(
+            run_cli_with_args(&[
+                "clec".to_owned(),
+                "--max-bytes".to_owned(),
+                "0".to_owned(),
+                "--help".to_owned(),
+            ]),
+            ErrorCode::OutputBudgetTooSmall.exit_code()
+        );
+        assert_eq!(
+            run_cli_with_args(&[
+                "clec".to_owned(),
+                "--max-bytes".to_owned(),
+                "65536".to_owned(),
+                "--help".to_owned(),
+            ]),
+            0
+        );
     }
 }
