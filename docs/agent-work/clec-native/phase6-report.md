@@ -4,21 +4,21 @@ Stage 6A delivers bounded platform cache path resolution and shared-cache owners
 
 All Stage 6A deliverables remain reversible local work pending independent parent review. Stage 6B host-answer evaluation, cross-OS execution, production default endpoint configuration, live Jev verification, and Stage 3 retrieval quality remain separate open gates.
 
-Independent review at `b45bdcc` accepted the native cache/MSRV scope and requested three packaging/Skill/CI changes. The coordinator corrected CI lint selection and the Skill context example in `47bc77f`. Hydrogen then implemented the remaining artifact-admission boundary across `892f354` (minimal `native/build.rs` and `native/src/build_identity.rs` compile metadata) and `795deb3` (`cli/scripts/artifact-admission.mjs`, `cli/scripts/build-receipt.mjs`, `cli/scripts/stage.mjs`, `cli/scripts/install.mjs`, `cli/test/packaging.test.mjs`), followed by fresh MSRV `1.89.0` builds, restaging, and isolated verification in `.cache/stage6a-v2/`. All historical `345f84f` / `7b62eec` / `b45bdcc` measurements remain attributed to their earlier commits; note that at `b45bdcc`, `.cache/stage6a/staged_1/provenance.json` recorded `features: []` and `testHooksIncluded: false` unconditionally without inspecting binary compile metadata or bound build receipts. Independent parent review of the updated artifacts remains pending.
+Independent review at `b45bdcc` accepted the native cache/MSRV scope and requested three packaging/Skill/CI changes. The coordinator corrected CI lint selection and the Skill context example in `47bc77f`. Hydrogen then implemented the initial artifact-admission boundary across `892f354` (minimal `native/build.rs` and `native/src/build_identity.rs` compile metadata) and `795deb3` (`cli/scripts/`). Subsequent review at `505e21d` identified two residual P2 gaps: `PT_INTERP` musl/custom acceptance in static slots and promotion of unverified capture-time git/command values into build provenance. The coordinator fixed `PT_INTERP` static-slot rejection in `c72ed0d`. The follow-up provenance-model fix then replaced the v1 receipt shape with a schema v2 discriminated union (`clec-inspected-prebuilt-receipt` vs `clec-controlled-build-receipt`), bound `--run-build` to actual `cargo` execution and checkout consistency, updated `stage.mjs` and `install.mjs` to validate the shared union without promoting `not_verified_unknown` observations, and restaged `.cache/stage6a-v3/` using the unchanged `795deb3` MSRV binaries classified honestly as `inspected-prebuilt`. All historical `345f84f` / `7b62eec` / `b45bdcc` / `795deb3` / `505e21d` / `c72ed0d` records remain attributed to their original commits. Independent parent review of the updated artifacts remains pending.
 
 ## Tested commits and gate status
 
 - **Base commit:** `607a99b47e51215f0fb26bcf38a418be5c71fb14` (Stage 5 mock contract accepted at `e2b6195b9ff893aebffa6b06ea6b5441ba626b1c`).
-- **Previous Stage 6A candidate heads (historical):** `345f84f99ea55f37da69fafa1999a4eda3db1e36` (native cache safety) and `7b62eece74f66222699225f570f067304e8f964b` (initial packaging/Skill).
-- **Current native and packaging code head:** `795deb33f149cbf7547849970429acc5f5d63f70` (`892f354` added compile-time build identity metadata; core CLI/cache/transport/ranking/Jev code remains unchanged from `345f84f`).
+- **Previous Stage 6A candidate heads (historical):** `345f84f99ea55f37da69fafa1999a4eda3db1e36` (native cache safety), `7b62eece74f66222699225f570f067304e8f964b` (initial packaging/Skill), `795deb33f149cbf7547849970429acc5f5d63f70` (initial artifact admission), `c72ed0d3e693dfec0b337edb5084965b9fdeb01c` (coordinator `PT_INTERP` fix).
+- **Current native source head:** `795deb33f149cbf7547849970429acc5f5d63f70` (`native/` is byte-identical from `795deb3` through the current JS/docs provenance-model fix).
 
 | Gate | Status | Evidence summary |
 | --- | --- | --- |
 | `SAFE_CACHE` | Accepted at `b45bdcc` (native scope) | Before/after temp-fixture repros (`.cache/stage6a/before-repro.json`, `.cache/stage6a/after-repro.json`) and unit tests in `native/src/cli.rs` and `native/src/snapshot.rs` (unchanged since `345f84f`) |
-| `ACTUAL_MSRV` | Verified at `795deb3` on `darwin-arm64` | Installed `rustc 1.89.0` (`29483883e`); `cargo +1.89.0 build --locked --release --bins` (`.cache/stage6a-v2/logs/msrv-build.log`), `clec_test_fixture` `--features test-hooks` build (`.cache/stage6a-v2/logs/msrv-test-hook-build.log`), `cargo +1.89.0 test --locked` (`60 + 1 + 18 = 79` tests in `.cache/stage6a-v2/logs/msrv-test.log`), `cargo +stable fmt --check`, and `cargo +stable clippy --locked --all-targets -- -D warnings` (default + `test-hooks`) passed |
-| `LOCAL_PACKAGING` | Verified at `795deb3` (pending parent review) | Bound receipt (`.cache/stage6a-v2/logs/darwin-arm64-build-receipt.json`) and `cli/scripts/stage.mjs` partial staging produced identical `SHA256SUMS` across `.cache/stage6a-v2/staged_1` and `staged_2`; `npm test --prefix cli` (`6/6` including real `darwin-arm64` wrong-tuple and renamed `clec_test_fixture` rejections) and 38-file `tools/export_cli.py` export (`npm test` + `cargo +1.89.0 check --locked`) passed |
-| `SKILL_PACKAGED` | Verified at `795deb3` | `cli/skills/clec/SKILL.md` (`17` lines, `2,938` B, SHA-256 `66031f09781b0ed95f610e607719bca0967c067a546656d8da83b3dc90d4eb9b`, updated in `47bc77f`) is byte-identical in source, consumer archive, and installed npm package; authored fixture smoke with `--context 1` and `--context 2` passed; zero global Skill writes |
-| `LOCAL_INSTALLED_ARTIFACT` | Verified at `795deb3` on `darwin-arm64` | Isolated `npm install --global --offline` into space+Unicode prefix linked `bin/clec` directly to native `bin/clec.exe`; `PATH`-stripped direct-vs-installed parity, consumer/maintainer archive verification, `SIGTERM`/`SIGINT` FIFO parity, repeat/uninstall/`--ignore-scripts`/rebuild repair, 8 negative installer rejections, and `otool -L` linkage inspection passed (`.cache/stage6a-v2/logs/installed-artifact-receipt-v2.json`) |
+| `ACTUAL_MSRV` | Verified at `795deb3` on `darwin-arm64`; `native/` unchanged | Installed `rustc 1.89.0` (`29483883e`); `cargo +1.89.0 build --locked --release --bins`, `clec_test_fixture` `--features test-hooks`, `cargo +1.89.0 test --locked` (`79` tests), and `cargo +stable clippy` passed at `795deb3` (`.cache/stage6a-v2/logs/`); `git diff 795deb3 -- native/` is empty, `cargo +stable fmt --check` passes, and retained `clec_core` `build_identity` test executables pass (`1` passed, `59` filtered each in `.cache/stage6a-v3/logs/msrv-identity-test-{1,2}.log`) |
+| `LOCAL_PACKAGING` | Verified at current fix head (pending parent review) | Inspected-prebuilt receipt (`.cache/stage6a-v3/logs/darwin-arm64-build-receipt.json`) and `cli/scripts/stage.mjs` partial staging produced identical `SHA256SUMS` across `.cache/stage6a-v3/staged_1` and `staged_2`; `npm test --prefix cli` (`9/9`, `0` skipped, including real `083e4...` misattribution probes, `--run-build` positive/negative checks, and full `admitTargetArtifacts` `PT_INTERP` rejections) and 38-file `tools/export_cli.py` export (`7` pass, `2` real-binary tests skipped in export) passed |
+| `SKILL_PACKAGED` | Verified at current fix head | `cli/skills/clec/SKILL.md` (`17` lines, `2,938` B, SHA-256 `66031f09781b0ed95f610e607719bca0967c067a546656d8da83b3dc90d4eb9b`, updated in `47bc77f`) is byte-identical in source, consumer archive, and installed npm package; authored fixture smoke with `--context 1` and `--context 2` passed; zero global Skill writes |
+| `LOCAL_INSTALLED_ARTIFACT` | Verified at current fix head on `darwin-arm64` | Isolated `npm install --global --offline` into space+Unicode prefix linked `bin/clec` directly to native `bin/clec.exe`; `PATH`-stripped direct-vs-installed parity, consumer/maintainer archive verification, `SIGTERM`/`SIGINT` FIFO parity, repeat/uninstall/`--ignore-scripts`/rebuild repair passed (`.cache/stage6a-v3/logs/installed-artifact-receipt-v3.json`) |
 | `CROSS_OS_SUPPORT` | `OPEN` | Only `darwin-arm64` (`macOS 26.4.1`, `minos 11.0`, `sdk 26.4`) executed; `darwin-x64`, `linux-x64` (`musl`/`glibc`), `linux-arm64` (`musl`/`glibc`), and `win32-x64` (`cmd`/PowerShell) unexecuted |
 | `HOST_ANSWER_QUALITY` | `OPEN` | Stage 6B preregistration draft recorded in `evaluation/clec-v1/phase6/PROTOCOL.md`; zero host-answer author/runtime/judge runs performed |
 | `PRODUCTION_DEFAULT` | `OPEN` | `BUILTIN_DEFAULT_MANIFEST_URL = None` (`schema.defaultConfigured = false`) |
@@ -36,9 +36,22 @@ Independent review at `b45bdcc` accepted the native cache/MSRV scope and request
 | `.cache/stage6a-v2/target-msrv/release/clec-validate` | 9,271,200 | `23e5d1f1fce715a63c7045eeb9d3395fd68d08ae9a7688d260a496f13c9af6dd` |
 | `.cache/stage6a-v2/target-msrv/release/examples/clec_test_fixture` (negative-test hook fixture only) | 15,818,496 | `25690e6994343ccbc84521fe4828a340377998366055b3c1f3edeceacdb729e2` |
 
-### Staged partial release package at `795deb3` (`.cache/stage6a-v2/staged_1/`)
+### Staged partial release package (`.cache/stage6a-v3/staged_1/`, packaging v2 union, `795deb3` binaries)
 
-`inventory.json` and `provenance.json` bind `sourceCommit: 795deb33f149cbf7547849970429acc5f5d63f70` (`sourceDirty: false`), `rustc 1.89.0 (29483883e 2025-08-04)`, `cargoLockSha256: 200070e2a526320a876dfecd70611583d654172ef87d59ce9d572e3aaf860cda`, `features: []`, and `testHooksIncluded: false` to exact artifact SHA-256 hashes, explicitly marking `complete: false`, `publishable: false`, and `darwin-x64`, `linux-x64`, `linux-arm64`, and `win32-x64` missing.
+`inventory.json` (`schemaVersion: 2`) and `provenance.json` (`schemaVersion: 2`, `provenanceClassification: "inspected-prebuilt"`) verify embedded compile metadata (`rustc 1.89.0 (29483883e 2025-08-04)`, `cargoLockSha256: 200070e2a526320a876dfecd70611583d654172ef87d59ce9d572e3aaf860cda`, `features: []`, `testHooksIncluded: false`) against exact payload SHA-256 hashes while leaving build source and build invocation explicitly `not_verified_unknown` (with capture-time git observation isolated inside `buildReceipt.captureObservation`), marking `complete: false`, `publishable: false`, and `darwin-x64`, `linux-x64`, `linux-arm64`, and `win32-x64` missing.
+
+| Staged file | Bytes | SHA-256 |
+| --- | --- | --- |
+| `clec-cli-1.0.0-dev.0.tgz` | 7,909,458 | `2997903414742741c5748f61cdc0933144f2a2ec5eccf6142b1147e0314aad38` |
+| `clec-v1.0.0-dev.0-darwin-arm64.tar.gz` | 7,899,694 | `231c683b03bfb1949d0ff6794446bedfc94e9dad2dba39d2dbac8fa2a2b43691` |
+| `clec-maintainer-v1.0.0-dev.0-darwin-arm64.tar.gz` | 10,630,413 | `9a17127ee8b2ea79d4496276ba940c71abbfb1ba0be9d2649d46265c27af3568` |
+| `inventory.json` | 2,234 | `525e1987fc2b037417518ca6983cc284fb6bafe65c559d21892caed66e793985` |
+| `provenance.json` | 6,958 | `ed042684df31b22dddb014de2a9bc6886828113beb8aa7d5f076d8e43386318f` |
+| `SHA256SUMS` | 473 | `c01ec25192937b8b9fccdb83570e9a23b939c4d994ea90534638e8ac25dedd63` |
+
+### Historical staged partial release package at `795deb3` (`.cache/stage6a-v2/staged_1/`, legacy v1 receipt, superseded)
+
+`inventory.json` and `provenance.json` bound `sourceCommit: 795deb33f149cbf7547849970429acc5f5d63f70` (`sourceDirty: false`) via the superseded v1 receipt shape before inspected-prebuilt vs controlled-build separation.
 
 | Staged file | Bytes | SHA-256 |
 | --- | --- | --- |
@@ -93,9 +106,9 @@ Independent review at `b45bdcc` accepted the native cache/MSRV scope and request
    - Assign an explicit repository and binary distribution license (`cli/NOTICES.md` currently records `unassigned_pending_maintainer_confirmation`).
    - Supply target execution infrastructure for `darwin-x64`, `linux-x64` (`musl` + `glibc`), `linux-arm64` (`musl` + `glibc`), and `win32-x64`, plus code-signing/notarization credentials if required by the chosen distribution channel.
 2. **Proposed future staging/publication sequence (only after all 5 targets are built/verified and destination/license are confirmed):**
-   - Capture bound local build receipts and stage complete production artifacts into a clean directory without `--allow-partial`:
+   - Capture controlled build receipts (or inspect prebuilt binaries without promoting unverified git/command fields) and stage complete production artifacts into a clean directory without `--allow-partial`:
      ```sh
-     node cli/scripts/build-receipt.mjs --tuple <tuple> --target-dir <target-dir> --toolchain 1.89.0 --build-command "cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins" --out <receipt-dir>/<tuple>.json
+     node cli/scripts/build-receipt.mjs --tuple <tuple> --target-dir <target-dir> --run-build --toolchain 1.89.0 --out <receipt-dir>/<tuple>.json
      node cli/scripts/stage.mjs --input <full-5-target-inputs.json> --output <release-dir>
      ```
    - Export verified public source tree with `python3 tools/export_cli.py <export-dir>` and publish via the verified GitHub release/npm scope commands once maintainer confirms destination and license.

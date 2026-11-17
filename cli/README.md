@@ -40,15 +40,15 @@ The distributable agent Skill lives at `skills/clec/SKILL.md`. Neither `npm` ins
 
 ## Staged local packaging and maintainer binaries
 
-Build native binaries from `native/` without `test-hooks`, capture a bound local build receipt, then stage archives and the npm tarball into a new directory:
+Run a controlled build and capture a bound `clec-controlled-build-receipt`, or inspect prebuilt binaries into a `clec-inspected-prebuilt-receipt` without promoting unverified git or command strings, then stage archives and the npm tarball into a new directory:
 
 ```sh
-cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins
-node cli/scripts/build-receipt.mjs --tuple darwin-arm64 --target-dir native/target --toolchain 1.89.0 --build-command "cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins" --out /path/to/darwin-arm64-receipt.json
+node cli/scripts/build-receipt.mjs --tuple darwin-arm64 --target-dir native/target --run-build --toolchain 1.89.0 --out /path/to/darwin-arm64-receipt.json
+node cli/scripts/build-receipt.mjs --tuple darwin-arm64 --target-dir .cache/stage6a-v2/target-msrv --toolchain 1.89.0 --cargo-lock native/Cargo.lock --out /path/to/darwin-arm64-prebuilt-receipt.json
 node cli/scripts/stage.mjs --input /path/to/inputs.json --output /path/to/staged --allow-partial
 npm test --prefix cli
 ```
 
-Use `--allow-partial` only for local non-publishable staging when fewer than all five target tuples (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`) are present. Production staging rejects incomplete inventories, dirty git trees, test-hook binaries, or inputs without matching build receipts and executable headers. Unsigned local build receipts bind payload hashes to local build outputs and embedded compile metadata; they do not authenticate a remote publisher or certify execution on unexecuted target OSes.
+Use `--allow-partial` only for local non-publishable staging when fewer than all five target tuples (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`) are present. Production staging rejects incomplete inventories, dirty git trees on controlled builds, test-hook binaries, interpreted ELF binaries in `musl-static` slots, legacy v1 receipts, or inputs without matching build receipts and executable headers. Inspected-prebuilt receipts verify executable headers and embedded compile metadata (`target`, `profile`, `features`, `rustcVersion`, `cargoLockSha256`) against exact payload bytes while keeping unestablished build source and command fields as `not_verified_unknown`. Unsigned local receipts do not authenticate a remote publisher, prove full hermeticity, or certify execution on unexecuted target OSes.
 
 Maintainer corpus tools (`clec-publish` and `clec-validate`) ship in separate maintainer archives and are excluded from consumer packages. Recorded repository metadata (`Centurybbx/clec-cli`) and distribution licensing remain unverified for public release.
