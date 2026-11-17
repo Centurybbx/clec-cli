@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import {
   chmodSync,
   lstatSync,
@@ -9,8 +8,17 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  assertExecutableMatchesTarget,
+  assertReleaseBuildIdentity,
+  assertSafeChildPath,
+  extractEmbeddedBuildIdentity,
+  sha256Hex,
+  validateInventoryHeader,
+  validateInventoryTargetEntry,
+} from './artifact-admission.mjs';
 import {
   BIN_TARGET_REL,
   PACKAGE_NAME,
@@ -30,28 +38,10 @@ function restorePlaceholder(destBin) {
     if (process.platform !== 'win32') {
       chmodSync(destBin, 0o644);
     }
-  } catch {
+    return null;
+  } catch (err) {
+    return err;
   }
-}
-
-function assertSafeChildPath(root, relPath) {
-  if (
-    typeof relPath !== 'string' ||
-    relPath.length === 0 ||
-    relPath.startsWith('/') ||
-    relPath.includes('\\') ||
-    relPath.includes('..') ||
-    !relPath.startsWith('payloads/')
-  ) {
-    throw new Error(`Unsafe payloadPath in inventory.json: ${String(relPath)}`);
-  }
-  const resolvedRoot = resolve(root);
-  const target = resolve(resolvedRoot, relPath);
-  const rel = relative(resolvedRoot, target);
-  if (rel.startsWith('..') || rel === '') {
-    throw new Error(`Payload escapes package root: ${relPath}`);
-  }
-  return target;
 }
 
 export function installFromRoot(pkgRoot, options = {}) {
@@ -61,7 +51,10 @@ export function installFromRoot(pkgRoot, options = {}) {
   const destBin = join(root, BIN_TARGET_REL);
 
   const fail = (message) => {
-    restorePlaceholder(destBin);
+    const restoreErr = restorePlaceholder(destBin);
+    if (restoreErr) {
+      throw new Error(`${message} (placeholder restoration failed: ${restoreErr.message})`);
+    }
     throw new Error(message);
   };
 
@@ -85,14 +78,10 @@ export function installFromRoot(pkgRoot, options = {}) {
       `Missing or invalid inventory.json (${err.message}). Install from a staged tarball or use a direct release archive.`,
     );
   }
-  if (
-    inventory.schemaVersion !== 1 ||
-    inventory.packageName !== PACKAGE_NAME ||
-    inventory.packageVersion !== PACKAGE_VERSION ||
-    typeof inventory.targets !== 'object' ||
-    inventory.targets === null
-  ) {
-    fail('Invalid inventory.json header or version mismatch.');
+  try {
+    validateInventoryHeader(inventory);
+  } catch (err) {
+    fail(err.message);
   }
 
   const targetMeta = findTargetByPlatformArch(platform, arch);
@@ -103,21 +92,10 @@ export function installFromRoot(pkgRoot, options = {}) {
   }
 
   const entry = inventory.targets[targetMeta.tuple];
-  if (!entry || entry.status !== 'present') {
-    const reason = entry && entry.reason ? ` (${entry.reason})` : '';
-    fail(
-      `Bundled binary for '${targetMeta.tuple}' (${targetMeta.rustTarget}) is not included in this package${reason}. Download the direct release archive for your target instead.`,
-    );
-  }
-
-  if (
-    typeof entry.bytes !== 'number' ||
-    !Number.isInteger(entry.bytes) ||
-    entry.bytes <= 0 ||
-    typeof entry.sha256 !== 'string' ||
-    !/^[0-9a-f]{64}$/.test(entry.sha256)
-  ) {
-    fail(`Invalid inventory metadata for tuple '${targetMeta.tuple}'.`);
+  try {
+    validateInventoryTargetEntry(entry, targetMeta);
+  } catch (err) {
+    fail(err.message);
   }
 
   let payloadPath;
@@ -143,11 +121,19 @@ export function installFromRoot(pkgRoot, options = {}) {
       `Payload byte length mismatch for '${targetMeta.tuple}': expected ${entry.bytes}, got ${bytes.length}.`,
     );
   }
-  const actualSha = createHash('sha256').update(bytes).digest('hex');
+  const actualSha = sha256Hex(bytes);
   if (actualSha !== entry.sha256) {
     fail(
       `Payload SHA-256 mismatch for '${targetMeta.tuple}': expected ${entry.sha256}, got ${actualSha}.`,
     );
+  }
+
+  try {
+    assertExecutableMatchesTarget(bytes, targetMeta);
+    const embedded = extractEmbeddedBuildIdentity(bytes);
+    assertReleaseBuildIdentity(embedded, 'clec', PACKAGE_VERSION, targetMeta.rustTarget);
+  } catch (err) {
+    fail(err.message);
   }
 
   mkdirSync(dirname(destBin), { recursive: true });

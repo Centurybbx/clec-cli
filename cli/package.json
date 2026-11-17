@@ -10,6 +10,7 @@
     "bin/clec.exe",
     "scripts/install.mjs",
     "scripts/targets.mjs",
+    "scripts/artifact-admission.mjs",
     "skills/clec/SKILL.md",
     "NOTICES.md",
     "README.md",

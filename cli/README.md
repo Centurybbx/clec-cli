@@ -40,14 +40,15 @@ The distributable agent Skill lives at `skills/clec/SKILL.md`. Neither `npm` ins
 
 ## Staged local packaging and maintainer binaries
 
-Build native binaries from `native/` without `test-hooks`, then stage archives and the npm tarball into a new directory:
+Build native binaries from `native/` without `test-hooks`, capture a bound local build receipt, then stage archives and the npm tarball into a new directory:
 
 ```sh
-cargo build --manifest-path native/Cargo.toml --locked --release --bins
+cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins
+node cli/scripts/build-receipt.mjs --tuple darwin-arm64 --target-dir native/target --toolchain 1.89.0 --build-command "cargo +1.89.0 build --manifest-path native/Cargo.toml --locked --release --bins" --out /path/to/darwin-arm64-receipt.json
 node cli/scripts/stage.mjs --input /path/to/inputs.json --output /path/to/staged --allow-partial
 npm test --prefix cli
 ```
 
-Use `--allow-partial` only for local non-publishable staging when fewer than all five target tuples (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`) are present. Production staging rejects incomplete inventories.
+Use `--allow-partial` only for local non-publishable staging when fewer than all five target tuples (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`) are present. Production staging rejects incomplete inventories, dirty git trees, test-hook binaries, or inputs without matching build receipts and executable headers. Unsigned local build receipts bind payload hashes to local build outputs and embedded compile metadata; they do not authenticate a remote publisher or certify execution on unexecuted target OSes.
 
 Maintainer corpus tools (`clec-publish` and `clec-validate`) ship in separate maintainer archives and are excluded from consumer packages. Recorded repository metadata (`Centurybbx/clec-cli`) and distribution licensing remain unverified for public release.

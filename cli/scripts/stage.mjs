@@ -1,15 +1,13 @@
-import { createHash } from 'node:crypto';
-import {
-  lstatSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  writeFileSync,
-} from 'node:fs';
+import { lstatSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDeterministicTarGz, createDeterministicZip } from './archive.mjs';
+import {
+  admitTargetArtifacts,
+  assertNonEmptyKnownString,
+  readRegularFile,
+  sha256Hex,
+} from './artifact-admission.mjs';
 import {
   BIN_TARGET_REL,
   PACKAGE_NAME,
@@ -18,28 +16,16 @@ import {
   findTargetByTuple,
 } from './targets.mjs';
 
-function sha256Hex(buffer) {
-  return createHash('sha256').update(buffer).digest('hex');
-}
-
-function readRegularFile(path) {
-  const st = lstatSync(path);
-  if (st.isSymbolicLink() || !st.isFile()) {
-    throw new Error(`Expected regular non-symlink file: ${path}`);
-  }
-  return readFileSync(path);
-}
-
 function parseArgs(argv) {
   const opts = {
     input: null,
     output: null,
     allowPartial: false,
-    sourceCommit: 'unknown',
-    rustcVersion: 'unknown',
+    sourceCommit: null,
+    rustcVersion: null,
     cargoLockPath: null,
-    buildCommand: 'unknown',
-    hostBaseline: `${process.platform}-${process.arch}`,
+    buildCommand: null,
+    hostBaseline: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -90,6 +76,25 @@ function ensureEmptyOrMissingDir(outputDir) {
   }
 }
 
+function uniformOrPerTarget(values) {
+  const unique = [...new Set(values)];
+  return unique.length === 1 ? unique[0] : 'per-target';
+}
+
+function assertOptionalCliMatches(cliValue, receiptValues, fieldName) {
+  if (cliValue === undefined || cliValue === null) {
+    return;
+  }
+  const checked = assertNonEmptyKnownString(cliValue, fieldName);
+  for (const rv of receiptValues) {
+    if (rv !== checked) {
+      throw new Error(
+        `CLI --${fieldName} '${checked}' contradicts bound build receipt value '${rv}'.`,
+      );
+    }
+  }
+}
+
 export function stageRelease(opts, cliRoot) {
   const root = resolve(cliRoot);
   const outputDir = resolve(opts.output);
@@ -115,20 +120,78 @@ export function stageRelease(opts, cliRoot) {
   const placeholderBytes = readRegularFile(join(root, BIN_TARGET_REL));
   const installScriptBytes = readRegularFile(join(root, 'scripts/install.mjs'));
   const targetsScriptBytes = readRegularFile(join(root, 'scripts/targets.mjs'));
+  const admissionScriptBytes = readRegularFile(join(root, 'scripts/artifact-admission.mjs'));
   const skillBytes = readRegularFile(join(root, 'skills/clec/SKILL.md'));
   const noticesBytes = readRegularFile(join(root, 'NOTICES.md'));
   const readmeBytes = readRegularFile(join(root, 'README.md'));
 
-  const targetsInventory = {};
-  const npmPayloadEntries = [];
-  const artifacts = [];
+  const expectedCargoLockSha256 = opts.cargoLockPath
+    ? sha256Hex(readRegularFile(resolve(opts.cargoLockPath), { nonEmpty: true }))
+    : null;
+
   const missingTuples = [];
+  const admittedByTuple = new Map();
 
   for (const meta of TARGET_MATRIX) {
     const supplied = inputSpec.targets[meta.tuple];
     if (!supplied) {
       missingTuples.push(meta.tuple);
-      targetsInventory[meta.tuple] = {
+      continue;
+    }
+    const admitted = admitTargetArtifacts(meta, supplied, {
+      packageVersion: PACKAGE_VERSION,
+      expectedCargoLockSha256,
+      allowPartial: Boolean(opts.allowPartial),
+    });
+    admittedByTuple.set(meta.tuple, admitted);
+  }
+
+  const complete = missingTuples.length === 0;
+  if (!complete && !opts.allowPartial) {
+    throw new Error(
+      `Refusing incomplete production staging; missing target tuples: ${missingTuples.join(', ')}. Pass --allow-partial for local partial staging.`,
+    );
+  }
+  if (admittedByTuple.size === 0) {
+    throw new Error('At least one admitted target tuple is required to stage.');
+  }
+
+  const admittedReceipts = [...admittedByTuple.values()].map((item) => item.receipt);
+  const sourceCommits = [...new Set(admittedReceipts.map((r) => r.sourceCommit))];
+  if (sourceCommits.length !== 1) {
+    throw new Error(`Admitted build receipts disagree on sourceCommit: ${sourceCommits.join(', ')}.`);
+  }
+  const cargoLocks = [...new Set(admittedReceipts.map((r) => r.cargoLockSha256))];
+  if (cargoLocks.length !== 1) {
+    throw new Error(`Admitted build receipts disagree on cargoLockSha256: ${cargoLocks.join(', ')}.`);
+  }
+
+  assertOptionalCliMatches(opts.sourceCommit, sourceCommits, 'source-commit');
+  assertOptionalCliMatches(
+    opts.rustcVersion,
+    admittedReceipts.map((r) => r.rustcVersion),
+    'rustc-version',
+  );
+  assertOptionalCliMatches(
+    opts.buildCommand,
+    admittedReceipts.map((r) => r.buildCommand),
+    'build-command',
+  );
+  assertOptionalCliMatches(
+    opts.hostBaseline,
+    admittedReceipts.map((r) => r.hostBaseline),
+    'host-baseline',
+  );
+
+  const targetsInventory = {};
+  const provenanceTargets = {};
+  const npmPayloadEntries = [];
+  const artifacts = [];
+
+  for (const meta of TARGET_MATRIX) {
+    const admitted = admittedByTuple.get(meta.tuple);
+    if (!admitted) {
+      const missingEntry = {
         status: 'missing',
         platform: meta.platform,
         arch: meta.arch,
@@ -136,19 +199,14 @@ export function stageRelease(opts, cliRoot) {
         binaryName: meta.binaryName,
         reason: 'no prebuilt artifact supplied',
       };
+      targetsInventory[meta.tuple] = missingEntry;
+      provenanceTargets[meta.tuple] = missingEntry;
       continue;
     }
 
-    if (!supplied.clec) {
-      throw new Error(`Target ${meta.tuple} must specify \`clec\` binary path.`);
-    }
-    const clecPath = resolve(supplied.clec);
-    if (clecPath.includes('clec_test_fixture')) {
-      throw new Error(`Refusing test-hooks fixture binary in release staging: ${clecPath}`);
-    }
-    const clecBytes = readRegularFile(clecPath);
-    const clecSha = sha256Hex(clecBytes);
     const payloadRel = `payloads/${meta.tuple}/${meta.binaryName}`;
+    const clecSha = admitted.clec.sha256;
+    const clecBytes = admitted.clec.bytes;
 
     targetsInventory[meta.tuple] = {
       status: 'present',
@@ -160,7 +218,23 @@ export function stageRelease(opts, cliRoot) {
       payloadPath: payloadRel,
       bytes: clecBytes.length,
       sha256: clecSha,
-      executionEvidence: supplied.executionEvidence ?? 'unverified',
+      structuralIdentity: admitted.structuralIdentity,
+      executionEvidence: admitted.executionEvidence,
+    };
+
+    provenanceTargets[meta.tuple] = {
+      ...targetsInventory[meta.tuple],
+      buildReceipt: {
+        receiptKind: admitted.receipt.receiptKind,
+        trustModel: admitted.receipt.trustModel,
+        sourceCommit: admitted.receipt.sourceCommit,
+        sourceDirty: admitted.receipt.sourceDirty,
+        cargoLockSha256: admitted.receipt.cargoLockSha256,
+        rustcVersion: admitted.receipt.rustcVersion,
+        buildCommand: admitted.receipt.buildCommand,
+        hostBaseline: admitted.receipt.hostBaseline,
+        artifacts: admitted.receipt.artifacts,
+      },
     };
 
     npmPayloadEntries.push({
@@ -196,14 +270,9 @@ export function stageRelease(opts, cliRoot) {
       sha256: sha256Hex(consumerArchiveBytes),
     });
 
-    if (supplied.clecPublish || supplied.clecValidate) {
-      if (!supplied.clecPublish || !supplied.clecValidate) {
-        throw new Error(
-          `Target ${meta.tuple} maintainer archive requires both \`clecPublish\` and \`clecValidate\`.`,
-        );
-      }
-      const pubBytes = readRegularFile(resolve(supplied.clecPublish));
-      const valBytes = readRegularFile(resolve(supplied.clecValidate));
+    if (admitted.maintainer) {
+      const pubBytes = admitted.maintainer.clecPublish.bytes;
+      const valBytes = admitted.maintainer.clecValidate.bytes;
       const [pubName, valName] = meta.maintainerBinaries;
       const maintRoot = `clec-maintainer-v${PACKAGE_VERSION}-${meta.tuple}`;
       const maintChecksums = `${sha256Hex(pubBytes)}  ${pubName}\n${sha256Hex(valBytes)}  ${valName}\n${sha256Hex(noticesBytes)}  NOTICES.md\n`;
@@ -233,13 +302,6 @@ export function stageRelease(opts, cliRoot) {
     }
   }
 
-  const complete = missingTuples.length === 0;
-  if (!complete && !opts.allowPartial) {
-    throw new Error(
-      `Refusing incomplete production staging; missing target tuples: ${missingTuples.join(', ')}. Pass --allow-partial for local partial staging.`,
-    );
-  }
-
   const inventory = {
     schemaVersion: 1,
     packageName: PACKAGE_NAME,
@@ -251,26 +313,26 @@ export function stageRelease(opts, cliRoot) {
   const inventoryBytes = Buffer.from(`${JSON.stringify(inventory, null, 2)}\n`, 'utf8');
   writeFileSync(join(outputDir, 'inventory.json'), inventoryBytes);
 
-  const cargoLockSha256 = opts.cargoLockPath
-    ? sha256Hex(readRegularFile(resolve(opts.cargoLockPath)))
-    : null;
   const provenance = {
     schemaVersion: 1,
     packageName: PACKAGE_NAME,
     packageVersion: PACKAGE_VERSION,
     complete,
     publishable: false,
-    sourceCommit: opts.sourceCommit,
-    cargoLockSha256,
-    rustcVersion: opts.rustcVersion,
+    trustBoundary:
+      'Unsigned local build receipts bind payload SHA-256 hashes to observed compiler, Cargo.lock, and embedded compile metadata; they do not authenticate a remote publisher or certify execution on unexecuted target OSes.',
+    sourceCommit: sourceCommits[0],
+    sourceDirty: admittedReceipts.some((r) => r.sourceDirty),
+    cargoLockSha256: cargoLocks[0],
+    rustcVersion: uniformOrPerTarget(admittedReceipts.map((r) => r.rustcVersion)),
     features: [],
     testHooksIncluded: false,
-    buildCommand: opts.buildCommand,
-    hostBaseline: opts.hostBaseline,
+    buildCommand: uniformOrPerTarget(admittedReceipts.map((r) => r.buildCommand)),
+    hostBaseline: uniformOrPerTarget(admittedReceipts.map((r) => r.hostBaseline)),
     licenseStatus: 'unassigned_pending_maintainer_confirmation',
     repositoryNote:
       'Recorded metadata Centurybbx/clec-cli returned 404 and root git has no remotes; no public release URL assumed.',
-    targets: targetsInventory,
+    targets: provenanceTargets,
   };
   const provenanceBytes = Buffer.from(`${JSON.stringify(provenance, null, 2)}\n`, 'utf8');
   writeFileSync(join(outputDir, 'provenance.json'), provenanceBytes);
@@ -280,6 +342,7 @@ export function stageRelease(opts, cliRoot) {
     { path: `package/${BIN_TARGET_REL}`, data: placeholderBytes, executable: false },
     { path: 'package/scripts/install.mjs', data: installScriptBytes, executable: false },
     { path: 'package/scripts/targets.mjs', data: targetsScriptBytes, executable: false },
+    { path: 'package/scripts/artifact-admission.mjs', data: admissionScriptBytes, executable: false },
     { path: 'package/skills/clec/SKILL.md', data: skillBytes, executable: false },
     { path: 'package/NOTICES.md', data: noticesBytes, executable: false },
     { path: 'package/README.md', data: readmeBytes, executable: false },

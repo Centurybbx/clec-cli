@@ -1,5 +1,6 @@
 export const PACKAGE_NAME = '@clec/cli';
 export const PACKAGE_VERSION = '1.0.0-dev.0';
+export const NATIVE_CRATE_NAME = 'clec-native';
 export const COMMAND_NAME = 'clec';
 export const BIN_TARGET_REL = 'bin/clec.exe';
 
@@ -13,6 +14,7 @@ export const TARGET_MATRIX = Object.freeze([
     maintainerBinaries: Object.freeze(['clec-publish', 'clec-validate']),
     archiveFormat: 'tar.gz',
     libc: 'apple-dyld',
+    executableFormat: 'macho-64',
   }),
   Object.freeze({
     tuple: 'darwin-x64',
@@ -23,6 +25,7 @@ export const TARGET_MATRIX = Object.freeze([
     maintainerBinaries: Object.freeze(['clec-publish', 'clec-validate']),
     archiveFormat: 'tar.gz',
     libc: 'apple-dyld',
+    executableFormat: 'macho-64',
   }),
   Object.freeze({
     tuple: 'linux-x64',
@@ -33,6 +36,7 @@ export const TARGET_MATRIX = Object.freeze([
     maintainerBinaries: Object.freeze(['clec-publish', 'clec-validate']),
     archiveFormat: 'tar.gz',
     libc: 'musl-static',
+    executableFormat: 'elf-64',
   }),
   Object.freeze({
     tuple: 'linux-arm64',
@@ -43,6 +47,7 @@ export const TARGET_MATRIX = Object.freeze([
     maintainerBinaries: Object.freeze(['clec-publish', 'clec-validate']),
     archiveFormat: 'tar.gz',
     libc: 'musl-static',
+    executableFormat: 'elf-64',
   }),
   Object.freeze({
     tuple: 'win32-x64',
@@ -53,6 +58,7 @@ export const TARGET_MATRIX = Object.freeze([
     maintainerBinaries: Object.freeze(['clec-publish.exe', 'clec-validate.exe']),
     archiveFormat: 'zip',
     libc: 'msvc',
+    executableFormat: 'pe-64',
   }),
 ]);
 
