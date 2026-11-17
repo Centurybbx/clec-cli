@@ -1,6 +1,6 @@
 pub(crate) mod jev;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Instant;
 
 use schemars::JsonSchema;
@@ -286,13 +286,13 @@ struct PoolCandidate {
 }
 
 struct TermDfCache {
-    entries: HashMap<String, usize>,
+    entries: BTreeMap<String, usize>,
 }
 
 impl TermDfCache {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
         }
     }
 
@@ -646,17 +646,14 @@ fn run_sag2_pinned(
         if merged_new.is_empty() {
             (pool0, Sag2StopReason::NoExpansionCandidates)
         } else {
-            let mut pool0_by_id: HashMap<PassageId, PoolCandidate> = pool0
+            let mut pool0_by_id: BTreeMap<PassageId, PoolCandidate> = pool0
                 .into_iter()
                 .map(|c| (c.passage_id.clone(), c))
                 .collect();
 
             let mut ordered_carry_ids = Vec::new();
-            let mut carried_set = HashSet::new();
+            let mut carried_set = BTreeSet::new();
 
-            for &idx in seed_indices.iter() {
-                let _ = idx;
-            }
             let mut r0_by_rank: Vec<PassageId> = pool0_by_id.keys().cloned().collect();
             r0_by_rank.sort_by_key(|pid| pool0_by_id[pid].retrieval_rank);
             for pid in r0_by_rank.iter().take(5) {
@@ -1039,13 +1036,13 @@ fn derive_expansion_terms(
 
     let max_score = seeds.iter().map(|s| s.jev_score).fold(0.0_f64, f64::max);
 
-    let mut ranked: HashMap<String, DerivedTerm> = HashMap::new();
+    let mut ranked: BTreeMap<String, DerivedTerm> = BTreeMap::new();
 
     for seed in seeds {
         check_deadline(run_deadline)?;
         let sentences = split_sentences(&seed.text);
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let mut context_scores: HashMap<String, f64> = HashMap::new();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut context_scores: BTreeMap<String, f64> = BTreeMap::new();
 
         for sentence in sentences {
             let tokens = tokenize_non_stop(sentence);
@@ -1129,6 +1126,24 @@ fn float_ulp(x: f64) -> f64 {
     }
 }
 
+fn sorted_sparse_dot(a: &[(String, f64)], b: &[(String, f64)]) -> f64 {
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    let mut sum = 0.0_f64;
+    while ia < a.len() && ib < b.len() {
+        match a[ia].0.cmp(&b[ib].0) {
+            std::cmp::Ordering::Less => ia += 1,
+            std::cmp::Ordering::Greater => ib += 1,
+            std::cmp::Ordering::Equal => {
+                sum += a[ia].1 * b[ib].1;
+                ia += 1;
+                ib += 1;
+            }
+        }
+    }
+    sum
+}
+
 fn rank_dpp_indices(
     store: &CorpusStore,
     df_cache: &mut TermDfCache,
@@ -1141,30 +1156,30 @@ fn rank_dpp_indices(
         return Ok((0..k).collect());
     }
 
-    let mut vectors: Vec<HashMap<String, f64>> = Vec::with_capacity(k);
+    let mut vectors: Vec<Vec<(String, f64)>> = Vec::with_capacity(k);
     for cand in candidates {
         check_deadline(run_deadline)?;
-        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for tok in tokenize_non_stop(&cand.text) {
             *counts.entry(tok).or_insert(0) += 1;
         }
-        let mut vec_map = HashMap::with_capacity(counts.len());
+        let mut sparse = Vec::with_capacity(counts.len());
         let mut norm_sq = 0.0_f64;
         for (term, tf) in counts {
             let df = df_cache.get(store, &term)?;
             let w = (1.0 + (tf as f64).ln()) * dpp_idf(total_passages, df);
             norm_sq += w * w;
-            vec_map.insert(term, w);
+            sparse.push((term, w));
         }
         let norm = norm_sq.sqrt();
         if norm > 0.0 {
-            for val in vec_map.values_mut() {
+            for (_, val) in &mut sparse {
                 *val /= norm;
             }
         } else {
-            vec_map.clear();
+            sparse.clear();
         }
-        vectors.push(vec_map);
+        vectors.push(sparse);
     }
 
     let scores: Vec<f64> = candidates.iter().map(|c| c.jev_score).collect();
@@ -1172,10 +1187,7 @@ fn rank_dpp_indices(
     for i in 0..k {
         kernel[i][i] = scores[i] * scores[i];
         for j in (i + 1)..k {
-            let dot: f64 = vectors[i]
-                .iter()
-                .map(|(t, &w)| w * vectors[j].get(t).copied().unwrap_or(0.0))
-                .sum();
+            let dot = sorted_sparse_dot(&vectors[i], &vectors[j]);
             let entry = scores[i] * scores[j] * dot;
             kernel[i][j] = entry;
             kernel[j][i] = entry;
@@ -1233,6 +1245,7 @@ mod tests {
     use crate::retrieval::{SearchRequest, execute_search};
     use crate::store::{CorpusCounts, SCHEMA_SQL};
     use rusqlite::{Connection, params};
+    use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::thread;
