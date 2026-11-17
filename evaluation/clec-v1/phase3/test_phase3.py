@@ -8,10 +8,12 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+from typing import TypedDict
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -20,9 +22,19 @@ import projection
 import score
 
 
+class _CliStepDict(TypedDict):
+    step: str
+    argv: list[str]
+    exitCode: int | None
+    timedOut: bool
+    elapsedSeconds: float
+    stdoutUtf8: str
+    stderrUtf8: str
+
+
 def _make_v2_outcome(
     qid: str,
-    steps: list[dict[str, object]],
+    steps: list[_CliStepDict],
     *,
     status: str = "completed",
     stop_reason: str | None = None,
@@ -48,10 +60,10 @@ def _make_cli_step(
     payload_items: list[dict[str, object]],
     *,
     extra_data: dict[str, object] | None = None,
-    exit_code: int = 0,
+    exit_code: int | None = 0,
     timed_out: bool = False,
     stderr_utf8: str = "",
-) -> dict[str, object]:
+) -> _CliStepDict:
     data: dict[str, object] = {"release": release_sha}
     if step_name == "search":
         data["hits"] = payload_items
@@ -863,7 +875,7 @@ class Phase3HarnessTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        overview_step = {
+        overview_step: _CliStepDict = {
             "step": "read",
             "argv": ["clec", "read", sid_srt],
             "exitCode": 0,
@@ -888,7 +900,7 @@ class Phase3HarnessTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        orig_step = {
+        orig_step: _CliStepDict = {
             "step": "read",
             "argv": ["clec", "read", self.sid_by_path["ep1.txt"], "--original"],
             "exitCode": 0,
@@ -909,10 +921,15 @@ class Phase3HarnessTests(unittest.TestCase):
         spoof_orig_payload = json.loads(orig_proc.stdout)
         spoof_orig_payload["data"]["items"][0]["originalText"] = "spoofed original text"
         spoof_orig_payload["data"].pop("budget", None)
-        spoof_orig_step = dict(
-            orig_step,
-            stdoutUtf8=json.dumps(spoof_orig_payload, ensure_ascii=False, separators=(",", ":")) + "\n",
-        )
+        spoof_orig_step: _CliStepDict = {
+            "step": orig_step["step"],
+            "argv": orig_step["argv"],
+            "exitCode": orig_step["exitCode"],
+            "timedOut": orig_step["timedOut"],
+            "elapsedSeconds": orig_step["elapsedSeconds"],
+            "stdoutUtf8": json.dumps(spoof_orig_payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            "stderrUtf8": orig_step["stderrUtf8"],
+        }
         spoof_orig_res = score.summarize_evaluation(
             dataset,
             [_make_v2_outcome("q-prov", [spoof_orig_step])],
@@ -934,7 +951,7 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertGreaterEqual(len(ctx_payload["data"]["items"][0]["context"]), 1)
         ctx_payload["data"]["items"][0]["context"][0]["text"] = "spoofed context text"
         ctx_payload["data"].pop("budget", None)
-        ctx_spoof_step = {
+        ctx_spoof_step: _CliStepDict = {
             "step": "read",
             "argv": ["clec", "read", ep1_first["passageId"], "--context", "1"],
             "exitCode": 0,
@@ -990,7 +1007,7 @@ class Phase3HarnessTests(unittest.TestCase):
             extra_data={"metadata": "x" * 600},
             stderr_utf8="warning on stderr not counted toward stdout\n",
         )
-        raw_stdout_len = len(envelope_step["stdoutUtf8"].encode("utf-8"))  # type: ignore[union-attr]
+        raw_stdout_len = len(envelope_step["stdoutUtf8"].encode("utf-8"))
         self.assertGreater(raw_stdout_len, compact_item_bytes + 500)
 
         over_budget_res = score.summarize_evaluation(
@@ -1010,8 +1027,8 @@ class Phase3HarnessTests(unittest.TestCase):
         ep1_cond_hit = next(h for h in self.p_by_path["ep1.srt"] if "若無稅務問題才能匯回臺灣" in h["text"])
         big_first_step = _make_cli_step("search", self.corpus_sha, [ep1_cond_hit], extra_data={"metadata": "y" * 1200})
         small_read_step = _make_cli_step("read", self.corpus_sha, [{**sum_hit, "kind": "passage", "context": []}])
-        big_len = len(big_first_step["stdoutUtf8"].encode("utf-8"))  # type: ignore[union-attr]
-        small_len = len(small_read_step["stdoutUtf8"].encode("utf-8"))  # type: ignore[union-attr]
+        big_len = len(big_first_step["stdoutUtf8"].encode("utf-8"))
+        small_len = len(small_read_step["stdoutUtf8"].encode("utf-8"))
         cum_cap = max(small_len + 50, big_len - 1)
         self.assertLess(cum_cap, big_len)
 
@@ -1097,7 +1114,7 @@ class Phase3HarnessTests(unittest.TestCase):
             ],
         }
         empty_search_step = _make_cli_step("search", self.corpus_sha, [])
-        timeout_step = {
+        timeout_step: _CliStepDict = {
             "step": "search",
             "argv": ["clec", "search"],
             "exitCode": None,
@@ -1438,6 +1455,524 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertEqual(bench_err_rep["comparisonVerdict"], "inconclusive_errors_present")
         self.assertEqual(bench_err_rep["wholeProcessCli"]["single_query_product_baseline"]["errorCount"], 5)
         self.assertEqual(bench_err_rep["wholeProcessCli"]["rrf_multiquery"]["errorCount"], 5)
+
+    def test_execution_boundary_rejects_failed_timedout_and_incoherent_steps(self) -> None:
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        valid_hit = next(h for h in self.p_by_path["ep1.srt"] if "若無稅務問題才能匯回臺灣" in h["text"])
+        valid_search = _make_cli_step("search", self.corpus_sha, [valid_hit])
+        failed_read = _make_cli_step("read", self.corpus_sha, [], exit_code=2, stderr_utf8="read error")
+        timed_out_read = _make_cli_step("read", self.corpus_sha, [], exit_code=None, timed_out=True)
+        incoherent_to_zero = _make_cli_step("read", self.corpus_sha, [valid_hit], exit_code=0, timed_out=True)
+
+        questions = [
+            {
+                "id": f"q-{idx}",
+                "category": "condition",
+                "question": "稅務條件",
+                "answerable": True,
+                "workKeys": ["w:ep1"],
+                "evidence": [
+                    {
+                        "claimId": f"c-{idx}",
+                        "sourceId": sid_srt,
+                        "path": "ep1.srt",
+                        "spans": [sp_srt],
+                        "quote": "若無稅務問題才能匯回臺灣",
+                        "kind": "condition",
+                    }
+                ],
+            }
+            for idx in range(7)
+        ]
+        dataset = {
+            "schemaVersion": 1,
+            "corpusSha256": self.corpus_sha,
+            "split": "development",
+            "questions": questions,
+        }
+        outcomes = [
+            _make_v2_outcome("q-0", [valid_search, failed_read], status="error", stop_reason="read_cli_error:2"),
+            _make_v2_outcome("q-1", [valid_search, failed_read], status="completed"),
+            _make_v2_outcome("q-2", [valid_search, timed_out_read], status="completed"),
+            _make_v2_outcome("q-3", [valid_search, incoherent_to_zero], status="completed"),
+            _make_v2_outcome("q-4", [], status="completed"),
+            _make_v2_outcome("q-5", [valid_search], status="timeout", stop_reason="forged_timeout"),
+            _make_v2_outcome("q-6", [valid_search], status="partial"),
+        ]
+        summary = score.summarize_evaluation(dataset, outcomes, self.corpus, self.corpus_sha)
+        self.assertEqual(summary["verdict"], "inconclusive_errors_present")
+        self.assertEqual(summary["counts"]["scheduledQuestions"], 7)
+        self.assertEqual(summary["counts"]["completedAnswerable"], 0)
+        self.assertEqual(summary["counts"]["errorsOrTimeouts"], 7)
+        self.assertFalse(summary["gates"]["zeroErrorsInDenominator"])
+        self.assertFalse(summary["gates"]["zeroCriticalConditionLoss"])
+        for row in summary["perQuestion"]:
+            self.assertNotEqual(row["status"], "completed")
+            self.assertIsNone(row["evidenceCoverage"])
+            self.assertIsNone(row["completeChain"])
+            self.assertIsNone(row["conditionLoss"])
+
+        eval_py = Path(__file__).resolve().parent / "eval.py"
+        fail_read_cli = self.tmp / "fail-read-clec.sh"
+        fail_read_cli.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do\n"
+            "  if [ \"$arg\" = \"read\" ]; then\n"
+            "    echo '{\"schemaVersion\":1,\"ok\":false,\"error\":{\"code\":\"READ_FAIL\"}}' >&2\n"
+            "    exit 2\n"
+            "  fi\n"
+            "done\n"
+            f"exec \"{self.clec_bin}\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        fail_read_cli.chmod(fail_read_cli.stat().st_mode | stat.S_IXUSR)
+        ds_file = self.tmp / "exec-boundary-ds.json"
+        ds_file.write_text(
+            json.dumps({**dataset, "questions": [questions[0]]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        run_out = self.tmp / "exec-boundary-run.json"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(eval_py),
+                "run",
+                "--clec",
+                str(fail_read_cli),
+                "--data-dir",
+                str(self.data_dir),
+                "--corpus-sha256",
+                self.corpus_sha,
+                "--dataset",
+                str(ds_file),
+                "--read-top-n",
+                "1",
+                "--output",
+                str(run_out),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        rep = json.loads(run_out.read_text(encoding="utf-8"))
+        self.assertEqual(rep["verdict"], "inconclusive_errors_present")
+        self.assertIsNone(rep["perQuestion"][0]["completeChain"])
+        self.assertIsNone(rep["perQuestion"][0]["evidenceCoverage"])
+
+    def test_active_corpus_coherence_across_validate_run_and_score_outcomes(self) -> None:
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        valid_hit = next(h for h in self.p_by_path["ep1.srt"] if "若無稅務問題才能匯回臺灣" in h["text"])
+        dataset_path = self.tmp / "coherence-ds.json"
+        dataset_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "corpusSha256": self.corpus_sha,
+                    "split": "development",
+                    "questions": [
+                        {
+                            "id": "q-coh",
+                            "category": "condition",
+                            "question": "匯回臺灣 稅務問題",
+                            "answerable": True,
+                            "workKeys": ["w:ep1"],
+                            "evidence": [
+                                {
+                                    "claimId": "c1",
+                                    "sourceId": sid_srt,
+                                    "path": "ep1.srt",
+                                    "spans": [sp_srt],
+                                    "quote": "若無稅務問題才能匯回臺灣",
+                                    "kind": "condition",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        outcomes_path = self.tmp / "coherence-outcomes.json"
+        outcomes_path.write_text(
+            json.dumps([_make_v2_outcome("q-coh", [_make_cli_step("search", self.corpus_sha, [valid_hit])])]),
+            encoding="utf-8",
+        )
+        eval_py = Path(__file__).resolve().parent / "eval.py"
+
+        for case_name in ("all_zero_release", "missing_active_json", "malformed_active_json", "dir_active_json"):
+            bad_dir = self.tmp / f"coh-{case_name}"
+            shutil.copytree(self.data_dir, bad_dir)
+            active_file = bad_dir / "active.json"
+            if case_name == "all_zero_release":
+                active_file.write_text(
+                    json.dumps({"release": "0" * 64, "manifestPath": str(self.rel_dir / "manifest.json")}),
+                    encoding="utf-8",
+                )
+            elif case_name == "missing_active_json":
+                active_file.unlink()
+            elif case_name == "malformed_active_json":
+                active_file.write_text("{not-json", encoding="utf-8")
+            elif case_name == "dir_active_json":
+                active_file.unlink()
+                active_file.mkdir()
+
+            val_p = subprocess.run(
+                [
+                    sys.executable,
+                    str(eval_py),
+                    "validate-dataset",
+                    "--dataset",
+                    str(dataset_path),
+                    "--data-dir",
+                    str(bad_dir),
+                    "--corpus-sha256",
+                    self.corpus_sha,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(val_p.returncode, 0, case_name)
+            self.assertFalse(json.loads(val_p.stdout)["valid"], case_name)
+
+            score_p = subprocess.run(
+                [
+                    sys.executable,
+                    str(eval_py),
+                    "score-outcomes",
+                    "--dataset",
+                    str(dataset_path),
+                    "--outcomes",
+                    str(outcomes_path),
+                    "--data-dir",
+                    str(bad_dir),
+                    "--corpus-sha256",
+                    self.corpus_sha,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(score_p.returncode, 0, case_name)
+            self.assertEqual(json.loads(score_p.stdout)["verdict"], "inconclusive", case_name)
+
+            run_p = subprocess.run(
+                [
+                    sys.executable,
+                    str(eval_py),
+                    "run",
+                    "--clec",
+                    str(self.clec_bin),
+                    "--data-dir",
+                    str(bad_dir),
+                    "--corpus-sha256",
+                    self.corpus_sha,
+                    "--dataset",
+                    str(dataset_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(run_p.returncode, 0, case_name)
+            self.assertEqual(json.loads(run_p.stdout)["verdict"], "inconclusive", case_name)
+
+    def test_unicode_whitespace_and_projection_parity_with_native_corpus(self) -> None:
+        ws = self.tmp / "parity-ws"
+        ws.mkdir()
+        (ws / "sep_plain.txt").write_bytes(
+            b"\xef\xbb\xbfalpha\x1cbeta\x1dgamma\x1edelta\x1fepsilon\xc2\x85zeta\xc2\xa0eta\xe3\x80\x80theta\r\nsecondline\n"
+        )
+        (ws / "sep_alias.srt").write_bytes(
+            b"1\r\n00:00:01,000 --> 00:00:03,000\r\nalpha\x1cbeta\x1dgamma\x1edelta\x1fepsilon\xc2\x85zeta\xc2\xa0eta\xe3\x80\x80theta\r\nsecondline\r\n"
+        )
+        (ws / "voice_note.md").write_bytes(
+            (
+                "\ufeff# 語音筆記：Parity\r\n\r\n"
+                "## [01:02.000 – 01:05.000]\r\n"
+                "alpha\u001cbeta\rcarriage\r\n"
+                "## [00:01:06,000 - 00:01:08,500]\r\n"
+                "gamma\u00a0delta\u2028omega\r\n"
+            ).encode("utf-8")
+        )
+        (ws / "voice_note.txt").write_bytes("alpha\u001cbeta\rcarriage\ngamma\u00a0delta\u2028omega\n".encode("utf-8"))
+        (ws / "cue_vtt.vtt").write_bytes(
+            "WEBVTT\r\n\r\n00:01.000 --> 00:03.000\r\nfirst\u001cpart\u3000second\u00a0part\r\n".encode("utf-8")
+        )
+        intake = self.tmp / "parity-intake.json"
+        intake.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "works": [
+                        {"key": "w:sep", "title": "Sep"},
+                        {"key": "w:md", "title": "MD"},
+                        {"key": "w:vtt", "title": "VTT"},
+                    ],
+                    "sources": [
+                        {"work": "w:sep", "path": "sep_plain.txt", "title": "P", "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                        {"work": "w:sep", "path": "sep_alias.srt", "title": "S", "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                        {"work": "w:md", "path": "voice_note.md", "title": "MD", "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                        {"work": "w:md", "path": "voice_note.txt", "title": "TXT", "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                        {"work": "w:vtt", "path": "cue_vtt.vtt", "title": "VTT", "role": "transcript", "attribution": "authored_fixture", "quality": "fixture", "status": "ready"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        rel = self.tmp / "parity-rel"
+        pub = subprocess.run(
+            [str(self.pub_bin), "--workspace", str(ws), "--intake", str(intake), "--output", str(rel)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        sha = json.loads(pub.stdout)["sha256"]
+        data_dir = self.tmp / "parity-data"
+        subprocess.run(
+            [str(self.clec_bin), "--data-dir", str(data_dir), "sync", "--manifest", str(rel / "manifest.json")],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        with score.CorpusIndexView(data_dir / f"{sha}.sqlite", sha) as parity_corpus:
+            for sid, meta in parity_corpus.sources.items():
+                proj = parity_corpus.projected_for_source(sid)
+                self.assertEqual(proj.equivalence_hash, meta["equivalenceHash"], meta["path"])
+
+            sids = {v["path"]: sid for sid, v in parity_corpus.sources.items()}
+            self.assertTrue(parity_corpus.are_canonical_aliases(sids["sep_plain.txt"], sids["sep_alias.srt"]))
+            self.assertTrue(parity_corpus.are_canonical_aliases(sids["voice_note.md"], sids["voice_note.txt"]))
+
+            raw_plain = parity_corpus.raw_bytes_for_source(sids["sep_plain.txt"])
+            needle = b"alpha\x1cbeta"
+            pos = raw_plain.index(needle)
+            ds = {
+                "schemaVersion": 1,
+                "corpusSha256": sha,
+                "split": "development",
+                "questions": [
+                    {
+                        "id": "q-empty-no-crash",
+                        "category": "alias",
+                        "question": "sep",
+                        "answerable": True,
+                        "workKeys": ["w:sep"],
+                        "evidence": [
+                            {
+                                "claimId": "c1",
+                                "sourceId": sids["sep_plain.txt"],
+                                "path": "sep_plain.txt",
+                                "spans": [{"startByte": pos, "endByte": pos + len(needle)}],
+                                "quote": "alpha\u001cbeta",
+                                "kind": "required",
+                            }
+                        ],
+                    }
+                ],
+            }
+            res = score.summarize_evaluation(
+                ds,
+                [_make_v2_outcome("q-empty-no-crash", [_make_cli_step("search", sha, [])])],
+                parity_corpus,
+                sha,
+            )
+            self.assertEqual(res["perQuestion"][0]["evidenceCoverage"], 0.0)
+            self.assertFalse(res["perQuestion"][0]["completeChain"])
+
+            parity_corpus._proj_cache.clear()
+            parity_corpus.sources[sids["sep_plain.txt"]]["equivalenceHash"] = "f" * 64
+            inc = score.summarize_evaluation(
+                ds,
+                [_make_v2_outcome("q-empty-no-crash", [_make_cli_step("search", sha, [])])],
+                parity_corpus,
+                sha,
+            )
+            self.assertEqual(inc["verdict"], "inconclusive_errors_present")
+            self.assertEqual(inc["perQuestion"][0]["status"], "inconclusive")
+            self.assertIn("projection_error", inc["perQuestion"][0]["stopReason"])
+            self.assertIsNone(inc["perQuestion"][0]["completeChain"])
+            self.assertIsNone(inc["perQuestion"][0]["evidenceCoverage"])
+
+    def test_subprocess_byte_capture_crlf_multibyte_invalid_utf8_and_timeout_partial_bytes(self) -> None:
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        valid_hit = next(h for h in self.p_by_path["ep1.srt"] if "若無稅務問題才能匯回臺灣" in h["text"])
+
+        payload_obj = {
+            "schemaVersion": 1,
+            "ok": True,
+            "command": "search",
+            "data": {"release": self.corpus_sha, "hits": [valid_hit], "note": "漢字\r\n換行"},
+        }
+        raw_crlf = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\r\n"
+        crlf_cli = self.tmp / "crlf-clec.py"
+        crlf_cli.write_text(
+            f"#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write({raw_crlf!r})\n",
+            encoding="utf-8",
+        )
+        crlf_cli.chmod(crlf_cli.stat().st_mode | stat.S_IXUSR)
+
+        rec_crlf = adapter.run_clec_command(
+            crlf_cli, ["search", "x"], data_dir=self.data_dir, max_bytes=65536, timeout_sec=5.0
+        )
+        self.assertEqual(len(rec_crlf["stdout"].encode("utf-8")), len(raw_crlf))
+        self.assertIn("\r\n", rec_crlf["stdout"])
+        self.assertIsNone(rec_crlf["stdoutDecodeError"])
+
+        ds = {
+            "schemaVersion": 1,
+            "corpusSha256": self.corpus_sha,
+            "split": "development",
+            "questions": [
+                {
+                    "id": "q-bytes",
+                    "category": "budget",
+                    "question": "稅務",
+                    "answerable": True,
+                    "workKeys": ["w:ep1"],
+                    "evidence": [
+                        {
+                            "claimId": "c1",
+                            "sourceId": sid_srt,
+                            "path": "ep1.srt",
+                            "spans": [sp_srt],
+                            "quote": "若無稅務問題才能匯回臺灣",
+                            "kind": "condition",
+                        }
+                    ],
+                }
+            ],
+        }
+        outcomes, _ = adapter.execute_dataset_queries(
+            clec_bin=crlf_cli,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=ds["questions"],
+            max_bytes=len(raw_crlf),
+            timeout_sec=5.0,
+        )
+        under_cap = score.summarize_evaluation(
+            ds, outcomes, self.corpus, self.corpus_sha, stdout_byte_budget=len(raw_crlf)
+        )
+        self.assertFalse(under_cap["perQuestion"][0]["stdoutBudgetExceeded"])
+        self.assertEqual(under_cap["perQuestion"][0]["searchStdoutUtf8Bytes"], len(raw_crlf))
+
+        over_cap = score.summarize_evaluation(
+            ds, outcomes, self.corpus, self.corpus_sha, stdout_byte_budget=len(raw_crlf) - 1
+        )
+        self.assertTrue(over_cap["perQuestion"][0]["stdoutBudgetExceeded"])
+        self.assertFalse(over_cap["perQuestion"][0]["completeChain"])
+
+        bad_utf8_cli = self.tmp / "bad-utf8-clec.py"
+        bad_utf8_cli.write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'{\"ok\":true}\\xff\\xfe')\n",
+            encoding="utf-8",
+        )
+        bad_utf8_cli.chmod(bad_utf8_cli.stat().st_mode | stat.S_IXUSR)
+        rec_bad = adapter.run_clec_command(
+            bad_utf8_cli, ["search", "x"], data_dir=self.data_dir, max_bytes=65536, timeout_sec=5.0
+        )
+        self.assertIsNone(rec_bad["stdout"])
+        self.assertIsNotNone(rec_bad["stdoutDecodeError"])
+        self.assertEqual(rec_bad["stdoutRawByteLen"], 13)
+
+        bad_outcomes, _ = adapter.execute_dataset_queries(
+            clec_bin=bad_utf8_cli,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=ds["questions"],
+            timeout_sec=5.0,
+        )
+        self.assertEqual(bad_outcomes[0]["status"], "error")
+        self.assertIsNone(bad_outcomes[0]["steps"][0]["stdoutUtf8"])
+        bad_scored = score.summarize_evaluation(ds, bad_outcomes, self.corpus, self.corpus_sha)
+        self.assertEqual(bad_scored["verdict"], "inconclusive_errors_present")
+        self.assertFalse(bad_scored["perQuestion"][0]["citationRawSpanValid"])
+        self.assertIsNone(bad_scored["perQuestion"][0]["completeChain"])
+
+        partial_to_cli = self.tmp / "partial-to-clec.sh"
+        partial_to_cli.write_text(
+            "#!/bin/sh\nprintf '{\"a\":\\344\\270'\nexec sleep 2\n",
+            encoding="utf-8",
+        )
+        partial_to_cli.chmod(partial_to_cli.stat().st_mode | stat.S_IXUSR)
+        rec_to = adapter.run_clec_command(
+            partial_to_cli, ["search", "x"], data_dir=self.data_dir, max_bytes=65536, timeout_sec=0.5
+        )
+        self.assertTrue(rec_to["timedOut"])
+        self.assertIsNone(rec_to["stdout"])
+        self.assertIsNotNone(rec_to["stdoutDecodeError"])
+        self.assertEqual(rec_to["stdoutRawByteLen"], 7)
+
+    def test_bench_rejects_duplicate_and_semantically_identical_rewrite_plans(self) -> None:
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        dataset_path = self.tmp / "bench-dup-ds.json"
+        dataset_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "corpusSha256": self.corpus_sha,
+                    "split": "development",
+                    "questions": [
+                        {
+                            "id": "q-b1",
+                            "category": "condition",
+                            "question": "稅務問題",
+                            "answerable": True,
+                            "workKeys": ["w:ep1"],
+                            "evidence": [
+                                {
+                                    "claimId": "c1",
+                                    "sourceId": sid_srt,
+                                    "path": "ep1.srt",
+                                    "spans": [sp_srt],
+                                    "quote": "若無稅務問題才能匯回臺灣",
+                                    "kind": "condition",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bench_py = Path(__file__).resolve().parent / "bench.py"
+
+        for case_name, queries in (
+            ("exact_duplicate", ["稅務", "稅務"]),
+            ("tw2s_semantic_duplicate", ["稅務問題", "税务问题"]),
+        ):
+            blind_p = self.tmp / f"blind-{case_name}.json"
+            blind_p.write_text(json.dumps([{"id": "q-b1", "queries": queries}], ensure_ascii=False), encoding="utf-8")
+            out_p = self.tmp / f"bench-{case_name}.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(bench_py),
+                    "--clec",
+                    str(self.clec_bin),
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--corpus-sha256",
+                    self.corpus_sha,
+                    "--dataset",
+                    str(dataset_path),
+                    "--blind-queries",
+                    str(blind_p),
+                    "--query-angle",
+                    "blind_rewrite",
+                    "--repeats",
+                    "5",
+                    "--output",
+                    str(out_p),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            rep = json.loads(out_p.read_text(encoding="utf-8"))
+            self.assertEqual(rep["comparisonStatus"], "IDENTICAL_QUERY_PLANS", case_name)
+            self.assertEqual(rep["comparisonVerdict"], "no_comparison_identical_query_plans", case_name)
 
 
 if __name__ == "__main__":
