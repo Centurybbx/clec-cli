@@ -879,13 +879,31 @@ fn group1_tiny_positive_max_bytes_rejected_before_io() {
         &key_env,
     );
     assert_ok_json(&no_cand_out);
-    let no_cand_len = no_cand_out.stdout.len();
+    let initial_len = no_cand_out.stdout.len();
+    let exact_out = run_clec(
+        &[
+            "--data-dir",
+            &warm_s,
+            "--max-bytes",
+            &initial_len.to_string(),
+            "search",
+            "zzznomatchtoken999",
+            "--sag2",
+        ],
+        &key_env,
+    );
+    let exact_json = assert_ok_json(&exact_out);
+    let exact_len = exact_out.stdout.len();
+    assert_eq!(
+        exact_json["data"]["budget"]["usedBytes"].as_u64().unwrap() as usize,
+        exact_len
+    );
     assert_ok_json(&run_clec(
         &[
             "--data-dir",
             &warm_s,
             "--max-bytes",
-            &no_cand_len.to_string(),
+            &exact_len.to_string(),
             "search",
             "zzznomatchtoken999",
             "--sag2",
@@ -898,7 +916,7 @@ fn group1_tiny_positive_max_bytes_rejected_before_io() {
                 "--data-dir",
                 &warm_s,
                 "--max-bytes",
-                &(no_cand_len - 1).to_string(),
+                &(exact_len - 1).to_string(),
                 "search",
                 "zzznomatchtoken999",
                 "--sag2",

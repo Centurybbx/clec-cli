@@ -162,7 +162,7 @@ pub(crate) struct Sag2Limits {
 }
 
 impl Sag2Limits {
-    fn shipped() -> Self {
+    pub(crate) fn shipped() -> Self {
         Self {
             max_initial_pool: MAX_INITIAL_POOL,
             max_expansion_rounds: MAX_EXPANSION_ROUNDS,
@@ -844,6 +844,64 @@ fn run_sag2_pinned(
         df_cache.len(),
         final_hits,
     ))
+}
+
+pub(crate) fn minimum_sag2_search_data(
+    prepared: &PreparedSearch,
+    max_bytes: usize,
+) -> Sag2SearchData {
+    let min_release = ReleaseHash::parse(&"0".repeat(64)).expect("64 zero hex digits valid");
+    Sag2SearchData {
+        release: min_release,
+        match_mode: prepared.match_mode,
+        queries: prepared.queries.clone(),
+        algorithm: ALGORITHM_NAME.to_owned(),
+        algorithm_revision: ALGORITHM_REVISION.to_owned(),
+        provider_verified: false,
+        requested_model: "a".to_owned(),
+        actual_model: Some("a".to_owned()),
+        rounds_completed: 0,
+        stop_reason: Sag2StopReason::Completed,
+        candidate_counts: Sag2CandidateCounts {
+            initial_rrf_total: 0,
+            initial_pool: 0,
+            seeds_selected: 0,
+            expansion_terms_selected: 0,
+            expansion_new_candidates: 0,
+            second_pool: 0,
+            scored_occurrences: 0,
+            final_pool: 0,
+            context_omitted_count: 0,
+        },
+        calls: Sag2CallStats {
+            http_attempts: 0,
+            successful_batches: 0,
+            sql_candidate_queries: 0,
+            df_lookups_distinct: 0,
+        },
+        limits: Sag2Limits::shipped(),
+        consumption: Sag2Consumption {
+            request_bytes: 0,
+            response_bytes: 0,
+            estimated_token_units: 0,
+            token_estimate_basis: "conditional_byte_upper_bound_not_tokenizer".to_owned(),
+        },
+        usage: Sag2UsageProvenance {
+            status: Sag2MetadataStatus::Unknown,
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cost_status: Sag2MetadataStatus::Unknown,
+            cost_usd: Some(0.0),
+        },
+        total_candidates: 0,
+        hits: Vec::new(),
+        budget: BudgetReport {
+            max_bytes,
+            used_bytes: 0,
+            omitted_count: 0,
+            omitted_ids: Vec::new(),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
