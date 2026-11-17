@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any
+from typing import Any, Literal
 
 try:
     from . import projection
@@ -19,8 +19,75 @@ except ImportError:
 
 VALID_SPLITS = frozenset({"development", "evaluation"})
 VALID_EVIDENCE_KINDS = frozenset({"required", "counterexample", "condition"})
+VALID_OUTCOME_STATUSES = frozenset({"completed", "timeout", "error"})
 OUTCOME_SCHEMA_VERSION = 2
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class CorpusBindingError(ValueError):
+    """Raised when active.json or corpus SQLite fails coherence or SHA-256 checks."""
+
+
+class ProjectionVerificationError(ValueError):
+    """Raised when equivalence projection or coordinate mapping fails."""
+
+
+@dataclass(frozen=True)
+class ActiveCorpusBinding:
+    data_dir: Path
+    release: str
+    manifest_path: str
+    db_path: Path
+
+
+def verify_active_corpus_binding(data_dir: Path, expected_sha256: str) -> ActiveCorpusBinding:
+    if not SHA256_HEX_RE.match(expected_sha256):
+        raise CorpusBindingError(
+            f"Expected 64-char lowercase SHA-256 hex, got {expected_sha256!r}"
+        )
+    resolved_dir = Path(data_dir)
+    if not resolved_dir.is_dir():
+        raise CorpusBindingError(f"Missing corpus data directory: {resolved_dir}")
+
+    active_json = resolved_dir / "active.json"
+    if not active_json.is_file():
+        raise CorpusBindingError(f"Missing active.json in {resolved_dir}")
+
+    try:
+        active_raw = active_json.read_bytes().decode("utf-8", errors="strict")
+        active_obj = json.loads(active_raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CorpusBindingError(f"Invalid active.json in {resolved_dir}: {exc}") from exc
+
+    if not isinstance(active_obj, dict):
+        raise CorpusBindingError(f"active.json in {resolved_dir} must be a JSON object")
+
+    release = active_obj.get("release")
+    if not isinstance(release, str) or not SHA256_HEX_RE.match(release):
+        raise CorpusBindingError(
+            f"active.json in {resolved_dir} has invalid release {release!r}"
+        )
+    if release != expected_sha256:
+        raise CorpusBindingError(
+            f"active.json release {release!r} != expected {expected_sha256!r}"
+        )
+
+    manifest_path = active_obj.get("manifestPath")
+    if not isinstance(manifest_path, str) or not manifest_path.strip():
+        raise CorpusBindingError(
+            f"active.json in {resolved_dir} missing non-empty manifestPath"
+        )
+
+    db_path = resolved_dir / f"{expected_sha256}.sqlite"
+    if not db_path.is_file():
+        raise CorpusBindingError(f"Missing corpus SQLite file: {db_path}")
+
+    return ActiveCorpusBinding(
+        data_dir=resolved_dir,
+        release=expected_sha256,
+        manifest_path=manifest_path,
+        db_path=db_path,
+    )
 
 
 def stream_sha256(path: Path) -> str:
@@ -50,6 +117,7 @@ class CorpusIndexView:
         db_path: Path,
         expected_sha256: str,
         *,
+        active_binding: ActiveCorpusBinding | None = None,
         max_cached_blobs: int = 256,
         max_blob_cache_bytes: int = 64 * 1024 * 1024,
         max_cached_passages: int = 4096,
@@ -59,7 +127,13 @@ class CorpusIndexView:
         self.db_path = Path(db_path)
         if not self.db_path.is_file():
             raise FileNotFoundError(f"Missing corpus SQLite file: {self.db_path}")
+        if active_binding is not None and (
+            active_binding.release != expected_sha256
+            or active_binding.db_path.resolve() != self.db_path.resolve()
+        ):
+            raise CorpusBindingError("ActiveCorpusBinding does not match opened SQLite path")
 
+        self.active_binding = active_binding
         self.expected_sha256 = expected_sha256
         self.actual_sha256 = stream_sha256(self.db_path)
         if self.actual_sha256 != self.expected_sha256:
@@ -82,13 +156,40 @@ class CorpusIndexView:
         self._proj_cache: OrderedDict[str, projection.ProjectedSource] = OrderedDict()
         self._passage_cache: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
 
-        self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        self._conn: sqlite3.Connection | None = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro", uri=True
+        )
         self._load_metadata_and_catalog()
+
+    @classmethod
+    def open_active(
+        cls,
+        data_dir: Path,
+        expected_sha256: str,
+        *,
+        max_cached_blobs: int = 256,
+        max_blob_cache_bytes: int = 64 * 1024 * 1024,
+        max_cached_passages: int = 4096,
+    ) -> CorpusIndexView:
+        binding = verify_active_corpus_binding(data_dir, expected_sha256)
+        return cls(
+            binding.db_path,
+            expected_sha256,
+            active_binding=binding,
+            max_cached_blobs=max_cached_blobs,
+            max_blob_cache_bytes=max_blob_cache_bytes,
+            max_cached_passages=max_cached_passages,
+        )
+
+    def _require_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("CorpusIndexView is closed")
+        return self._conn
 
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
-            self._conn = None  # type: ignore[assignment]
+            self._conn = None
 
     def __enter__(self) -> CorpusIndexView:
         return self
@@ -97,15 +198,26 @@ class CorpusIndexView:
         self.close()
 
     def verify_db_file_unchanged(self) -> bool:
-        return stream_sha256(self.db_path) == self.actual_sha256
+        if stream_sha256(self.db_path) != self.actual_sha256:
+            return False
+        if self.active_binding is not None:
+            try:
+                current = verify_active_corpus_binding(
+                    self.active_binding.data_dir, self.expected_sha256
+                )
+            except CorpusBindingError:
+                return False
+            return current == self.active_binding
+        return True
 
     def _load_metadata_and_catalog(self) -> None:
-        fmt = self._conn.execute("SELECT value FROM metadata WHERE key='corpus_format'").fetchone()
+        conn = self._require_conn()
+        fmt = conn.execute("SELECT value FROM metadata WHERE key='corpus_format'").fetchone()
         if not fmt or fmt[0] != "clec-native-v2":
             raise ValueError(f"Expected clec-native-v2 database, got {fmt}")
         self.corpus_format = str(fmt[0])
 
-        for wid, wkey, title in self._conn.execute("SELECT id, work_key, title FROM works"):
+        for wid, wkey, title in conn.execute("SELECT id, work_key, title FROM works"):
             self.works_by_key[wkey] = wid
             self.works_by_id[wid] = {"workId": wid, "workKey": wkey, "title": title}
 
@@ -120,7 +232,7 @@ class CorpusIndexView:
             eq_hash,
             proj_kind,
             eq_basis,
-        ) in self._conn.execute(
+        ) in conn.execute(
             "SELECT s.id, s.work_id, s.path, s.title, s.role, s.content_hash, "
             "m.canonical_source_id, m.equivalence_hash, m.projection_kind, m.equivalence_basis "
             "FROM sources s JOIN source_canonical_map m ON m.source_id = s.id"
@@ -143,7 +255,7 @@ class CorpusIndexView:
         if cached is not None:
             self._blob_cache.move_to_end(content_hash)
             return cached
-        row = self._conn.execute(
+        row = self._require_conn().execute(
             "SELECT raw_bytes FROM blobs WHERE content_hash = ?",
             (content_hash,),
         ).fetchone()
@@ -174,7 +286,7 @@ class CorpusIndexView:
             return cached
         cues = [
             (int(ts), int(te))
-            for ts, te in self._conn.execute(
+            for ts, te in self._require_conn().execute(
                 "SELECT text_start_byte, text_end_byte FROM cues WHERE source_id = ? ORDER BY ordinal",
                 (source_id,),
             )
@@ -192,9 +304,14 @@ class CorpusIndexView:
         src = self.sources[source_id]
         raw = self.raw_bytes_for_source(source_id)
         cues = self.cues_for_source(source_id)
-        proj = projection.project_source(raw, src["projectionKind"], cues)
+        try:
+            proj = projection.project_source(raw, src["projectionKind"], cues)
+        except (ValueError, TypeError, UnicodeDecodeError) as exc:
+            raise ProjectionVerificationError(
+                f"Failed to project {source_id}: {exc}"
+            ) from exc
         if proj.equivalence_hash != src["equivalenceHash"]:
-            raise ValueError(
+            raise ProjectionVerificationError(
                 f"Projected equivalence_hash mismatch for {source_id}: "
                 f"{proj.equivalence_hash} != {src['equivalenceHash']}"
             )
@@ -207,7 +324,8 @@ class CorpusIndexView:
         if passage_id in self._passage_cache:
             self._passage_cache.move_to_end(passage_id)
             return self._passage_cache[passage_id]
-        row = self._conn.execute(
+        conn = self._require_conn()
+        row = conn.execute(
             "SELECT id, source_id, work_id, ordinal, text FROM passages WHERE id = ?",
             (passage_id,),
         ).fetchone()
@@ -216,7 +334,7 @@ class CorpusIndexView:
         else:
             spans = [
                 (int(sb), int(eb), (int(co) if co is not None else None))
-                for sb, eb, co in self._conn.execute(
+                for sb, eb, co in conn.execute(
                     "SELECT start_byte, end_byte, cue_ordinal FROM passage_spans "
                     "WHERE passage_id = ? ORDER BY span_ordinal",
                     (passage_id,),
@@ -659,7 +777,12 @@ def _item_covers_evidence(
         return True
 
     gold_proj = corpus.projected_for_source(gold_sid)
-    gold_coord_intervals = gold_proj.project_byte_spans(gold_spans)
+    try:
+        gold_coord_intervals = gold_proj.project_byte_spans(gold_spans)
+    except ValueError as exc:
+        raise ProjectionVerificationError(
+            f"Gold byte span projection failed for {gold_sid}: {exc}"
+        ) from exc
     if not gold_coord_intervals:
         return False
 
@@ -670,7 +793,12 @@ def _item_covers_evidence(
         if not corpus.are_canonical_aliases(gold_sid, item.source_id):
             continue
         item_proj = corpus.projected_for_source(item.source_id)
-        alias_coord_intervals.extend(item_proj.project_byte_spans(item.byte_spans))
+        try:
+            alias_coord_intervals.extend(item_proj.project_byte_spans(item.byte_spans))
+        except ValueError as exc:
+            raise ProjectionVerificationError(
+                f"Returned item byte span projection failed for {item.source_id}: {exc}"
+            ) from exc
 
     return bool(alias_coord_intervals) and all(
         projection.intervals_cover(alias_coord_intervals, gci) for gci in gold_coord_intervals
@@ -695,6 +823,55 @@ def _build_obligations(evidence: list[dict[str, Any]]) -> list[list[dict[str, An
     return obligations
 
 
+@dataclass(frozen=True)
+class CompletedStep:
+    step_name: str
+    stdout_bytes: int
+    stderr_bytes: int
+    items: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class FailedStep:
+    step_name: str
+    stdout_bytes: int
+    stderr_bytes: int
+    timed_out: bool
+    reason: str
+    undecodable_output: bool = False
+
+
+ParsedStep = CompletedStep | FailedStep
+
+
+@dataclass(frozen=True)
+class ScoreableExecution:
+    completed_steps: tuple[CompletedStep, ...]
+    all_steps: tuple[ParsedStep, ...]
+    search_stdout_bytes: int
+    read_stdout_bytes: int
+    stderr_bytes: int
+
+
+@dataclass(frozen=True)
+class NonScoreableExecution:
+    status: Literal["error", "timeout", "inconclusive"]
+    stop_reason: str
+    completed_steps: tuple[CompletedStep, ...]
+    all_steps: tuple[ParsedStep, ...]
+    search_stdout_bytes: int
+    read_stdout_bytes: int
+    stderr_bytes: int
+    undecodable_reasons: tuple[str, ...]
+
+
+ExecutionOutcome = ScoreableExecution | NonScoreableExecution
+
+
+def _is_int_non_bool(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _is_valid_v2_outcome(outcome: Any) -> tuple[bool, str | None]:
     if not isinstance(outcome, dict):
         return False, "Outcome must be an object"
@@ -711,29 +888,133 @@ def _is_valid_v2_outcome(outcome: Any) -> tuple[bool, str | None]:
             return False, f"Step {idx} must be an object"
         if step.get("step") not in ("search", "read"):
             return False, f"Step {idx} has invalid step kind {step.get('step')!r}"
-        if not isinstance(step.get("stdoutUtf8"), str):
-            return False, f"Step {idx} missing raw stdoutUtf8 string"
-        if not isinstance(step.get("stderrUtf8"), str):
-            return False, f"Step {idx} missing raw stderrUtf8 string"
+        if "argv" in step:
+            argv = step["argv"]
+            if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+                return False, f"Step {idx} has invalid argv"
         if not isinstance(step.get("timedOut"), bool):
             return False, f"Step {idx} missing boolean timedOut"
+        exit_code = step.get("exitCode")
+        if exit_code is not None and not _is_int_non_bool(exit_code):
+            return False, f"Step {idx} has invalid exitCode {exit_code!r}"
+
+        stdout_utf8 = step.get("stdoutUtf8")
+        stdout_err = step.get("stdoutDecodeError")
+        if isinstance(stdout_utf8, str):
+            if stdout_err is not None:
+                return False, f"Step {idx} has both stdoutUtf8 string and stdoutDecodeError"
+        elif stdout_utf8 is None:
+            if not isinstance(stdout_err, str) or not stdout_err:
+                return False, f"Step {idx} missing raw stdoutUtf8 string or stdoutDecodeError"
+        else:
+            return False, f"Step {idx} has invalid stdoutUtf8 type"
+
+        stderr_utf8 = step.get("stderrUtf8")
+        stderr_err = step.get("stderrDecodeError")
+        if isinstance(stderr_utf8, str):
+            if stderr_err is not None:
+                return False, f"Step {idx} has both stderrUtf8 string and stderrDecodeError"
+        elif stderr_utf8 is None:
+            if not isinstance(stderr_err, str) or not stderr_err:
+                return False, f"Step {idx} missing raw stderrUtf8 string or stderrDecodeError"
+        else:
+            return False, f"Step {idx} has invalid stderrUtf8 type"
     return True, None
 
 
-def _parse_step_payload(step: dict[str, Any], corpus: CorpusIndexView) -> tuple[list[dict[str, Any]] | None, int, int, str | None]:
-    stdout_utf8: str = step["stdoutUtf8"]
-    stderr_utf8: str = step["stderrUtf8"]
-    stdout_bytes = len(stdout_utf8.encode("utf-8"))
-    stderr_bytes = len(stderr_utf8.encode("utf-8"))
-    step_name = step["step"]
+def _parse_step_payload(step: dict[str, Any], corpus: CorpusIndexView) -> ParsedStep:
+    step_name = str(step["step"])
+    stdout_utf8: str | None = step["stdoutUtf8"]
+    stderr_utf8: str | None = step["stderrUtf8"]
+    stdout_err: str | None = step.get("stdoutDecodeError")
+    stderr_err: str | None = step.get("stderrDecodeError")
+    raw_len_field = step.get("stdoutRawByteLen")
 
-    if step["timedOut"] or step.get("exitCode") != 0:
-        return None, stdout_bytes, stderr_bytes, None
+    if stdout_utf8 is not None:
+        stdout_bytes = len(stdout_utf8.encode("utf-8"))
+        if raw_len_field is not None and (
+            not _is_int_non_bool(raw_len_field) or raw_len_field != stdout_bytes
+        ):
+            return FailedStep(
+                step_name=step_name,
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=len(stderr_utf8.encode("utf-8")) if stderr_utf8 is not None else 0,
+                timed_out=bool(step["timedOut"]),
+                reason=f"{step_name}_stdout_raw_byte_len_mismatch:{raw_len_field}!={stdout_bytes}",
+            )
+    else:
+        stdout_bytes = int(raw_len_field) if _is_int_non_bool(raw_len_field) and raw_len_field >= 0 else 0
 
+    if stderr_utf8 is not None:
+        stderr_bytes = len(stderr_utf8.encode("utf-8"))
+    else:
+        stderr_raw_len = step.get("stderrRawByteLen")
+        stderr_bytes = int(stderr_raw_len) if _is_int_non_bool(stderr_raw_len) and stderr_raw_len >= 0 else 0
+
+    timed_out = bool(step["timedOut"])
+    exit_code = step.get("exitCode")
+
+    if stdout_err is not None:
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=timed_out,
+            reason=f"{step_name}_undecodable_stdout:{stdout_err}",
+            undecodable_output=True,
+        )
+    if stderr_err is not None:
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=timed_out,
+            reason=f"{step_name}_undecodable_stderr:{stderr_err}",
+            undecodable_output=True,
+        )
+
+    if timed_out:
+        if exit_code == 0:
+            reason = f"{step_name}_incoherent_timedOut_with_zero_exit"
+        else:
+            reason = f"{step_name}_timeout"
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=True,
+            reason=reason,
+        )
+
+    if exit_code is None:
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=False,
+            reason=f"{step_name}_missing_exitCode_without_timeout",
+        )
+
+    if exit_code != 0:
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=False,
+            reason=f"{step_name}_exit_{exit_code}",
+        )
+
+    assert stdout_utf8 is not None
     try:
         payload = json.loads(stdout_utf8)
     except json.JSONDecodeError as exc:
-        return None, stdout_bytes, stderr_bytes, f"invalid_{step_name}_stdout_json:{exc}"
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=False,
+            reason=f"invalid_{step_name}_stdout_json:{exc}",
+        )
 
     if (
         not isinstance(payload, dict)
@@ -741,26 +1022,239 @@ def _parse_step_payload(step: dict[str, Any], corpus: CorpusIndexView) -> tuple[
         or payload.get("ok") is not True
         or payload.get("command") != step_name
     ):
-        return None, stdout_bytes, stderr_bytes, f"invalid_{step_name}_envelope"
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=False,
+            reason=f"invalid_{step_name}_envelope",
+        )
 
     data = payload.get("data")
     if not isinstance(data, dict) or data.get("release") != corpus.actual_sha256:
-        return None, stdout_bytes, stderr_bytes, f"{step_name}_release_mismatch"
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=False,
+            reason=f"{step_name}_release_mismatch",
+        )
 
     budget_obj = data.get("budget")
     if isinstance(budget_obj, dict) and "usedBytes" in budget_obj:
         if budget_obj["usedBytes"] != stdout_bytes:
-            return (
-                None,
-                stdout_bytes,
-                stderr_bytes,
-                f"{step_name}_budget_usedBytes_mismatch:{budget_obj['usedBytes']}!={stdout_bytes}",
+            return FailedStep(
+                step_name=step_name,
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                timed_out=False,
+                reason=f"{step_name}_budget_usedBytes_mismatch:{budget_obj['usedBytes']}!={stdout_bytes}",
             )
 
     raw_items = data.get("hits") if step_name == "search" else data.get("items")
     if not isinstance(raw_items, list):
-        return None, stdout_bytes, stderr_bytes, f"invalid_{step_name}_items_list"
-    return raw_items, stdout_bytes, stderr_bytes, None
+        return FailedStep(
+            step_name=step_name,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timed_out=False,
+            reason=f"invalid_{step_name}_items_list",
+        )
+    return CompletedStep(
+        step_name=step_name,
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
+        items=tuple(raw_items),
+    )
+
+
+def _derive_execution_outcome(
+    outcome: dict[str, Any], corpus: CorpusIndexView
+) -> ExecutionOutcome:
+    raw_status = outcome.get("status")
+    stop_reason = outcome.get("stopReason")
+    if stop_reason is not None and not isinstance(stop_reason, str):
+        stop_reason = str(stop_reason)
+
+    parsed_steps = tuple(_parse_step_payload(step, corpus) for step in outcome["steps"])
+    completed_steps = tuple(s for s in parsed_steps if isinstance(s, CompletedStep))
+    failed_steps = tuple(s for s in parsed_steps if isinstance(s, FailedStep))
+    search_stdout_bytes = sum(s.stdout_bytes for s in parsed_steps if s.step_name == "search")
+    read_stdout_bytes = sum(s.stdout_bytes for s in parsed_steps if s.step_name == "read")
+    stderr_bytes = sum(s.stderr_bytes for s in parsed_steps)
+    undecodable_reasons = tuple(s.reason for s in failed_steps if s.undecodable_output)
+
+    if raw_status not in VALID_OUTCOME_STATUSES:
+        return NonScoreableExecution(
+            status="inconclusive",
+            stop_reason=f"incoherent_outcome:invalid_status:{raw_status!r}",
+            completed_steps=completed_steps,
+            all_steps=parsed_steps,
+            search_stdout_bytes=search_stdout_bytes,
+            read_stdout_bytes=read_stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            undecodable_reasons=undecodable_reasons,
+        )
+
+    if failed_steps:
+        first_fail = failed_steps[0]
+        timeout_fail = next((s for s in failed_steps if s.timed_out), None)
+        if raw_status == "completed":
+            kind = "completed_with_timed_out_step" if timeout_fail is not None else "completed_with_failed_step"
+            detail = timeout_fail.reason if timeout_fail is not None else first_fail.reason
+            return NonScoreableExecution(
+                status="error",
+                stop_reason=f"incoherent_outcome:{kind}:{detail}",
+                completed_steps=completed_steps,
+                all_steps=parsed_steps,
+                search_stdout_bytes=search_stdout_bytes,
+                read_stdout_bytes=read_stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                undecodable_reasons=undecodable_reasons,
+            )
+        if raw_status == "timeout" and timeout_fail is None:
+            return NonScoreableExecution(
+                status="inconclusive",
+                stop_reason=f"incoherent_outcome:timeout_without_timed_out_step:{first_fail.reason}",
+                completed_steps=completed_steps,
+                all_steps=parsed_steps,
+                search_stdout_bytes=search_stdout_bytes,
+                read_stdout_bytes=read_stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                undecodable_reasons=undecodable_reasons,
+            )
+        resolved_status: Literal["error", "timeout"] = "timeout" if raw_status == "timeout" else "error"
+        return NonScoreableExecution(
+            status=resolved_status,
+            stop_reason=stop_reason or first_fail.reason,
+            completed_steps=completed_steps,
+            all_steps=parsed_steps,
+            search_stdout_bytes=search_stdout_bytes,
+            read_stdout_bytes=read_stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            undecodable_reasons=undecodable_reasons,
+        )
+
+    if raw_status == "completed":
+        if not completed_steps:
+            return NonScoreableExecution(
+                status="inconclusive",
+                stop_reason="incoherent_outcome:completed_with_no_steps",
+                completed_steps=completed_steps,
+                all_steps=parsed_steps,
+                search_stdout_bytes=search_stdout_bytes,
+                read_stdout_bytes=read_stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                undecodable_reasons=undecodable_reasons,
+            )
+        return ScoreableExecution(
+            completed_steps=completed_steps,
+            all_steps=parsed_steps,
+            search_stdout_bytes=search_stdout_bytes,
+            read_stdout_bytes=read_stdout_bytes,
+            stderr_bytes=stderr_bytes,
+        )
+
+    if raw_status == "timeout":
+        return NonScoreableExecution(
+            status="inconclusive",
+            stop_reason="incoherent_outcome:timeout_without_timed_out_step",
+            completed_steps=completed_steps,
+            all_steps=parsed_steps,
+            search_stdout_bytes=search_stdout_bytes,
+            read_stdout_bytes=read_stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            undecodable_reasons=undecodable_reasons,
+        )
+
+    if completed_steps and not stop_reason:
+        return NonScoreableExecution(
+            status="inconclusive",
+            stop_reason="incoherent_outcome:error_without_failed_step",
+            completed_steps=completed_steps,
+            all_steps=parsed_steps,
+            search_stdout_bytes=search_stdout_bytes,
+            read_stdout_bytes=read_stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            undecodable_reasons=undecodable_reasons,
+        )
+    if completed_steps and stop_reason:
+        return NonScoreableExecution(
+            status="inconclusive",
+            stop_reason=f"incoherent_outcome:error_with_only_succeeded_steps:{stop_reason}",
+            completed_steps=completed_steps,
+            all_steps=parsed_steps,
+            search_stdout_bytes=search_stdout_bytes,
+            read_stdout_bytes=read_stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            undecodable_reasons=undecodable_reasons,
+        )
+    return NonScoreableExecution(
+        status="error",
+        stop_reason=stop_reason or "error",
+        completed_steps=completed_steps,
+        all_steps=parsed_steps,
+        search_stdout_bytes=search_stdout_bytes,
+        read_stdout_bytes=read_stdout_bytes,
+        stderr_bytes=stderr_bytes,
+        undecodable_reasons=undecodable_reasons,
+    )
+
+
+def _null_outcome_row(
+    question: dict[str, Any],
+    *,
+    outcome_schema_version: Any,
+    outcome_version_valid: bool,
+    status: str,
+    stop_reason: str,
+    top_k: int,
+    stdout_byte_budget: int | None,
+    read_byte_budget: int | None,
+    cumulative_stdout_byte_budget: int | None,
+    search_stdout_bytes: int,
+    read_stdout_bytes: int,
+    cumulative_stdout_bytes: int,
+    stderr_bytes: int,
+    budget_exceeded: bool,
+    citation_ok: bool,
+    citation_failures: list[dict[str, Any]],
+    obligation_count: int,
+    condition_count: int,
+    counterexample_count: int,
+) -> dict[str, Any]:
+    return {
+        "id": question["id"],
+        "category": question.get("category"),
+        "answerable": question["answerable"],
+        "outcomeSchemaVersion": outcome_schema_version,
+        "outcomeVersionValid": outcome_version_valid,
+        "status": status,
+        "stopReason": stop_reason,
+        "topK": top_k,
+        "stdoutByteBudget": stdout_byte_budget,
+        "readByteBudget": read_byte_budget,
+        "cumulativeStdoutByteBudget": cumulative_stdout_byte_budget,
+        "searchStdoutUtf8Bytes": search_stdout_bytes,
+        "readStdoutUtf8Bytes": read_stdout_bytes,
+        "cumulativeStdoutUtf8Bytes": cumulative_stdout_bytes,
+        "stderrUtf8Bytes": stderr_bytes,
+        "stdoutBudgetExceeded": budget_exceeded,
+        "tokenBudget": None,
+        "tokenMetricNote": "UTF-8 bytes are not tokens; token budget requires model tokenizer",
+        "citationRawSpanValid": citation_ok,
+        "citationFailures": citation_failures,
+        "obligationCount": obligation_count,
+        "coveredObligations": None,
+        "evidenceCoverage": None,
+        "completeChain": None,
+        "conditionCount": condition_count,
+        "conditionsCovered": None,
+        "conditionLoss": None,
+        "counterexampleCount": counterexample_count,
+        "counterexamplesCovered": None,
+        "counterexampleLoss": None,
+    }
 
 
 def score_question(
@@ -779,74 +1273,49 @@ def score_question(
 
     v2_ok, v2_err = _is_valid_v2_outcome(outcome)
     if not v2_ok:
-        return {
-            "id": question["id"],
-            "category": question.get("category"),
-            "answerable": question["answerable"],
-            "outcomeSchemaVersion": outcome.get("outcomeSchemaVersion") if isinstance(outcome, dict) else None,
-            "outcomeVersionValid": False,
-            "status": "error",
-            "stopReason": f"unsupported_outcome_version:{v2_err}",
-            "topK": top_k,
-            "stdoutByteBudget": stdout_byte_budget,
-            "readByteBudget": read_byte_budget,
-            "cumulativeStdoutByteBudget": cumulative_stdout_byte_budget,
-            "searchStdoutUtf8Bytes": 0,
-            "readStdoutUtf8Bytes": 0,
-            "cumulativeStdoutUtf8Bytes": 0,
-            "stderrUtf8Bytes": 0,
-            "stdoutBudgetExceeded": False,
-            "tokenBudget": None,
-            "tokenMetricNote": "UTF-8 bytes are not tokens; token budget requires model tokenizer",
-            "citationRawSpanValid": False,
-            "citationFailures": [{"error": v2_err}],
-            "obligationCount": len(obligations),
-            "coveredObligations": None,
-            "evidenceCoverage": None,
-            "completeChain": None,
-            "conditionCount": len(cond_obs),
-            "conditionsCovered": None,
-            "conditionLoss": None,
-            "counterexampleCount": len(ce_obs),
-            "counterexamplesCovered": None,
-            "counterexampleLoss": None,
-        }
+        return _null_outcome_row(
+            question,
+            outcome_schema_version=outcome.get("outcomeSchemaVersion") if isinstance(outcome, dict) else None,
+            outcome_version_valid=False,
+            status="inconclusive",
+            stop_reason=f"unsupported_outcome_version:{v2_err}",
+            top_k=top_k,
+            stdout_byte_budget=stdout_byte_budget,
+            read_byte_budget=read_byte_budget,
+            cumulative_stdout_byte_budget=cumulative_stdout_byte_budget,
+            search_stdout_bytes=0,
+            read_stdout_bytes=0,
+            cumulative_stdout_bytes=0,
+            stderr_bytes=0,
+            budget_exceeded=False,
+            citation_ok=False,
+            citation_failures=[{"error": v2_err}],
+            obligation_count=len(obligations),
+            condition_count=len(cond_obs),
+            counterexample_count=len(ce_obs),
+        )
 
-    status = outcome.get("status", "error")
-    stop_reason = outcome.get("stopReason")
-    steps: list[dict[str, Any]] = outcome["steps"]
-
-    search_stdout_bytes = 0
-    read_stdout_bytes = 0
-    total_stderr_bytes = 0
-    parsed_steps: list[tuple[str, int, list[dict[str, Any]]]] = []
-    parse_error: str | None = None
-
-    for step in steps:
-        raw_items, out_b, err_b, step_err = _parse_step_payload(step, corpus)
-        total_stderr_bytes += err_b
-        if step["step"] == "search":
-            search_stdout_bytes += out_b
-        else:
-            read_stdout_bytes += out_b
-        if step_err is not None and parse_error is None:
-            parse_error = step_err
-        if raw_items is not None:
-            parsed_steps.append((step["step"], out_b, raw_items))
+    execution = _derive_execution_outcome(outcome, corpus)
 
     all_citation_failures: list[dict[str, Any]] = []
-    validated_per_step: list[tuple[str, int, list[ValidatedEvidenceItem]]] = []
+    if isinstance(execution, NonScoreableExecution) and execution.undecodable_reasons:
+        for reason in execution.undecodable_reasons:
+            all_citation_failures.append({"error": reason})
+
+    validated_by_step: dict[int, list[ValidatedEvidenceItem]] = {}
     global_item_idx = 0
-    for step_name, out_b, raw_items in parsed_steps:
+    for step_idx, step in enumerate(execution.all_steps):
+        if not isinstance(step, CompletedStep):
+            continue
         step_valid_items: list[ValidatedEvidenceItem] = []
-        for pos, item in enumerate(raw_items):
+        for pos, item in enumerate(step.items):
             validated_item, errs = validate_returned_item(item, corpus, item_index=global_item_idx)
             global_item_idx += 1
             all_citation_failures.extend(errs)
             if validated_item is not None and not errs:
-                if step_name != "search" or pos < top_k:
+                if step.step_name != "search" or pos < top_k:
                     step_valid_items.append(validated_item)
-        validated_per_step.append((step_name, out_b, step_valid_items))
+        validated_by_step[step_idx] = step_valid_items
 
     credited_items: list[ValidatedEvidenceItem] = []
     credited_search_hits_count = 0
@@ -854,68 +1323,55 @@ def score_question(
     budget_exceeded = False
     budget_stopped = False
 
-    for step_name, out_b, step_valid_items in validated_per_step:
+    for step_idx, step in enumerate(execution.all_steps):
         per_call_cap = (
             stdout_byte_budget
-            if step_name == "search"
+            if step.step_name == "search"
             else (read_byte_budget if read_byte_budget is not None else stdout_byte_budget)
         )
         if budget_stopped:
             continue
-        exceeds_call = per_call_cap is not None and out_b > per_call_cap
+        exceeds_call = per_call_cap is not None and step.stdout_bytes > per_call_cap
         exceeds_cum = (
             cumulative_stdout_byte_budget is not None
-            and cumulative_credited_bytes + out_b > cumulative_stdout_byte_budget
+            and cumulative_credited_bytes + step.stdout_bytes > cumulative_stdout_byte_budget
         )
         if exceeds_call or exceeds_cum:
             budget_exceeded = True
             budget_stopped = True
             continue
-        cumulative_credited_bytes += out_b
-        credited_items.extend(step_valid_items)
-        if step_name == "search":
-            credited_search_hits_count += len(step_valid_items)
+        cumulative_credited_bytes += step.stdout_bytes
+        if isinstance(step, CompletedStep):
+            step_valid_items = validated_by_step[step_idx]
+            credited_items.extend(step_valid_items)
+            if step.step_name == "search":
+                credited_search_hits_count += len(step_valid_items)
 
-    cumulative_observed_stdout_bytes = search_stdout_bytes + read_stdout_bytes
+    cumulative_observed_stdout_bytes = execution.search_stdout_bytes + execution.read_stdout_bytes
     citation_ok = len(all_citation_failures) == 0
 
-    if parse_error is not None and status == "completed":
-        status = "error"
-        stop_reason = parse_error
-
-    if status != "completed":
-        return {
-            "id": question["id"],
-            "category": question.get("category"),
-            "answerable": question["answerable"],
-            "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
-            "outcomeVersionValid": True,
-            "status": status,
-            "stopReason": stop_reason or status,
-            "topK": top_k,
-            "stdoutByteBudget": stdout_byte_budget,
-            "readByteBudget": read_byte_budget,
-            "cumulativeStdoutByteBudget": cumulative_stdout_byte_budget,
-            "searchStdoutUtf8Bytes": search_stdout_bytes,
-            "readStdoutUtf8Bytes": read_stdout_bytes,
-            "cumulativeStdoutUtf8Bytes": cumulative_observed_stdout_bytes,
-            "stderrUtf8Bytes": total_stderr_bytes,
-            "stdoutBudgetExceeded": budget_exceeded,
-            "tokenBudget": None,
-            "tokenMetricNote": "UTF-8 bytes are not tokens; token budget requires model tokenizer",
-            "citationRawSpanValid": citation_ok,
-            "citationFailures": all_citation_failures,
-            "obligationCount": len(obligations),
-            "coveredObligations": None,
-            "evidenceCoverage": None,
-            "completeChain": None,
-            "conditionCount": len(cond_obs),
-            "conditionsCovered": None,
-            "conditionLoss": None,
-            "counterexampleCount": len(ce_obs),
-            "counterexamplesCovered": None,
-            "counterexampleLoss": None,
-        }
+    if isinstance(execution, NonScoreableExecution):
+        return _null_outcome_row(
+            question,
+            outcome_schema_version=OUTCOME_SCHEMA_VERSION,
+            outcome_version_valid=True,
+            status=execution.status,
+            stop_reason=execution.stop_reason,
+            top_k=top_k,
+            stdout_byte_budget=stdout_byte_budget,
+            read_byte_budget=read_byte_budget,
+            cumulative_stdout_byte_budget=cumulative_stdout_byte_budget,
+            search_stdout_bytes=execution.search_stdout_bytes,
+            read_stdout_bytes=execution.read_stdout_bytes,
+            cumulative_stdout_bytes=cumulative_observed_stdout_bytes,
+            stderr_bytes=execution.stderr_bytes,
+            budget_exceeded=budget_exceeded,
+            citation_ok=citation_ok,
+            citation_failures=all_citation_failures,
+            obligation_count=len(obligations),
+            condition_count=len(cond_obs),
+            counterexample_count=len(ce_obs),
+        )
 
     if question["answerable"] is False:
         return {
@@ -930,10 +1386,10 @@ def score_question(
             "stdoutByteBudget": stdout_byte_budget,
             "readByteBudget": read_byte_budget,
             "cumulativeStdoutByteBudget": cumulative_stdout_byte_budget,
-            "searchStdoutUtf8Bytes": search_stdout_bytes,
-            "readStdoutUtf8Bytes": read_stdout_bytes,
+            "searchStdoutUtf8Bytes": execution.search_stdout_bytes,
+            "readStdoutUtf8Bytes": execution.read_stdout_bytes,
             "cumulativeStdoutUtf8Bytes": cumulative_observed_stdout_bytes,
-            "stderrUtf8Bytes": total_stderr_bytes,
+            "stderrUtf8Bytes": execution.stderr_bytes,
             "stdoutBudgetExceeded": budget_exceeded,
             "tokenBudget": None,
             "tokenMetricNote": "UTF-8 bytes are not tokens; token budget requires model tokenizer",
@@ -945,21 +1401,44 @@ def score_question(
             "unanswerableNote": "Irrelevant retrieval on unanswerable question is expected; insufficiency marking requires host eval.",
         }
 
-    covered_obs = sum(
-        1
-        for ob_group in obligations
-        if any(_item_covers_evidence(ev, credited_items, corpus) for ev in ob_group)
-    )
-    cond_cov = sum(
-        1
-        for ob in cond_obs
-        if any(_item_covers_evidence(ev, credited_items, corpus) for ev in ob)
-    )
-    ce_cov = sum(
-        1
-        for ob in ce_obs
-        if any(_item_covers_evidence(ev, credited_items, corpus) for ev in ob)
-    )
+    try:
+        covered_obs = sum(
+            1
+            for ob_group in obligations
+            if any(_item_covers_evidence(ev, credited_items, corpus) for ev in ob_group)
+        )
+        cond_cov = sum(
+            1
+            for ob in cond_obs
+            if any(_item_covers_evidence(ev, credited_items, corpus) for ev in ob)
+        )
+        ce_cov = sum(
+            1
+            for ob in ce_obs
+            if any(_item_covers_evidence(ev, credited_items, corpus) for ev in ob)
+        )
+    except ProjectionVerificationError as exc:
+        return _null_outcome_row(
+            question,
+            outcome_schema_version=OUTCOME_SCHEMA_VERSION,
+            outcome_version_valid=True,
+            status="inconclusive",
+            stop_reason=f"projection_error:{exc}",
+            top_k=top_k,
+            stdout_byte_budget=stdout_byte_budget,
+            read_byte_budget=read_byte_budget,
+            cumulative_stdout_byte_budget=cumulative_stdout_byte_budget,
+            search_stdout_bytes=execution.search_stdout_bytes,
+            read_stdout_bytes=execution.read_stdout_bytes,
+            cumulative_stdout_bytes=cumulative_observed_stdout_bytes,
+            stderr_bytes=execution.stderr_bytes,
+            budget_exceeded=budget_exceeded,
+            citation_ok=False,
+            citation_failures=[*all_citation_failures, {"error": f"projection_error:{exc}"}],
+            obligation_count=len(obligations),
+            condition_count=len(cond_obs),
+            counterexample_count=len(ce_obs),
+        )
 
     complete_chain = (
         bool(obligations)
@@ -981,10 +1460,10 @@ def score_question(
         "stdoutByteBudget": stdout_byte_budget,
         "readByteBudget": read_byte_budget,
         "cumulativeStdoutByteBudget": cumulative_stdout_byte_budget,
-        "searchStdoutUtf8Bytes": search_stdout_bytes,
-        "readStdoutUtf8Bytes": read_stdout_bytes,
+        "searchStdoutUtf8Bytes": execution.search_stdout_bytes,
+        "readStdoutUtf8Bytes": execution.read_stdout_bytes,
         "cumulativeStdoutUtf8Bytes": cumulative_observed_stdout_bytes,
-        "stderrUtf8Bytes": total_stderr_bytes,
+        "stderrUtf8Bytes": execution.stderr_bytes,
         "stdoutBudgetExceeded": budget_exceeded,
         "tokenBudget": None,
         "tokenMetricNote": "UTF-8 bytes are not tokens; token budget requires model tokenizer",
@@ -1043,11 +1522,22 @@ def summarize_evaluation(
     questions = dataset["questions"]
     outcomes_by_id: dict[str, dict[str, Any]] = {}
     for o in outcomes:
-        if not isinstance(o, dict) or "id" not in o:
+        if not isinstance(o, dict) or not isinstance(o.get("id"), str) or not o["id"]:
             return {
                 "schemaVersion": 1,
                 "verdict": "inconclusive",
-                "reason": "Outcome entry missing id or object shape.",
+                "reason": "Outcome entry missing string id or object shape.",
+                "corpusSha256": active_release_sha256,
+                "actualCorpusSha256": corpus.actual_sha256,
+                "corpusFormat": corpus.corpus_format,
+                "split": dataset.get("split"),
+                "perQuestion": [],
+            }
+        if o["id"] in outcomes_by_id:
+            return {
+                "schemaVersion": 1,
+                "verdict": "inconclusive",
+                "reason": f"Duplicate outcome id {o['id']!r}.",
                 "corpusSha256": active_release_sha256,
                 "actualCorpusSha256": corpus.actual_sha256,
                 "corpusFormat": corpus.corpus_format,

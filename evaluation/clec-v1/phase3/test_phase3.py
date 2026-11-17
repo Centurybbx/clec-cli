@@ -1675,6 +1675,30 @@ class Phase3HarnessTests(unittest.TestCase):
             self.assertNotEqual(run_p.returncode, 0, case_name)
             self.assertEqual(json.loads(run_p.stdout)["verdict"], "inconclusive", case_name)
 
+        relocated_dir = self.tmp / "coh-relocated-missing-manifest"
+        shutil.copytree(self.data_dir, relocated_dir)
+        active_reloc = relocated_dir / "active.json"
+        reloc_obj = json.loads(active_reloc.read_text(encoding="utf-8"))
+        reloc_obj["manifestPath"] = str(self.tmp / "deleted-release" / "manifest.json")
+        active_reloc.write_text(json.dumps(reloc_obj), encoding="utf-8")
+        reloc_val = subprocess.run(
+            [
+                sys.executable,
+                str(eval_py),
+                "validate-dataset",
+                "--dataset",
+                str(dataset_path),
+                "--data-dir",
+                str(relocated_dir),
+                "--corpus-sha256",
+                self.corpus_sha,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(reloc_val.returncode, 0)
+        self.assertTrue(json.loads(reloc_val.stdout)["valid"])
+
     def test_unicode_whitespace_and_projection_parity_with_native_corpus(self) -> None:
         ws = self.tmp / "parity-ws"
         ws.mkdir()
@@ -1781,9 +1805,40 @@ class Phase3HarnessTests(unittest.TestCase):
 
             parity_corpus._proj_cache.clear()
             parity_corpus.sources[sids["sep_plain.txt"]]["equivalenceHash"] = "f" * 64
+            raw_vtt = parity_corpus.raw_bytes_for_source(sids["cue_vtt.vtt"])
+            vtt_needle = b"first\x1cpart"
+            vtt_pos = raw_vtt.index(vtt_needle)
+            ds_mixed = {
+                "schemaVersion": 1,
+                "corpusSha256": sha,
+                "split": "development",
+                "questions": [
+                    ds["questions"][0],
+                    {
+                        "id": "q-valid-sibling",
+                        "category": "plain",
+                        "question": "vtt",
+                        "answerable": True,
+                        "workKeys": ["w:vtt"],
+                        "evidence": [
+                            {
+                                "claimId": "c2",
+                                "sourceId": sids["cue_vtt.vtt"],
+                                "path": "cue_vtt.vtt",
+                                "spans": [{"startByte": vtt_pos, "endByte": vtt_pos + len(vtt_needle)}],
+                                "quote": "first\u001cpart",
+                                "kind": "required",
+                            }
+                        ],
+                    },
+                ],
+            }
             inc = score.summarize_evaluation(
-                ds,
-                [_make_v2_outcome("q-empty-no-crash", [_make_cli_step("search", sha, [])])],
+                ds_mixed,
+                [
+                    _make_v2_outcome("q-empty-no-crash", [_make_cli_step("search", sha, [])]),
+                    _make_v2_outcome("q-valid-sibling", [_make_cli_step("search", sha, [])]),
+                ],
                 parity_corpus,
                 sha,
             )
@@ -1792,6 +1847,8 @@ class Phase3HarnessTests(unittest.TestCase):
             self.assertIn("projection_error", inc["perQuestion"][0]["stopReason"])
             self.assertIsNone(inc["perQuestion"][0]["completeChain"])
             self.assertIsNone(inc["perQuestion"][0]["evidenceCoverage"])
+            self.assertEqual(inc["perQuestion"][1]["status"], "completed")
+            self.assertEqual(inc["perQuestion"][1]["evidenceCoverage"], 0.0)
 
     def test_subprocess_byte_capture_crlf_multibyte_invalid_utf8_and_timeout_partial_bytes(self) -> None:
         sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
@@ -1862,6 +1919,64 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertTrue(over_cap["perQuestion"][0]["stdoutBudgetExceeded"])
         self.assertFalse(over_cap["perQuestion"][0]["completeChain"])
 
+        cum_crlf_cli = self.tmp / "cum-crlf-clec.py"
+        search_crlf = json.dumps(
+            {
+                "schemaVersion": 1,
+                "ok": True,
+                "command": "search",
+                "data": {"release": self.corpus_sha, "hits": [valid_hit]},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\r\n"
+        bad_read_hit = copy.deepcopy(valid_hit)
+        bad_read_hit["text"] = "fabricated-inside-over-budget-read"
+        read_crlf = json.dumps(
+            {
+                "schemaVersion": 1,
+                "ok": True,
+                "command": "read",
+                "data": {"release": self.corpus_sha, "items": [{**bad_read_hit, "kind": "passage", "context": []}]},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\r\n"
+        cum_crlf_cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "if 'read' in sys.argv:\n"
+            f"    sys.stdout.buffer.write({read_crlf!r})\n"
+            "else:\n"
+            f"    sys.stdout.buffer.write({search_crlf!r})\n",
+            encoding="utf-8",
+        )
+        cum_crlf_cli.chmod(cum_crlf_cli.stat().st_mode | stat.S_IXUSR)
+        cum_outcomes, _ = adapter.execute_dataset_queries(
+            clec_bin=cum_crlf_cli,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=ds["questions"],
+            read_top_n=1,
+            timeout_sec=5.0,
+        )
+        cum_scored = score.summarize_evaluation(
+            ds,
+            cum_outcomes,
+            self.corpus,
+            self.corpus_sha,
+            stdout_byte_budget=len(search_crlf) + 100,
+            read_byte_budget=len(read_crlf) + 100,
+            cumulative_stdout_byte_budget=len(search_crlf) + len(read_crlf) - 1,
+        )
+        self.assertTrue(cum_scored["perQuestion"][0]["stdoutBudgetExceeded"])
+        self.assertFalse(cum_scored["perQuestion"][0]["citationRawSpanValid"])
+        self.assertFalse(cum_scored["perQuestion"][0]["completeChain"])
+        self.assertEqual(
+            cum_scored["perQuestion"][0]["cumulativeStdoutUtf8Bytes"],
+            len(search_crlf) + len(read_crlf),
+        )
+
         bad_utf8_cli = self.tmp / "bad-utf8-clec.py"
         bad_utf8_cli.write_text(
             "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'{\"ok\":true}\\xff\\xfe')\n",
@@ -1891,12 +2006,12 @@ class Phase3HarnessTests(unittest.TestCase):
 
         partial_to_cli = self.tmp / "partial-to-clec.sh"
         partial_to_cli.write_text(
-            "#!/bin/sh\nprintf '{\"a\":\\344\\270'\nexec sleep 2\n",
+            "#!/bin/sh\nprintf '{\"a\":\\344\\270'\nexec sleep 3\n",
             encoding="utf-8",
         )
         partial_to_cli.chmod(partial_to_cli.stat().st_mode | stat.S_IXUSR)
         rec_to = adapter.run_clec_command(
-            partial_to_cli, ["search", "x"], data_dir=self.data_dir, max_bytes=65536, timeout_sec=0.5
+            partial_to_cli, ["search", "x"], data_dir=self.data_dir, max_bytes=65536, timeout_sec=1.0
         )
         self.assertTrue(rec_to["timedOut"])
         self.assertIsNone(rec_to["stdout"])

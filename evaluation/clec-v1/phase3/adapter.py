@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,11 +11,40 @@ import subprocess
 import time
 from typing import Any
 
+try:
+    from . import score
+except ImportError:
+    import score
+
 
 VALID_MODES = frozenset({"single_query_product_baseline", "rrf_multiquery"})
 VALID_QUERY_ANGLES = frozenset({"question", "blind_rewrite"})
 FORBIDDEN_QUERY_FIELDS = frozenset({"evidence", "quote", "quotes", "workKeys", "notes", "spans"})
 OUTCOME_SCHEMA_VERSION = 2
+_MAX_UNDECODABLE_BASE64_BYTES = 65536
+
+
+def _decode_stream_strict(raw: bytes, stream_name: str) -> dict[str, Any]:
+    raw_len = len(raw)
+    try:
+        decoded = raw.decode("utf-8", errors="strict")
+        return {
+            "text": decoded,
+            "rawByteLen": raw_len,
+            "decodeError": None,
+            "rawSha256": None,
+            "rawBase64": None,
+            "rawBase64Truncated": False,
+        }
+    except UnicodeDecodeError as exc:
+        return {
+            "text": None,
+            "rawByteLen": raw_len,
+            "decodeError": f"invalid_utf8_{stream_name}:{exc.reason}@byte_{exc.start}",
+            "rawSha256": hashlib.sha256(raw).hexdigest(),
+            "rawBase64": base64.b64encode(raw[:_MAX_UNDECODABLE_BASE64_BYTES]).decode("ascii"),
+            "rawBase64Truncated": raw_len > _MAX_UNDECODABLE_BASE64_BYTES,
+        }
 
 
 def _clean_env() -> dict[str, str]:
@@ -98,35 +129,54 @@ def run_clec_command(
         *argv_tail,
     ]
     started = time.monotonic()
+    timed_out = False
+    exit_code: int | None = None
     try:
         proc = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            text=False,
             env=_clean_env(),
             timeout=timeout_sec,
         )
         elapsed = time.monotonic() - started
-        return {
-            "argv": argv,
-            "exitCode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "elapsedSeconds": round(elapsed, 6),
-            "timedOut": False,
-        }
+        exit_code = proc.returncode
+        raw_stdout = proc.stdout or b""
+        raw_stderr = proc.stderr or b""
     except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - started
-        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return {
-            "argv": argv,
-            "exitCode": None,
-            "stdout": stdout,
-            "stderr": stderr,
-            "elapsedSeconds": round(elapsed, 6),
-            "timedOut": True,
-        }
+        timed_out = True
+        raw_stdout = (
+            exc.stdout
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout.encode("utf-8") if isinstance(exc.stdout, str) else b"")
+        )
+        raw_stderr = (
+            exc.stderr
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr.encode("utf-8") if isinstance(exc.stderr, str) else b"")
+        )
+
+    out_dec = _decode_stream_strict(raw_stdout, "stdout")
+    err_dec = _decode_stream_strict(raw_stderr, "stderr")
+    return {
+        "argv": argv,
+        "exitCode": exit_code,
+        "stdout": out_dec["text"],
+        "stderr": err_dec["text"],
+        "stdoutRawByteLen": out_dec["rawByteLen"],
+        "stderrRawByteLen": err_dec["rawByteLen"],
+        "stdoutDecodeError": out_dec["decodeError"],
+        "stderrDecodeError": err_dec["decodeError"],
+        "stdoutRawSha256": out_dec["rawSha256"],
+        "stderrRawSha256": err_dec["rawSha256"],
+        "stdoutRawBase64": out_dec["rawBase64"],
+        "stderrRawBase64": err_dec["rawBase64"],
+        "stdoutRawBase64Truncated": out_dec["rawBase64Truncated"],
+        "stderrRawBase64Truncated": err_dec["rawBase64Truncated"],
+        "elapsedSeconds": round(elapsed, 6),
+        "timedOut": timed_out,
+    }
 
 
 def verify_active_corpus(
@@ -135,16 +185,10 @@ def verify_active_corpus(
     expected_corpus_sha256: str,
     timeout_sec: float,
 ) -> tuple[bool, dict[str, Any]]:
-    active_json = data_dir / "active.json"
-    if active_json.is_file():
-        try:
-            active_obj = json.loads(active_json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            return False, {"error": f"Invalid active.json in {data_dir}: {exc}"}
-        if active_obj.get("release") != expected_corpus_sha256:
-            return False, {
-                "error": f"active.json release {active_obj.get('release')!r} != expected {expected_corpus_sha256!r}"
-            }
+    try:
+        binding = score.verify_active_corpus_binding(data_dir, expected_corpus_sha256)
+    except score.CorpusBindingError as exc:
+        return False, {"error": str(exc)}
 
     rec = run_clec_command(
         clec_bin,
@@ -155,6 +199,11 @@ def verify_active_corpus(
     )
     if rec["timedOut"] or rec["exitCode"] != 0:
         return False, {"record": rec, "error": "clec status failed or timed out"}
+    if rec["stdoutDecodeError"] or rec["stderrDecodeError"] or rec["stdout"] is None:
+        return False, {
+            "record": rec,
+            "error": f"clec status produced undecodable UTF-8: {rec['stdoutDecodeError'] or rec['stderrDecodeError']}",
+        }
     try:
         payload = json.loads(rec["stdout"])
         data = payload["data"]
@@ -164,16 +213,21 @@ def verify_active_corpus(
         return False, {"record": rec, "error": "Target --data-dir has no active corpus"}
     if data.get("corpusFormat") != "clec-native-v2":
         return False, {"record": rec, "error": f"Expected clec-native-v2, got {data.get('corpusFormat')}"}
-    if data.get("activeRelease") != expected_corpus_sha256:
+    if data.get("activeRelease") != binding.release:
         return False, {
             "record": rec,
-            "error": f"Active release {data.get('activeRelease')} != expected {expected_corpus_sha256}",
+            "error": f"Active release {data.get('activeRelease')} != expected {binding.release}",
+        }
+    if data.get("manifestPath") != binding.manifest_path:
+        return False, {
+            "record": rec,
+            "error": f"Status manifestPath {data.get('manifestPath')!r} != active.json {binding.manifest_path!r}",
         }
     return True, {"record": rec, "status": data}
 
 
 def _step_record(step_name: str, rec: dict[str, Any]) -> dict[str, Any]:
-    return {
+    step: dict[str, Any] = {
         "step": step_name,
         "argv": rec["argv"],
         "exitCode": rec["exitCode"],
@@ -181,7 +235,22 @@ def _step_record(step_name: str, rec: dict[str, Any]) -> dict[str, Any]:
         "elapsedSeconds": rec["elapsedSeconds"],
         "stdoutUtf8": rec["stdout"],
         "stderrUtf8": rec["stderr"],
+        "stdoutRawByteLen": rec["stdoutRawByteLen"],
+        "stderrRawByteLen": rec["stderrRawByteLen"],
     }
+    if rec["stdoutDecodeError"] is not None:
+        step["stdoutDecodeError"] = rec["stdoutDecodeError"]
+        step["stdoutRawSha256"] = rec["stdoutRawSha256"]
+        step["stdoutRawBase64"] = rec["stdoutRawBase64"]
+        if rec["stdoutRawBase64Truncated"]:
+            step["stdoutRawBase64Truncated"] = True
+    if rec["stderrDecodeError"] is not None:
+        step["stderrDecodeError"] = rec["stderrDecodeError"]
+        step["stderrRawSha256"] = rec["stderrRawSha256"]
+        step["stderrRawBase64"] = rec["stderrRawBase64"]
+        if rec["stderrRawBase64Truncated"]:
+            step["stderrRawBase64Truncated"] = True
+    return step
 
 
 def execute_dataset_queries(
@@ -231,6 +300,12 @@ def execute_dataset_queries(
         steps = [_step_record("search", search_rec)]
 
         if search_rec["timedOut"]:
+            dec_err = search_rec["stdoutDecodeError"] or search_rec["stderrDecodeError"]
+            stop_reason = (
+                f"search_timeout_{timeout_sec}s:{dec_err}"
+                if dec_err
+                else f"search_timeout_{timeout_sec}s"
+            )
             outcomes.append(
                 {
                     "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
@@ -239,7 +314,23 @@ def execute_dataset_queries(
                     "queryAngle": query_angle,
                     "queries": queries,
                     "status": "timeout",
-                    "stopReason": f"search_timeout_{timeout_sec}s",
+                    "stopReason": stop_reason,
+                    "steps": steps,
+                }
+            )
+            continue
+
+        if search_rec["stdoutDecodeError"] or search_rec["stderrDecodeError"] or search_rec["stdout"] is None:
+            dec_err = search_rec["stdoutDecodeError"] or search_rec["stderrDecodeError"] or "undecodable_search"
+            outcomes.append(
+                {
+                    "outcomeSchemaVersion": OUTCOME_SCHEMA_VERSION,
+                    "id": qid,
+                    "mode": mode,
+                    "queryAngle": query_angle,
+                    "queries": queries,
+                    "status": "error",
+                    "stopReason": f"undecodable_search_output:{dec_err}",
                     "steps": steps,
                 }
             )
@@ -248,7 +339,8 @@ def execute_dataset_queries(
         if search_rec["exitCode"] != 0:
             err_code = None
             try:
-                err_code = json.loads(search_rec["stderr"]).get("error", {}).get("code")
+                if search_rec["stderr"] is not None:
+                    err_code = json.loads(search_rec["stderr"]).get("error", {}).get("code")
             except (json.JSONDecodeError, AttributeError):
                 pass
             outcomes.append(
@@ -283,6 +375,7 @@ def execute_dataset_queries(
             )
             continue
 
+        read_status = "completed"
         read_error: str | None = None
         if read_top_n > 0 and hits:
             read_ids = [h["passageId"] for h in hits[:read_top_n]]
@@ -296,19 +389,32 @@ def execute_dataset_queries(
             raw_logs.append({"questionId": qid, "step": "read", **read_rec})
             steps.append(_step_record("read", read_rec))
             if read_rec["timedOut"]:
-                read_error = f"read_timeout_{timeout_sec}s"
+                dec_err = read_rec["stdoutDecodeError"] or read_rec["stderrDecodeError"]
+                read_status = "timeout"
+                read_error = (
+                    f"read_timeout_{timeout_sec}s:{dec_err}"
+                    if dec_err
+                    else f"read_timeout_{timeout_sec}s"
+                )
+            elif read_rec["stdoutDecodeError"] or read_rec["stderrDecodeError"] or read_rec["stdout"] is None:
+                dec_err = read_rec["stdoutDecodeError"] or read_rec["stderrDecodeError"] or "undecodable_read"
+                read_status = "error"
+                read_error = f"undecodable_read_output:{dec_err}"
             elif read_rec["exitCode"] != 0:
                 err_code = None
                 try:
-                    err_code = json.loads(read_rec["stderr"]).get("error", {}).get("code")
+                    if read_rec["stderr"] is not None:
+                        err_code = json.loads(read_rec["stderr"]).get("error", {}).get("code")
                 except (json.JSONDecodeError, AttributeError):
                     pass
+                read_status = "error"
                 read_error = f"read_cli_error:{err_code or read_rec['exitCode']}"
             else:
                 try:
                     read_json = json.loads(read_rec["stdout"])
                     _ = read_json["data"]["items"]
                 except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    read_status = "error"
                     read_error = f"invalid_read_json:{exc}"
 
         if read_error is not None:
@@ -319,7 +425,7 @@ def execute_dataset_queries(
                     "mode": mode,
                     "queryAngle": query_angle,
                     "queries": queries,
-                    "status": "error",
+                    "status": read_status,
                     "stopReason": read_error,
                     "steps": steps,
                 }

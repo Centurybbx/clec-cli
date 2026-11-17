@@ -15,27 +15,33 @@ import adapter
 import score
 
 
-def _db_path_for_release(data_dir: Path, corpus_sha256: str) -> Path:
-    return data_dir / f"{corpus_sha256}.sqlite"
-
-
 def cmd_validate_dataset(args: argparse.Namespace) -> int:
     dataset_bytes = args.dataset.read_bytes()
-    dataset = json.loads(dataset_bytes.decode("utf-8"))
-    db_path = _db_path_for_release(args.data_dir.resolve(), args.corpus_sha256)
-    if not db_path.is_file():
-        print(json.dumps({"valid": False, "error": f"Missing corpus SQLite: {db_path}"}, indent=2))
-        return 1
+    dataset_sha = hashlib.sha256(dataset_bytes).hexdigest()
     try:
-        corpus = score.CorpusIndexView(db_path, args.corpus_sha256)
-    except (ValueError, OSError) as exc:
+        dataset = json.loads(dataset_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         out = {
             "schemaVersion": 1,
-            "datasetSha256": hashlib.sha256(dataset_bytes).hexdigest(),
+            "datasetSha256": dataset_sha,
             "corpusSha256": args.corpus_sha256,
             "valid": False,
             "errorCount": 1,
-            "errors": [{"field": "corpusSha256", "error": str(exc)}],
+            "errors": [{"field": "dataset", "error": f"Invalid dataset JSON/UTF-8: {exc}"}],
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 1
+
+    try:
+        corpus = score.CorpusIndexView.open_active(args.data_dir.resolve(), args.corpus_sha256)
+    except (ValueError, OSError) as exc:
+        out = {
+            "schemaVersion": 1,
+            "datasetSha256": dataset_sha,
+            "corpusSha256": args.corpus_sha256,
+            "valid": False,
+            "errorCount": 1,
+            "errors": [{"field": "activeCorpus", "error": str(exc)}],
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 1
@@ -44,7 +50,7 @@ def cmd_validate_dataset(args: argparse.Namespace) -> int:
         errors = score.validate_dataset_against_db(dataset, corpus, args.corpus_sha256)
         out = {
             "schemaVersion": 1,
-            "datasetSha256": hashlib.sha256(dataset_bytes).hexdigest(),
+            "datasetSha256": dataset_sha,
             "corpusSha256": args.corpus_sha256,
             "actualCorpusSha256": corpus.actual_sha256,
             "corpusFormat": corpus.corpus_format,
@@ -66,8 +72,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     clec_bin = args.clec.resolve()
     data_dir = args.data_dir.resolve()
     dataset_bytes = args.dataset.read_bytes()
-    dataset = json.loads(dataset_bytes.decode("utf-8"))
     dataset_sha = hashlib.sha256(dataset_bytes).hexdigest()
+    dataset = json.loads(dataset_bytes.decode("utf-8", errors="strict"))
 
     ok_status, status_info = adapter.verify_active_corpus(
         clec_bin,
@@ -88,15 +94,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 1
 
-    db_path = _db_path_for_release(data_dir, args.corpus_sha256)
     try:
-        corpus = score.CorpusIndexView(db_path, args.corpus_sha256)
+        corpus = score.CorpusIndexView.open_active(data_dir, args.corpus_sha256)
     except (ValueError, OSError) as exc:
         report = {
             "schemaVersion": 1,
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
             "verdict": "inconclusive",
-            "reason": f"Corpus SHA-256 or format verification failed: {exc}",
+            "reason": f"Active corpus binding, SHA-256, or format verification failed: {exc}",
             "corpusSha256": args.corpus_sha256,
             "datasetSha256": dataset_sha,
         }
@@ -213,20 +218,32 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_score_outcomes(args: argparse.Namespace) -> int:
     dataset_bytes = args.dataset.read_bytes()
-    dataset = json.loads(dataset_bytes.decode("utf-8"))
-    outcomes = json.loads(args.outcomes.read_text(encoding="utf-8"))
-    db_path = _db_path_for_release(args.data_dir.resolve(), args.corpus_sha256)
-    if not db_path.is_file():
-        print(json.dumps({"verdict": "inconclusive", "reason": f"Missing corpus SQLite: {db_path}"}, indent=2))
-        return 1
+    dataset_sha = hashlib.sha256(dataset_bytes).hexdigest()
+    dataset = json.loads(dataset_bytes.decode("utf-8", errors="strict"))
     try:
-        corpus = score.CorpusIndexView(db_path, args.corpus_sha256)
+        outcomes_raw = args.outcomes.read_bytes().decode("utf-8", errors="strict")
+        outcomes = json.loads(outcomes_raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        report = {
+            "schemaVersion": 1,
+            "verdict": "inconclusive",
+            "reason": f"Invalid outcomes JSON/UTF-8: {exc}",
+            "corpusSha256": args.corpus_sha256,
+            "datasetSha256": dataset_sha,
+        }
+        _write_report(args.output, report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    try:
+        corpus = score.CorpusIndexView.open_active(args.data_dir.resolve(), args.corpus_sha256)
     except (ValueError, OSError) as exc:
         report = {
             "schemaVersion": 1,
             "verdict": "inconclusive",
-            "reason": f"Corpus SHA-256 or format verification failed: {exc}",
+            "reason": f"Active corpus binding, SHA-256, or format verification failed: {exc}",
             "corpusSha256": args.corpus_sha256,
+            "datasetSha256": dataset_sha,
         }
         _write_report(args.output, report)
         print(json.dumps(report, ensure_ascii=False, indent=2))

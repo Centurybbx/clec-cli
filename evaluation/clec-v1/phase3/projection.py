@@ -5,16 +5,94 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 import hashlib
-import re
 from typing import Sequence
 
 
 VALID_PROJECTION_KINDS = frozenset(
     {"subtitle_cue_payload", "archive_voice_note_md", "plain_text"}
 )
-MD_TS_RE = re.compile(
-    r"^## \[\d+:\d{2}:\d{2}[.,]\d{3}\s+[–-]\s+\d+:\d{2}:\d{2}[.,]\d{3}\]$"
+# Matches Rust char::is_whitespace (Unicode White_Space=Y), excluding U+001C..U+001F.
+RUST_WHITESPACE_CHARS = frozenset(
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0"
+    "\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
 )
+_RUST_WHITESPACE_STR = "".join(RUST_WHITESPACE_CHARS)
+_I64_MAX = (1 << 63) - 1
+
+
+def _rust_trim(text: str) -> str:
+    return text.strip(_RUST_WHITESPACE_STR)
+
+
+def _parse_ascii_uint(part: str) -> int | None:
+    if not part or not part.isascii() or not part.isdigit():
+        return None
+    return int(part)
+
+
+def _parse_timestamp_ms(token: str) -> int | None:
+    normalized = token.replace(",", ".")
+    if "." not in normalized:
+        return None
+    hms, ms_str = normalized.split(".", 1)
+    if len(ms_str) != 3 or not ms_str.isascii() or not ms_str.isdigit():
+        return None
+    ms = int(ms_str)
+    parts = hms.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes = _parse_ascii_uint(parts[0])
+        seconds = _parse_ascii_uint(parts[1])
+    elif len(parts) == 3:
+        hours = _parse_ascii_uint(parts[0])
+        minutes = _parse_ascii_uint(parts[1])
+        seconds = _parse_ascii_uint(parts[2])
+    else:
+        return None
+    if hours is None or minutes is None or seconds is None:
+        return None
+    if minutes >= 60 or seconds >= 60:
+        return None
+    total_ms = ((hours * 3600) + (minutes * 60) + seconds) * 1000 + ms
+    if total_ms > _I64_MAX:
+        return None
+    return total_ms
+
+
+def _is_archive_md_ts_header(trimmed: str) -> bool:
+    if not (trimmed.startswith("## [") and trimmed.endswith("]")):
+        return False
+    inner = trimmed[4:-1]
+    if " – " in inner:
+        left, right = inner.split(" – ", 1)
+    elif " - " in inner:
+        left, right = inner.split(" - ", 1)
+    else:
+        return False
+    return (
+        _parse_timestamp_ms(_rust_trim(left)) is not None
+        and _parse_timestamp_ms(_rust_trim(right)) is not None
+    )
+
+
+def _rust_lines_with_byte_offsets(
+    raw_bytes: bytes, start_offset: int
+) -> list[tuple[int, int, str]]:
+    lines: list[tuple[int, int, str]] = []
+    pos = start_offset
+    total = len(raw_bytes)
+    while pos < total:
+        nl = raw_bytes.find(b"\n", pos)
+        if nl == -1:
+            content = raw_bytes[pos:total].decode("utf-8", errors="strict")
+            lines.append((pos, total, content))
+            break
+        content_end = nl - 1 if nl > pos and raw_bytes[nl - 1] == 0x0D else nl
+        content = raw_bytes[pos:content_end].decode("utf-8", errors="strict")
+        lines.append((pos, nl + 1, content))
+        pos = nl + 1
+    return lines
 
 
 def merge_intervals(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -113,21 +191,17 @@ def _extract_regions(
 
     if projection_kind == "archive_voice_note_md":
         pos = 3 if raw_bytes.startswith(b"\xef\xbb\xbf") else 0
-        body_text = raw_bytes[pos:].decode("utf-8")
-        lines = body_text.splitlines(keepends=True)
-        if not lines or not lines[0].strip().startswith("# 語音筆記："):
+        lines = _rust_lines_with_byte_offsets(raw_bytes, pos)
+        if not lines or not _rust_trim(lines[0][2]).startswith("# 語音筆記："):
             raise ValueError("archive_voice_note_md missing '# 語音筆記：' header")
-        pos += len(lines[0].encode("utf-8"))
         saw_ts_header = False
         regions: list[tuple[int, int]] = []
-        for line in lines[1:]:
-            line_bytes = len(line.encode("utf-8"))
-            trimmed = line.strip()
-            if MD_TS_RE.match(trimmed):
+        for line_start, line_end, content in lines[1:]:
+            trimmed = _rust_trim(content)
+            if _is_archive_md_ts_header(trimmed):
                 saw_ts_header = True
             elif trimmed:
-                regions.append((pos, pos + line_bytes))
-            pos += line_bytes
+                regions.append((line_start, line_end))
         if not saw_ts_header or not regions:
             raise ValueError("archive_voice_note_md missing timestamp headers or body")
         return regions
@@ -164,7 +238,7 @@ def project_source(
         cur_tok: list[str] = []
         for ch in reg_str:
             ch_bytes = len(ch.encode("utf-8"))
-            if ch.isspace():
+            if ch in RUST_WHITESPACE_CHARS:
                 if cur_tok:
                     tokens.append("".join(cur_tok))
                     cur_tok.clear()

@@ -79,18 +79,23 @@ def main() -> int:
 
     clec_bin = args.clec.resolve()
     data_dir = args.data_dir.resolve()
+    try:
+        binding = score.verify_active_corpus_binding(data_dir, args.corpus_sha256)
+    except score.CorpusBindingError as exc:
+        raise SystemExit(str(exc)) from exc
+
     ok_status, status_info = adapter.verify_active_corpus(
         clec_bin, data_dir, args.corpus_sha256, args.timeout_sec
     )
     if not ok_status:
         raise SystemExit(status_info["error"])
 
-    db_path = data_dir / f"{args.corpus_sha256}.sqlite"
+    db_path = binding.db_path
     actual_sha = score.stream_sha256(db_path)
     if actual_sha != args.corpus_sha256:
         raise SystemExit(f"Corpus SQLite SHA-256 mismatch: expected {args.corpus_sha256}, actual {actual_sha}")
 
-    dataset = json.loads(args.dataset.read_text(encoding="utf-8"))
+    dataset = json.loads(args.dataset.read_bytes().decode("utf-8", errors="strict"))
     blind_map = adapter.load_blind_queries(args.blind_queries.resolve()) if args.blind_queries else None
     questions = dataset["questions"]
 
@@ -109,12 +114,14 @@ def main() -> int:
             "single_query_product_baseline": q_base,
             "rrf_multiquery": q_rrf,
         }
-        if len(q_rrf) < 2 or q_rrf == q_base:
+        unique_raw_base = list(dict.fromkeys(q_base))
+        unique_raw_rrf = list(dict.fromkeys(q_rrf))
+        if len(unique_raw_rrf) < 2 or unique_raw_rrf == unique_raw_base:
             has_distinct_plans = False
 
-    comparison_status = "DISTINCT_QUERY_PLANS" if has_distinct_plans else "IDENTICAL_QUERY_PLANS"
-
     question_fts_queries: dict[str, str] = {}
+    effective_plan_details: dict[str, dict[str, Any]] = {}
+    warmup_error_count = 0
     for q in questions:
         qid = q["id"]
         modes_to_warm = (
@@ -122,6 +129,8 @@ def main() -> int:
             if has_distinct_plans
             else ("single_query_product_baseline",)
         )
+        base_term_sets: set[frozenset[str]] | None = None
+        rrf_term_sets: set[frozenset[str]] | None = None
         for mode in modes_to_warm:
             queries = plan_by_qid[qid][mode]
             warm_rec = adapter.run_clec_command(
@@ -140,12 +149,44 @@ def main() -> int:
                 max_bytes=args.max_bytes,
                 timeout_sec=args.timeout_sec,
             )
-            if mode == "single_query_product_baseline" and not warm_rec["timedOut"] and warm_rec["exitCode"] == 0:
+            warm_ok = (
+                not warm_rec["timedOut"]
+                and warm_rec["exitCode"] == 0
+                and warm_rec["stdoutDecodeError"] is None
+                and warm_rec["stderrDecodeError"] is None
+                and warm_rec["stdout"] is not None
+            )
+            if not warm_ok:
+                warmup_error_count += 1
+                continue
+            try:
                 warm_data = json.loads(warm_rec["stdout"])["data"]
-                terms = warm_data["queries"][0]["terms"]
+                q_entries = warm_data["queries"]
+                term_sets = {frozenset(str(t) for t in item["terms"]) for item in q_entries}
+            except (json.JSONDecodeError, KeyError, TypeError):
+                warmup_error_count += 1
+                continue
+            if mode == "single_query_product_baseline":
+                base_term_sets = term_sets
+                terms = q_entries[0]["terms"]
                 question_fts_queries[qid] = " OR ".join(
                     f'"t{t.encode("utf-8").hex()}"' for t in terms
                 )
+            else:
+                rrf_term_sets = term_sets
+
+        if rrf_term_sets is not None and (
+            len(rrf_term_sets) < 2 or (base_term_sets is not None and rrf_term_sets == base_term_sets)
+        ):
+            has_distinct_plans = False
+        effective_plan_details[qid] = {
+            "baselineRawQueries": plan_by_qid[qid]["single_query_product_baseline"],
+            "rrfRawQueries": plan_by_qid[qid]["rrf_multiquery"],
+            "baselineEffectiveTermSetCount": len(base_term_sets) if base_term_sets is not None else None,
+            "rrfEffectiveTermSetCount": len(rrf_term_sets) if rrf_term_sets is not None else None,
+        }
+
+    comparison_status = "DISTINCT_QUERY_PLANS" if has_distinct_plans else "IDENTICAL_QUERY_PLANS"
 
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         for fts_q in question_fts_queries.values():
@@ -194,16 +235,25 @@ def main() -> int:
                     max_bytes=args.max_bytes,
                     timeout_sec=args.timeout_sec,
                 )
-                ok = not rec["timedOut"] and rec["exitCode"] == 0
+                ok = (
+                    not rec["timedOut"]
+                    and rec["exitCode"] == 0
+                    and rec["stdoutDecodeError"] is None
+                    and rec["stderrDecodeError"] is None
+                    and rec["stdout"] is not None
+                )
                 work_keys: list[str] = []
                 total_candidates = 0
                 returned_hits = 0
                 if ok:
-                    data = json.loads(rec["stdout"])["data"]
-                    hits = data["hits"]
-                    total_candidates = int(data.get("totalCandidates", 0))
-                    returned_hits = len(hits)
-                    work_keys = sorted({h["work"]["workKey"] for h in hits})
+                    try:
+                        data = json.loads(rec["stdout"])["data"]
+                        hits = data["hits"]
+                        total_candidates = int(data.get("totalCandidates", 0))
+                        returned_hits = len(hits)
+                        work_keys = sorted({h["work"]["workKey"] for h in hits})
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                        ok = False
                 cli_records[mode].append(
                     {
                         "repeat": rep,
@@ -267,13 +317,13 @@ def main() -> int:
             "runs": rows,
         }
 
-    total_cli_errors = sum(v["errorCount"] for v in whole_process_cli.values())
-    if not has_distinct_plans:
+    total_cli_errors = sum(v["errorCount"] for v in whole_process_cli.values()) + warmup_error_count
+    if total_cli_errors > 0:
+        comparison_verdict = "inconclusive_errors_present"
+    elif not has_distinct_plans:
         comparison_verdict = "no_comparison_identical_query_plans"
     elif args.repeats < 5:
         comparison_verdict = "inconclusive_under_5_repeats"
-    elif total_cli_errors > 0:
-        comparison_verdict = "inconclusive_errors_present"
     else:
         comparison_verdict = "valid_interleaved_latency_comparison"
 
@@ -285,6 +335,8 @@ def main() -> int:
         "actualCorpusSha256": actual_sha,
         "comparisonStatus": comparison_status,
         "comparisonVerdict": comparison_verdict,
+        "warmupErrorCount": warmup_error_count,
+        "effectivePlanDetails": effective_plan_details,
         "repeats": args.repeats,
         "questionCount": len(questions),
         "hostLoadBefore": list(load_before) if load_before else None,
