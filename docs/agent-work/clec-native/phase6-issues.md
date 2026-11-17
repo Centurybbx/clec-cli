@@ -2,6 +2,14 @@
 
 This ledger tracks Stage 6A implementation work stacked on accepted Stage 5 head `607a99b47e51215f0fb26bcf38a418be5c71fb14` (mock contract accepted at `e2b6195b9ff893aebffa6b06ea6b5441ba626b1c`).
 
+## Independent review follow-up at `b45bdcc`
+
+Review `ff034441` accepted native cache safety and MSRV lifecycle. Review `2d508eb7` requested three packaging corrections. Its executable probes established wrong-target, empty, and renamed test-hook payload admission, unsupported CI lint-toolchain selection, and an invalid Skill context example. No public artifacts were released.
+
+The coordinator corrected the two small configuration/documentation findings. CI lint commands explicitly select `+stable`, whose rustfmt and Clippy components the workflow installs; MSRV build/test commands still select `+1.89.0`. The Skill now gives `--context 1` and separately explains `--context 2`. Local stable component checks and formatting pass; the actual native parser accepts context `1` and reaches `NO_DATA` on an empty offline fixture. This is no claim of a dispatched CI run. The original npm size was corrected to the measured 7,904,121 bytes. Two narration comments were removed without behavior changes.
+
+Artifact admission remains OPEN pending a focused Hydrogen fix and independent review. Staging must establish executable format/architecture, bind build facts to actual artifacts, reject test-hook builds after rename, and validate installer tuple metadata. Existing package/Skill hashes remain historical receipts at their recorded code heads. Corrected artifacts must be restaged and reverified before acceptance.
+
 ## Carried-forward open gates
 
 1. **Live Jev provider (`OPEN`).** `schema.providerVerified` remains `false`. No live provider API calls or credentials are authorized or used in Stage 6A.

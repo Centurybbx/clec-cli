@@ -31,7 +31,6 @@ function restorePlaceholder(destBin) {
       chmodSync(destBin, 0o644);
     }
   } catch {
-    // Best-effort cleanup so a failed repair never leaves an unverified binary.
   }
 }
 
@@ -164,7 +163,6 @@ export function installFromRoot(pkgRoot, options = {}) {
     try {
       rmSync(tmpBin, { force: true });
     } catch {
-      // Ignore temp cleanup errors.
     }
     fail(`Failed to install native binary to ${destBin}: ${err.message}`);
   }

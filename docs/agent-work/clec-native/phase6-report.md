@@ -4,6 +4,8 @@ Stage 6A delivers bounded platform cache path resolution and shared-cache owners
 
 All Stage 6A deliverables remain reversible local work pending independent parent review. Stage 6B host-answer evaluation, cross-OS execution, production default endpoint configuration, live Jev verification, and Stage 3 retrieval quality remain separate open gates.
 
+Independent review at `b45bdcc` accepted the native cache/MSRV scope and requested packaging changes. The coordinator corrected CI lint selection and the Skill context example; artifact admission and restaging remain pending. The tables below retain historical measurements at their named commits, including the earlier Skill hash, rather than claiming they identify these later edits. See `phase6-issues.md` for the open findings.
+
 ## Tested commits and gate status
 
 - **Base commit:** `607a99b47e51215f0fb26bcf38a418be5c71fb14` (Stage 5 mock contract accepted at `e2b6195b9ff893aebffa6b06ea6b5441ba626b1c`).
@@ -47,7 +49,7 @@ All Stage 6A deliverables remain reversible local work pending independent paren
 
 | Staged file | Bytes | SHA-256 |
 | --- | --- | --- |
-| `clec-cli-1.0.0-dev.0.tgz` | 7,904,085 | `c49d59bd81fd4315f56387fc36f9fd9e0b768ba74f663adf41435dadd298d4ec` |
+| `clec-cli-1.0.0-dev.0.tgz` | 7,904,121 | `c49d59bd81fd4315f56387fc36f9fd9e0b768ba74f663adf41435dadd298d4ec` |
 | `clec-v1.0.0-dev.0-darwin-arm64.tar.gz` | 7,900,988 | `2690069e807c74e348d966249beec0a79bb80cea2268c6ce66da54ab3890ff0c` |
 | `clec-maintainer-v1.0.0-dev.0-darwin-arm64.tar.gz` | 10,630,242 | `e9fdd04973a6a0bf259120f5c64d717ba1c8a48d01bc4db276651a8417d7019c` |
 | `inventory.json` | 1,487 | `bdfe96bc6a542a0fb889855d257999760939ab1657bbcf2ff5e982e3b58c229f` |
