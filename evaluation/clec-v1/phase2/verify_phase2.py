@@ -750,6 +750,101 @@ def main() -> int:
             assert caught_bad_err
             return "all 4 known-bad controls caught expected mismatches"
 
+        def check_large_64_bucket_regression(log: list[dict[str, Any]]) -> str:
+            ws = tmp / "large-2001-ws"
+            ws.mkdir()
+            passage_count = 2001
+            sources = []
+            for i in range(1, passage_count + 1):
+                rel_name = f"p{i:04d}.txt"
+                (ws / rel_name).write_text(f"tok{i:04d} alpha beta", encoding="utf-8")
+                sources.append(
+                    {
+                        "work": "w2001",
+                        "path": rel_name,
+                        "title": f"Title {i:04d}",
+                        "role": "document",
+                        "attribution": "authored_fixture",
+                        "quality": "fixture",
+                        "status": "ready",
+                    }
+                )
+            intake_path = tmp / "large-2001-intake.json"
+            intake_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "works": [{"key": "w2001", "title": "Large 64 Bucket Fixture"}],
+                        "sources": sources,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rel_dir = tmp / "large-2001-rel"
+            pub = run_cmd(pub_bin, ["--workspace", str(ws), "--intake", str(intake_path), "--output", str(rel_dir)], clean_env, log)
+            assert pub.returncode == 0, pub.stderr
+            manifest = log_corpus_record(corpora_logged, "large-2001-64bucket", rel_dir / "manifest.json")
+            assert manifest["counts"]["passages"] == passage_count, manifest["counts"]
+
+            large_data = tmp / "large-2001-data"
+            synced = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(large_data), "sync", "--manifest", str(rel_dir / "manifest.json")], clean_env, log))
+            active_sha = synced["release"]
+            assert active_sha == manifest["sha256"]
+            for tok in ("tok0064", "tok0065", "tok2001"):
+                res = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(large_data), "search", tok], clean_env, log))
+                assert len(res["hits"]) == 1, (tok, res)
+
+            def rewrite_search(conn: sqlite3.Connection, mutator: Any) -> None:
+                conn.execute("CREATE VIRTUAL TABLE temp.__v USING fts5vocab(main, search, instance)")
+                by_doc: dict[int, dict[str, list[str]]] = {}
+                for doc, col, term in conn.execute("SELECT doc, col, term FROM temp.__v ORDER BY doc, col, offset"):
+                    by_doc.setdefault(int(doc), {"title_tokens": [], "body_tokens": []})[col].append(term)
+                conn.execute("DROP TABLE temp.__v")
+                mutator(by_doc)
+                conn.execute("INSERT INTO search(search) VALUES('delete-all')")
+                for doc in sorted(by_doc):
+                    conn.execute(
+                        "INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(?, ?, ?)",
+                        (doc, " ".join(by_doc[doc]["title_tokens"]), " ".join(by_doc[doc]["body_tokens"])),
+                    )
+
+            def swap_64_65(by_doc: dict[int, dict[str, list[str]]]) -> None:
+                by_doc[64]["body_tokens"], by_doc[65]["body_tokens"] = (
+                    by_doc[65]["body_tokens"],
+                    by_doc[64]["body_tokens"],
+                )
+
+            def drop_last_posting(by_doc: dict[int, dict[str, list[str]]]) -> None:
+                by_doc[2001]["body_tokens"] = by_doc[2001]["body_tokens"][:-1]
+
+            def dup_last_posting(by_doc: dict[int, dict[str, list[str]]]) -> None:
+                toks = by_doc[2001]["body_tokens"]
+                by_doc[2001]["body_tokens"] = [*toks[:-1], toks[-2]]
+
+            for name, mutator in (
+                ("large-boundary-64-65", lambda c: rewrite_search(c, swap_64_65)),
+                ("large-missing-2001", lambda c: rewrite_search(c, drop_last_posting)),
+                ("large-duplicate-2001", lambda c: rewrite_search(c, dup_last_posting)),
+                ("large-global-stats-2001", lambda c: c.execute("UPDATE search_data SET block=x'000000' WHERE id=1")),
+            ):
+                m_bad = repack_tampered_release(rel_dir, tmp / name, mutator)
+                assert_err_json(
+                    run_cmd(clec_bin, ["--data-dir", str(large_data), "sync", "--manifest", str(m_bad)], clean_env, log),
+                    "INTEGRITY_MISMATCH",
+                )
+                leftovers = [
+                    p.name
+                    for p in large_data.iterdir()
+                    if p.name.startswith(".clec-fts-") or p.name in (".incoming.sqlite.tmp", ".active.tmp")
+                ]
+                assert not leftovers, f"leftover temp artifacts after failed {name}: {leftovers}"
+
+            st_after = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(large_data), "status"], clean_env, log))
+            assert st_after["activeRelease"] == active_sha
+            res_after = assert_ok_json(run_cmd(clec_bin, ["--data-dir", str(large_data), "search", "tok2001"], clean_env, log))
+            assert len(res_after["hits"]) == 1
+            return "2001-passage 64-bucket sync, 64/65 boundary swap, last-row 2001 missing/duplicate postings, global stats, unchanged active state, and temp cleanup verified"
+
         run_check("no_data_lifecycle", check_no_data)
         run_check("parser_and_unsupported_flags", check_parser_and_unsupported)
         run_check("synthetic_triples_and_false_friends", check_synthetic_triples_and_false_friends)
@@ -757,6 +852,7 @@ def main() -> int:
         run_check("authored_ranking_and_diversity", check_authored_ranking_and_diversity)
         run_check("real_00318_00575_e2e", check_real_mini_corpus)
         run_check("sync_atomicity_and_import_guards", check_sync_atomicity_and_import_guards)
+        run_check("large_64_bucket_2001_regression", check_large_64_bucket_regression)
         run_check("known_bad_controls", check_known_bad_controls)
 
     report = {

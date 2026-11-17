@@ -2,14 +2,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use clec_core::domain::{ClecError, ErrorCode, ErrorEnvelope};
+use clec_core::domain::{CORPUS_FORMAT, ClecError, ErrorCode, ErrorEnvelope};
 use clec_core::snapshot::publish_release;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "clec-publish",
     version,
-    about = "Build a clec-native-v1 corpus.sqlite.zst release and manifest.json"
+    about = format!("Build a {CORPUS_FORMAT} corpus.sqlite.zst release and manifest.json")
 )]
 struct PublishCli {
     /// Workspace root containing admitted relative source files
@@ -53,5 +53,19 @@ fn main() -> ExitCode {
             eprintln!("{}", serde_json::to_string(&env).unwrap());
             ExitCode::from(err.code.exit_code() as u8)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_about_derives_from_corpus_format_constant() {
+        let cmd = PublishCli::command();
+        let about = cmd.get_about().expect("about text").to_string();
+        assert!(about.contains(CORPUS_FORMAT), "about={about}");
+        assert!(!about.contains("clec-native-v1"), "about={about}");
     }
 }

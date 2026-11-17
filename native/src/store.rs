@@ -3094,4 +3094,186 @@ mod tests {
         let b1 = bucket_test.take_sorted(1).unwrap();
         assert_eq!(b1.entries.len(), 2);
     }
+
+    #[test]
+    fn validates_and_rejects_corruptions_on_2001_passage_64_bucket_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let passage_count = 2001usize;
+        let mut intake_sources = Vec::with_capacity(passage_count);
+        for i in 1..=passage_count {
+            let rel = format!("p{i:04}.txt");
+            let body = format!("tok{i:04} alpha beta");
+            fs::write(ws.join(&rel), body).unwrap();
+            intake_sources.push(serde_json::json!({
+                "work": "w2001",
+                "path": rel,
+                "title": format!("Title {i:04}"),
+                "role": "document",
+                "attribution": "authored_fixture",
+                "quality": "fixture",
+                "status": "ready"
+            }));
+        }
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            serde_json::to_string(&serde_json::json!({
+                "schemaVersion": 1,
+                "works": [{ "key": "w2001", "title": "Large 64-Bucket Work" }],
+                "sources": intake_sources
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let rel = tmp.path().join("release");
+        let manifest = publish_release(&ws, &intake, &rel).unwrap();
+        assert_eq!(manifest.counts.passages, passage_count);
+
+        let db_path = tmp.path().join("corpus.sqlite");
+        let zst = fs::File::open(rel.join("corpus.sqlite.zst")).unwrap();
+        let mut dec = zstd::stream::Decoder::new(zst).unwrap();
+        let mut buf = Vec::new();
+        dec.read_to_end(&mut buf).unwrap();
+        fs::write(&db_path, &buf).unwrap();
+
+        let release = ReleaseHash::parse(&"9".repeat(64)).unwrap();
+        let staging_check_dir = tmp.path().join("stage_ok");
+        fs::create_dir_all(&staging_check_dir).unwrap();
+        let stage_ok_db = staging_check_dir.join("corpus.sqlite");
+        fs::copy(&db_path, &stage_ok_db).unwrap();
+        CorpusStore::validate_staging_db(&stage_ok_db, release.clone(), &manifest.counts).unwrap();
+        assert_eq!(
+            fs::read_dir(&staging_check_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".clec-fts-"))
+                .count(),
+            0
+        );
+
+        let rewrite_search = |target_db: &Path, mutator: &dyn Fn(usize, String) -> String| {
+            let conn = Connection::open(target_db).unwrap();
+            let mut rows_data: Vec<(i64, String, String)> = Vec::with_capacity(passage_count);
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT p.rowid, s.title, p.text FROM passages p JOIN sources s ON s.id = p.source_id ORDER BY p.rowid",
+                    )
+                    .unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                while let Some(r) = rows.next().unwrap() {
+                    let rowid: i64 = r.get(0).unwrap();
+                    let title: String = r.get(1).unwrap();
+                    let text: String = r.get(2).unwrap();
+                    let body_tokens = mutator(rowid as usize, index_tokens_string(&text));
+                    rows_data.push((rowid, index_tokens_string(&title), body_tokens));
+                }
+            }
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute_batch("INSERT INTO search(search) VALUES('delete-all');")
+                .unwrap();
+            {
+                let mut ins = tx
+                    .prepare("INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(?, ?, ?)")
+                    .unwrap();
+                for (rowid, t, b) in &rows_data {
+                    ins.execute(params![rowid, t, b]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        };
+
+        let boundary_dir = tmp.path().join("stage_boundary");
+        fs::create_dir_all(&boundary_dir).unwrap();
+        let boundary_db = boundary_dir.join("corpus.sqlite");
+        fs::copy(&db_path, &boundary_db).unwrap();
+        rewrite_search(&boundary_db, &|rowid, body| match rowid {
+            64 => index_tokens_string("tok0065 alpha beta"),
+            65 => index_tokens_string("tok0064 alpha beta"),
+            _ => body,
+        });
+        assert_eq!(
+            CorpusStore::validate_staging_db(&boundary_db, release.clone(), &manifest.counts)
+                .unwrap_err()
+                .code,
+            ErrorCode::IntegrityMismatch
+        );
+        assert_eq!(
+            fs::read_dir(&boundary_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".clec-fts-"))
+                .count(),
+            0
+        );
+
+        let missing_last_dir = tmp.path().join("stage_missing_last");
+        fs::create_dir_all(&missing_last_dir).unwrap();
+        let missing_last_db = missing_last_dir.join("corpus.sqlite");
+        fs::copy(&db_path, &missing_last_db).unwrap();
+        rewrite_search(&missing_last_db, &|rowid, body| {
+            if rowid == passage_count {
+                index_tokens_string("tok2001 alpha")
+            } else {
+                body
+            }
+        });
+        assert_eq!(
+            CorpusStore::validate_staging_db(&missing_last_db, release.clone(), &manifest.counts)
+                .unwrap_err()
+                .code,
+            ErrorCode::IntegrityMismatch
+        );
+
+        let dup_last_dir = tmp.path().join("stage_dup_last");
+        fs::create_dir_all(&dup_last_dir).unwrap();
+        let dup_last_db = dup_last_dir.join("corpus.sqlite");
+        fs::copy(&db_path, &dup_last_db).unwrap();
+        rewrite_search(&dup_last_db, &|rowid, body| {
+            if rowid == passage_count {
+                index_tokens_string("tok2001 alpha alpha")
+            } else {
+                body
+            }
+        });
+        assert_eq!(
+            CorpusStore::validate_staging_db(&dup_last_db, release.clone(), &manifest.counts)
+                .unwrap_err()
+                .code,
+            ErrorCode::IntegrityMismatch
+        );
+
+        let global_stat_dir = tmp.path().join("stage_global_stat");
+        fs::create_dir_all(&global_stat_dir).unwrap();
+        let global_stat_db = global_stat_dir.join("corpus.sqlite");
+        fs::copy(&db_path, &global_stat_db).unwrap();
+        {
+            let conn = Connection::open(&global_stat_db).unwrap();
+            conn.execute("UPDATE search_data SET block=x'000000' WHERE id=1", [])
+                .unwrap();
+        }
+        assert_eq!(
+            CorpusStore::validate_staging_db(&global_stat_db, release, &manifest.counts)
+                .unwrap_err()
+                .code,
+            ErrorCode::IntegrityMismatch
+        );
+
+        let mut dup_offset_buckets = PostingBuckets::new(tmp.path(), "dup_offset", 64).unwrap();
+        dup_offset_buckets.push(2001, 1, 0, b"t6162").unwrap();
+        dup_offset_buckets.push(2001, 1, 0, b"t6162").unwrap();
+        dup_offset_buckets.flush().unwrap();
+        assert_eq!(
+            dup_offset_buckets
+                .take_sorted(2001 % 64)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::InvalidPackage
+        );
+    }
 }

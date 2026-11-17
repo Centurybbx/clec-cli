@@ -567,7 +567,6 @@ def prepare_intake(workspace: Path) -> tuple[dict[str, Any], list[dict[str, Any]
     ):
         add_inventory_only(bin_rel, f"meta:{bin_rel}", Path(bin_rel).name, "unsupported", "binary_original_not_searchable")
 
-    # Stickiest quarantine wins across duplicate manifest records for the same path.
     resolved_sources: list[dict[str, Any]] = []
     for path in sorted(candidates_by_path):
         cands = candidates_by_path[path]
@@ -607,7 +606,6 @@ def build_reconciliation(
     ready_sources = [s for s in sources if s["status"] == "ready"]
     by_path = {s["path"]: s for s in sources}
 
-    # Audit candidate duplicates across distinct works without merging them.
     body_buckets: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for s in ready_sources:
         body_hash = hashlib.sha256(project_body_for_candidate_audit(workspace / s["path"], s["path"]).encode("utf-8")).hexdigest()
