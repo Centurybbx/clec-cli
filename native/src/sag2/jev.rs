@@ -1709,7 +1709,8 @@ mod tests {
 
         let b_port =
             canonical_http1_header_block_bytes(&u_port, "synthetic-review-sentinel", 5462).unwrap();
-        assert_eq!(b_port, 192);
+        let expected_port_bytes = 192 - "0.1.0".len() + env!("CARGO_PKG_VERSION").len();
+        assert_eq!(b_port, expected_port_bytes);
         let b_v6 = canonical_http1_header_block_bytes(&u_v6, "k", 10).unwrap();
         assert!(b_v6 > 0);
         let b_def = canonical_http1_header_block_bytes(&u_default, "k", 100).unwrap();

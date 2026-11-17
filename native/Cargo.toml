@@ -1,6 +1,6 @@
 [package]
 name = "clec-native"
-version = "0.1.0"
+version = "1.0.0-dev.0"
 edition = "2024"
 rust-version = "1.89.0"
 description = "Offline CLEC evidence search, exact byte-span reads, and local snapshot sync"

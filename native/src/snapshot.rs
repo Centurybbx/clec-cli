@@ -1031,6 +1031,19 @@ fn open_existing_store(
     CorpusStore::open_readonly(&db_path, state.release.clone())
 }
 
+fn ensure_not_legacy_cache_dir(data_dir: &Path) -> Result<(), ClecError> {
+    if fs::symlink_metadata(data_dir.join("current")).is_ok() {
+        return Err(ClecError::new(
+            ErrorCode::InvalidDataDir,
+            format!(
+                "Data directory {} contains a legacy CLEC `current` cache marker. Choose a separate directory with --data-dir PATH or CLEC_DATA_DIR, or omit both to use the default native-v2 directory.",
+                data_dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_current_store(
     data_dir: &Path,
     network_policy: NetworkPolicy,
@@ -1038,6 +1051,7 @@ pub(crate) fn ensure_current_store(
     transfer_policy: &TransferPolicy,
     release_pin: Option<&ReleaseHash>,
 ) -> Result<CorpusStore, ClecError> {
+    ensure_not_legacy_cache_dir(data_dir)?;
     if let Some(state) = read_active_state(data_dir)? {
         return open_existing_store(data_dir, &state, release_pin);
     }
@@ -1115,6 +1129,7 @@ pub(crate) fn sync_dry_run(
     default_origin: Option<&str>,
     transfer_policy: &TransferPolicy,
 ) -> Result<SyncDryRunData, ClecError> {
+    ensure_not_legacy_cache_dir(data_dir)?;
     let prev_state_res = read_active_state(data_dir);
     let location = resolve_sync_location(manifest_arg, &prev_state_res, default_origin)?;
     let loaded = load_manifest(&location, network_policy, transfer_policy)?;
@@ -1137,6 +1152,7 @@ pub(crate) fn sync_dry_run(
 }
 
 pub(crate) fn data_dir_status(data_dir: &Path) -> Result<StatusData, ClecError> {
+    ensure_not_legacy_cache_dir(data_dir)?;
     let state = read_active_state(data_dir)?;
     let storage_bytes = compute_managed_bytes(data_dir)?;
     let data_dir_str = data_dir.display().to_string();
@@ -1211,6 +1227,7 @@ where
             "--data-dir must point to a directory.",
         ));
     }
+    ensure_not_legacy_cache_dir(data_dir)?;
     fs::create_dir_all(data_dir).map_err(|e| {
         ClecError::new(
             ErrorCode::InvalidDataDir,
@@ -1284,6 +1301,7 @@ fn sync_locked<T, F>(
 where
     F: FnOnce(&SyncData) -> Result<T, ClecError>,
 {
+    ensure_not_legacy_cache_dir(data_dir)?;
     cleanup_stale_staging(data_dir);
     let prev_state_res = read_active_state(data_dir);
     let location = resolve_sync_location(manifest_arg, &prev_state_res, default_origin)?;
@@ -1333,12 +1351,15 @@ where
         }
 
         return commit_active_state(
-            data_dir,
-            &existing_path,
-            existing_bytes,
-            &manifest,
-            manifest_path_str,
-            true,
+            ActiveCommitInput {
+                data_dir,
+                final_db: &existing_path,
+                final_db_len: existing_bytes,
+                prev_release: prev_release.as_ref(),
+                manifest: &manifest,
+                manifest_path_str,
+                reused: true,
+            },
             prepare_output,
         );
     }
@@ -1365,12 +1386,15 @@ where
         fs::rename(&staging_db, &final_db).map_err(map_io)?;
 
         commit_active_state(
-            data_dir,
-            &final_db,
-            total,
-            &manifest,
-            manifest_path_str,
-            false,
+            ActiveCommitInput {
+                data_dir,
+                final_db: &final_db,
+                final_db_len: total,
+                prev_release: prev_release.as_ref(),
+                manifest: &manifest,
+                manifest_path_str,
+                reused: false,
+            },
             prepare_output,
         )
     })();
@@ -1384,7 +1408,7 @@ where
         return install_res;
     }
 
-    cleanup_old_releases(data_dir, manifest.sha256.as_str());
+    cleanup_old_releases(data_dir, prev_release.as_ref(), &manifest.sha256);
     install_res
 }
 
@@ -1439,29 +1463,41 @@ fn stream_verify_zstd_artifact(
     Ok(total)
 }
 
-fn commit_active_state<T, F>(
-    data_dir: &Path,
-    final_db: &Path,
+struct ActiveCommitInput<'a> {
+    data_dir: &'a Path,
+    final_db: &'a Path,
     final_db_len: u64,
-    manifest: &ReleaseManifest,
+    prev_release: Option<&'a ReleaseHash>,
+    manifest: &'a ReleaseManifest,
     manifest_path_str: String,
     reused: bool,
+}
+
+fn commit_active_state<T, F>(
+    input: ActiveCommitInput<'_>,
     prepare_output: F,
 ) -> Result<T, ClecError>
 where
     F: FnOnce(&SyncData) -> Result<T, ClecError>,
 {
+    let data_dir = input.data_dir;
     let (active_tmp, active_tmp_len) =
-        write_active_state_tmp(data_dir, &manifest.sha256, &manifest_path_str)?;
+        write_active_state_tmp(data_dir, &input.manifest.sha256, &input.manifest_path_str)?;
     let commit_res = (|| -> Result<T, ClecError> {
-        let storage_bytes =
-            compute_projected_managed_bytes(data_dir, final_db, final_db_len, active_tmp_len)?;
+        let storage_bytes = compute_projected_managed_bytes(
+            data_dir,
+            input.final_db,
+            input.final_db_len,
+            input.prev_release,
+            &input.manifest.sha256,
+            active_tmp_len,
+        )?;
         let sync_data = SyncData {
-            release: manifest.sha256.clone(),
-            corpus_format: manifest.corpus_format.clone(),
-            manifest_path: manifest_path_str,
-            counts: manifest.counts.clone(),
-            reused,
+            release: input.manifest.sha256.clone(),
+            corpus_format: input.manifest.corpus_format.clone(),
+            manifest_path: input.manifest_path_str,
+            counts: input.manifest.counts.clone(),
+            reused: input.reused,
             storage_bytes,
         };
         let prepared = prepare_output(&sync_data)?;
@@ -1530,16 +1566,20 @@ fn sync_dir_best_effort(dir: &Path) {
     }
 }
 
-fn cleanup_old_releases(data_dir: &Path, active_sha: &str) {
-    let active_name = format!("{active_sha}.sqlite");
-    if let Ok(entries) = fs::read_dir(data_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if s.ends_with(".sqlite") && s.len() == 71 && s != active_name {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
+fn cleanup_old_releases(
+    data_dir: &Path,
+    prev_release: Option<&ReleaseHash>,
+    active_release: &ReleaseHash,
+) {
+    let Some(prev) = prev_release else {
+        return;
+    };
+    if prev == active_release {
+        return;
+    }
+    let prev_path = data_dir.join(format!("{}.sqlite", prev.as_str()));
+    if fs::symlink_metadata(&prev_path).is_ok_and(|meta| meta.is_file()) {
+        let _ = fs::remove_file(prev_path);
     }
 }
 
@@ -1563,18 +1603,23 @@ fn compute_projected_managed_bytes(
     data_dir: &Path,
     final_db: &Path,
     final_db_len: u64,
+    prev_release: Option<&ReleaseHash>,
+    active_release: &ReleaseHash,
     active_state_len: u64,
 ) -> Result<u64, ClecError> {
     let final_db_name = final_db
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let prev_db_name = prev_release
+        .filter(|prev| *prev != active_release)
+        .map(|prev| format!("{}.sqlite", prev.as_str()));
     let mut total = final_db_len + active_state_len;
     for entry in fs::read_dir(data_dir).map_err(map_io)? {
         let entry = entry.map_err(map_io)?;
         let name = entry.file_name();
         let s = name.to_string_lossy();
-        let is_superseded_db = s.ends_with(".sqlite") && s.len() == 71 && s != final_db_name;
+        let is_superseded_db = prev_db_name.as_deref() == Some(s.as_ref());
         if s == "active.json"
             || s == ".active.tmp"
             || s == ".incoming.sqlite.tmp"
@@ -2382,5 +2427,119 @@ mod tests {
 
         let _ = reqwest::blocking::get(format!("http://127.0.0.1:{port}/shutdown"));
         let _ = handle.join();
+    }
+
+    #[test]
+    fn cache_admission_rejects_legacy_current_and_cleanup_deletes_only_previous_native_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_a = tmp.path().join("ws_a");
+        let ws_b = tmp.path().join("ws_b");
+        fs::create_dir_all(&ws_a).unwrap();
+        fs::create_dir_all(&ws_b).unwrap();
+        fs::write(ws_a.join("a.txt"), "alpha cache safety").unwrap();
+        fs::write(ws_b.join("b.txt"), "beta cache safety").unwrap();
+        let intake_a = tmp.path().join("intake_a.json");
+        let intake_b = tmp.path().join("intake_b.json");
+        fs::write(
+            &intake_a,
+            r#"{"schemaVersion":1,"works":[{"key":"wa","title":"A"}],"sources":[{"work":"wa","path":"a.txt","title":"A","role":"document","attribution":"authored_fixture","quality":"fixture","status":"ready"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &intake_b,
+            r#"{"schemaVersion":1,"works":[{"key":"wb","title":"B"}],"sources":[{"work":"wb","path":"b.txt","title":"B","role":"document","attribution":"authored_fixture","quality":"fixture","status":"ready"}]}"#,
+        )
+        .unwrap();
+        let rel_a = tmp.path().join("rel_a");
+        let rel_b = tmp.path().join("rel_b");
+        let m_a = publish_release(&ws_a, &intake_a, &rel_a).unwrap();
+        let m_b = publish_release(&ws_b, &intake_b, &rel_b).unwrap();
+        let m_a_path = rel_a.join("manifest.json").display().to_string();
+        let m_b_path = rel_b.join("manifest.json").display().to_string();
+
+        let legacy_dir = tmp.path().join("legacy_shared");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_hash = "1".repeat(64);
+        let legacy_sqlite = legacy_dir.join(format!("{legacy_hash}.sqlite"));
+        let legacy_marker = legacy_dir.join("current");
+        let unrelated_71 = legacy_dir.join(format!("{}.sqlite", "x".repeat(64)));
+        let unknown_note = legacy_dir.join("notes.txt");
+        fs::write(&legacy_sqlite, b"legacy db").unwrap();
+        fs::write(&legacy_marker, format!("{legacy_hash}\n")).unwrap();
+        fs::write(&unrelated_71, b"unrelated 71").unwrap();
+        fs::write(&unknown_note, b"keep").unwrap();
+
+        let err_sync = sync_local(&legacy_dir, Some(&m_a_path)).unwrap_err();
+        assert_eq!(err_sync.code, ErrorCode::InvalidDataDir);
+        assert!(err_sync.message.contains("separate directory"));
+        assert!(!legacy_dir.join(".sync.lock").exists());
+        assert!(!legacy_dir.join("active.json").exists());
+        assert_eq!(fs::read(&legacy_sqlite).unwrap(), b"legacy db");
+        assert_eq!(
+            fs::read_to_string(&legacy_marker).unwrap(),
+            format!("{legacy_hash}\n")
+        );
+        assert_eq!(fs::read(&unrelated_71).unwrap(), b"unrelated 71");
+        assert_eq!(fs::read(&unknown_note).unwrap(), b"keep");
+
+        assert_eq!(
+            sync_dry_run(
+                &legacy_dir,
+                Some(&m_a_path),
+                NetworkPolicy::Allowed,
+                None,
+                &TransferPolicy::shipped(),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidDataDir
+        );
+        assert_eq!(
+            data_dir_status(&legacy_dir).unwrap_err().code,
+            ErrorCode::InvalidDataDir
+        );
+        let store_err = match ensure_current_store(
+            &legacy_dir,
+            NetworkPolicy::Offline,
+            None,
+            &TransferPolicy::shipped(),
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("legacy dir should be rejected"),
+        };
+        assert_eq!(store_err.code, ErrorCode::InvalidDataDir);
+
+        let native_dir = tmp.path().join("native_cache");
+        fs::create_dir_all(&native_dir).unwrap();
+        let native_unrelated_71 = native_dir.join(format!("{}.sqlite", "y".repeat(64)));
+        let native_unknown = native_dir.join("custom.txt");
+        fs::write(&native_unrelated_71, b"unrelated sqlite payload").unwrap();
+        fs::write(&native_unknown, b"unknown file").unwrap();
+
+        let sync_a = sync_local(&native_dir, Some(&m_a_path)).unwrap();
+        assert_eq!(
+            sync_a.storage_bytes,
+            data_dir_status(&native_dir).unwrap().storage_bytes
+        );
+        assert!(native_dir.join(format!("{}.sqlite", m_a.sha256)).is_file());
+        assert_eq!(
+            fs::read(&native_unrelated_71).unwrap(),
+            b"unrelated sqlite payload"
+        );
+        assert_eq!(fs::read(&native_unknown).unwrap(), b"unknown file");
+
+        let sync_b = sync_local(&native_dir, Some(&m_b_path)).unwrap();
+        assert_eq!(
+            sync_b.storage_bytes,
+            data_dir_status(&native_dir).unwrap().storage_bytes
+        );
+        assert!(!native_dir.join(format!("{}.sqlite", m_a.sha256)).exists());
+        assert!(native_dir.join(format!("{}.sqlite", m_b.sha256)).is_file());
+        assert_eq!(
+            fs::read(&native_unrelated_71).unwrap(),
+            b"unrelated sqlite payload"
+        );
+        assert_eq!(fs::read(&native_unknown).unwrap(), b"unknown file");
     }
 }

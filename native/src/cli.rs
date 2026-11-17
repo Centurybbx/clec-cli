@@ -74,7 +74,7 @@ pub struct TestFixtureOptions {
     disable_help_subcommand = false
 )]
 struct Cli {
-    /// Corpus data directory (defaults to CLEC_DATA_DIR or ~/.local/share/clec)
+    /// Corpus data directory (defaults to CLEC_DATA_DIR, ~/.local/share/clec/native-v2 on Unix, or %LOCALAPPDATA%/clec/native-v2 on Windows)
     #[arg(long, global = true, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
@@ -529,19 +529,83 @@ fn command_name(cmd: &Commands) -> &'static str {
     }
 }
 
-fn resolve_data_dir(explicit: Option<&PathBuf>) -> PathBuf {
+fn non_empty_env<F>(get_env: &F, key: &str) -> Option<std::ffi::OsString>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    get_env(key).filter(|val| !val.to_string_lossy().trim().is_empty())
+}
+
+#[cfg(any(not(windows), test))]
+fn resolve_unix_data_dir_with<F>(get_env: &F) -> Result<PathBuf, ClecError>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let Some(home) = non_empty_env(get_env, "HOME") else {
+        return Err(ClecError::new(
+            ErrorCode::InvalidDataDir,
+            "Cannot determine default data directory because HOME is unset or empty. Pass --data-dir PATH or set CLEC_DATA_DIR.",
+        ));
+    };
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("clec")
+        .join("native-v2"))
+}
+
+#[cfg(any(windows, test))]
+fn resolve_windows_data_dir_with<F>(get_env: &F) -> Result<PathBuf, ClecError>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if let Some(local_app_data) = non_empty_env(get_env, "LOCALAPPDATA") {
+        return Ok(PathBuf::from(local_app_data).join("clec").join("native-v2"));
+    }
+    if let Some(user_profile) = non_empty_env(get_env, "USERPROFILE") {
+        return Ok(PathBuf::from(user_profile)
+            .join("AppData")
+            .join("Local")
+            .join("clec")
+            .join("native-v2"));
+    }
+    Err(ClecError::new(
+        ErrorCode::InvalidDataDir,
+        "Cannot determine default data directory because LOCALAPPDATA and USERPROFILE are unset or empty. Pass --data-dir PATH or set CLEC_DATA_DIR.",
+    ))
+}
+
+fn resolve_data_dir_with_env<F>(
+    explicit: Option<&PathBuf>,
+    get_env: F,
+) -> Result<PathBuf, ClecError>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
     if let Some(p) = explicit {
-        return p.clone();
+        if p.as_os_str().is_empty() {
+            return Err(ClecError::new(
+                ErrorCode::InvalidDataDir,
+                "--data-dir must not be empty.",
+            ));
+        }
+        return Ok(p.clone());
     }
-    if let Ok(env_dir) = env::var("CLEC_DATA_DIR")
-        && !env_dir.trim().is_empty()
+    if let Some(env_dir) = non_empty_env(&get_env, "CLEC_DATA_DIR") {
+        return Ok(PathBuf::from(env_dir));
+    }
+    #[cfg(windows)]
     {
-        return PathBuf::from(env_dir);
+        resolve_windows_data_dir_with(&get_env)
     }
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local").join("share").join("clec")
+    #[cfg(not(windows))]
+    {
+        resolve_unix_data_dir_with(&get_env)
+    }
+}
+
+fn resolve_data_dir(explicit: Option<&PathBuf>) -> Result<PathBuf, ClecError> {
+    resolve_data_dir_with_env(explicit, |k| env::var_os(k))
 }
 
 #[derive(Debug, Clone)]
@@ -708,7 +772,6 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
         ));
     }
 
-    let data_dir = resolve_data_dir(cli.data_dir.as_ref());
     let max_bytes = cli.max_bytes;
     let network_policy = if cli.offline {
         NetworkPolicy::Offline
@@ -723,10 +786,12 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
             serialize_fixed("schema", &data, use_json, max_bytes, format_schema_text)
         }
         Commands::Status => {
+            let data_dir = resolve_data_dir(cli.data_dir.as_ref())?;
             let data = data_dir_status(&data_dir)?;
             serialize_fixed("status", &data, use_json, max_bytes, format_status_text)
         }
         Commands::Sync(args) => {
+            let data_dir = resolve_data_dir(cli.data_dir.as_ref())?;
             if args.dry_run {
                 let data = sync_dry_run(
                     &data_dir,
@@ -778,6 +843,7 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                 }
             }
             let mode = authorize_search_mode(cli, args)?;
+            let data_dir = resolve_data_dir(cli.data_dir.as_ref())?;
             let mut store = ensure_current_store(
                 &data_dir,
                 network_policy,
@@ -807,6 +873,7 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
         }
         Commands::Sources(args) => {
             let prepared = PreparedSources::prepare(args)?;
+            let data_dir = resolve_data_dir(cli.data_dir.as_ref())?;
             let store = ensure_current_store(
                 &data_dir,
                 network_policy,
@@ -842,6 +909,7 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
         }
         Commands::Read(args) => {
             let prepared = PreparedRead::prepare(args)?;
+            let data_dir = resolve_data_dir(cli.data_dir.as_ref())?;
             let store = ensure_current_store(
                 &data_dir,
                 network_policy,
@@ -2044,5 +2112,111 @@ mod tests {
                 "at exact lower bound, pre-I/O admission must allow proceeding"
             );
         }
+    }
+
+    #[test]
+    fn resolve_data_dir_enforces_precedence_platform_defaults_and_no_cwd_fallback() {
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+
+        let map_lookup = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, OsString> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
+                .collect();
+            move |key: &str| map.get(key).cloned()
+        };
+
+        let explicit = PathBuf::from("/explicit/dir");
+        assert_eq!(
+            resolve_data_dir_with_env(
+                Some(&explicit),
+                map_lookup(&[("CLEC_DATA_DIR", "/env/dir"), ("HOME", "/home/u")]),
+            )
+            .unwrap(),
+            explicit
+        );
+
+        let empty_explicit = PathBuf::from("");
+        let empty_err = resolve_data_dir_with_env(
+            Some(&empty_explicit),
+            map_lookup(&[("CLEC_DATA_DIR", "/env/dir"), ("HOME", "/home/u")]),
+        )
+        .unwrap_err();
+        assert_eq!(empty_err.code, ErrorCode::InvalidDataDir);
+
+        assert_eq!(
+            resolve_data_dir_with_env(
+                None,
+                map_lookup(&[("CLEC_DATA_DIR", "/env/dir"), ("HOME", "/home/u")]),
+            )
+            .unwrap(),
+            PathBuf::from("/env/dir")
+        );
+
+        let unix_from_empty_env = resolve_unix_data_dir_with(&map_lookup(&[
+            ("CLEC_DATA_DIR", "   "),
+            ("HOME", "/home/alice"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            unix_from_empty_env,
+            PathBuf::from("/home/alice/.local/share/clec/native-v2")
+        );
+
+        assert_eq!(
+            resolve_data_dir_with_env(
+                None,
+                map_lookup(&[
+                    ("CLEC_DATA_DIR", "  "),
+                    ("HOME", "/home/alice"),
+                    ("LOCALAPPDATA", "C:\\Users\\alice\\AppData\\Local"),
+                ]),
+            )
+            .unwrap(),
+            if cfg!(windows) {
+                PathBuf::from("C:\\Users\\alice\\AppData\\Local")
+                    .join("clec")
+                    .join("native-v2")
+            } else {
+                PathBuf::from("/home/alice/.local/share/clec/native-v2")
+            }
+        );
+
+        for bad_home in ["", "   "] {
+            let err = resolve_unix_data_dir_with(&map_lookup(&[("HOME", bad_home)])).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidDataDir);
+        }
+        let err_absent = resolve_unix_data_dir_with(&map_lookup(&[])).unwrap_err();
+        assert_eq!(err_absent.code, ErrorCode::InvalidDataDir);
+        assert!(err_absent.message.contains("--data-dir"));
+
+        assert_eq!(
+            resolve_windows_data_dir_with(&map_lookup(&[
+                ("LOCALAPPDATA", "/win/local"),
+                ("USERPROFILE", "/win/profile"),
+            ]))
+            .unwrap(),
+            PathBuf::from("/win/local").join("clec").join("native-v2")
+        );
+        assert_eq!(
+            resolve_windows_data_dir_with(&map_lookup(&[
+                ("LOCALAPPDATA", "  "),
+                ("USERPROFILE", "/win/profile"),
+            ]))
+            .unwrap(),
+            PathBuf::from("/win/profile")
+                .join("AppData")
+                .join("Local")
+                .join("clec")
+                .join("native-v2")
+        );
+        let win_absent = resolve_windows_data_dir_with(&map_lookup(&[
+            ("LOCALAPPDATA", ""),
+            ("USERPROFILE", ""),
+        ]))
+        .unwrap_err();
+        assert_eq!(win_absent.code, ErrorCode::InvalidDataDir);
+        assert!(win_absent.message.contains("--data-dir"));
     }
 }
