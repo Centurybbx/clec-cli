@@ -2,6 +2,10 @@
 
 This ledger tracks Stage 6A implementation work stacked on accepted Stage 5 head `607a99b47e51215f0fb26bcf38a418be5c71fb14` (mock contract accepted at `e2b6195b9ff893aebffa6b06ea6b5441ba626b1c`).
 
+## Current local acceptance
+
+Independent review `9045cfdf` accepted both residual provenance and static-ELF fixes at exact clean head `110c5eb4a06d04c6556fdd675dcfc291a10f22d3`. Earlier native/cache and installer scopes carry over on unchanged-source proof. The nonblocking stale packaged README was corrected after integration with two identical restages and direct source-byte checks, plus a fresh isolated offline npm installation and empty-PATH native version/schema checks. Evidence is retained in `.cache/coordinator-stage6a-current/receipt.json`. Earlier pending-review statements below are historical records. Local Stage 6A acceptance does not close cross-OS, rights/publication, live Jev, production bootstrap, Stage 3 quality, or Stage 6B host quality.
+
 ## Independent review follow-up at `b45bdcc`
 
 ### Residual admission findings at `505e21d` and resolution at `c72ed0d` + current packaging head
@@ -27,7 +31,7 @@ The artifact-admission fix was implemented in two verifiable commits on top of c
 ### Artifact-admission data shape and ownership sketch
 
 1. **Compile-time metadata (`native/build.rs`, `native/src/build_identity.rs`).** Captures Cargo `TARGET`, `PROFILE`, active `CARGO_CFG_FEATURE` list, `RUSTC --version`, and `native/Cargo.lock` SHA-256, and embeds one retained `CLEC_BUILD_IDENTITY_V1` JSON marker per binary entrypoint (`clec`, `clec-publish`, `clec-validate`, `clec_test_fixture`) without altering any public `clec` CLI command, flag, or schema. `tools/export_cli.py` includes `native/build.rs` in the source allowlist.
-2. **Coherent admission boundary (`cli/scripts/artifact-admission.mjs`, `cli/scripts/targets.mjs`).** Shared by `build-receipt.mjs`, `stage.mjs`, and `install.mjs`. Validates nonempty regular files, Mach-O 64 / ELF64 / PE32+ executable headers and CPU architectures (plus `musl-static` non-glibc `PT_INTERP` checks), exact-once `CLEC_BUILD_IDENTITY_V1` metadata, bound `clec-build-receipt` files, and full `inventory.json` target metadata against `TARGET_MATRIX`.
+2. **Coherent admission boundary (`cli/scripts/artifact-admission.mjs`, `cli/scripts/targets.mjs`).** Shared by `build-receipt.mjs`, `stage.mjs`, and `install.mjs`. Validates nonempty regular files, Mach-O 64 / ELF64 / PE32+ executable headers and CPU architectures (rejecting every `PT_INTERP` in `musl-static` slots), exact-once `CLEC_BUILD_IDENTITY_V1` metadata, bound schema v2 receipt variants, and full `inventory.json` target metadata against `TARGET_MATRIX`.
 3. **Discriminated build receipts and staging (`cli/scripts/build-receipt.mjs`, `cli/scripts/stage.mjs`).** `build-receipt.mjs` emits schema v2 `clec-controlled-build-receipt` only from an actual `--run-build` cargo invocation with before/after checkout stability and exact executed `argv`, or `clec-inspected-prebuilt-receipt` with `provenance.source` and `provenance.buildInvocation` marked `not_verified_unknown` and capture-time metadata isolated in `captureObservation`. `stage.mjs` refuses legacy v1 receipts, bare `"unknown"` in required fields, dirty controlled builds in production staging, contradictory CLI overrides, and any `testHooks` / `test-hooks` binary, separates `structuralIdentity` from `executionEvidence`, never promotes `captureObservation` into `provenance.json` or `inventory.json`, and keeps `complete` and `publishable: false` honest.
 4. **Installer (`cli/scripts/install.mjs`).** Validates schema v2 `inventory.json` header, full tuple schema (`platform`, `arch`, `rustTarget`, `binaryName`, `libc`, safe `payloadPath`), shared `provenance` union, regular file status, byte length, SHA-256, executable container/arch, and non-`test-hooks` identity; fails closed and reports any placeholder-restoration failure honestly.
 
