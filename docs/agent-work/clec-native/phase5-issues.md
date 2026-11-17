@@ -9,7 +9,7 @@ At `8ca49bb`, review `60c3f7fe` accepted the three Jev fixes. Review `a78085d5` 
 - The expansion fixture lacked an otherwise-eligible source dated before `--date-from`. The follow-up adds `exp_too_early.txt` with a `2025-04-30` date and checks its marker is absent from Round 1 submitted candidates while an allowed expansion candidate is present.
 - The 4 MiB total-response ceiling was incorrectly classified as unreachable. The existing 64-candidate, 32-request test now pads every valid response to 131,072 bytes and asserts the exact 4,194,304-byte total, 32 successful batches, and two questions in each actual request. The protocol distinguishes reachable equality from a successful one-over total, which the per-response and attempt caps prevent.
 
-These small test and documentation corrections are authored by the coordinator. Production sources are unchanged. Focused independent acceptance remains pending.
+These small test and documentation corrections are authored by the coordinator. Production sources are unchanged. Independent review `7e0b87bb` accepted both corrections at exact clean head `e2b6195b9ff893aebffa6b06ea6b5441ba626b1c`, with freshly compiled CLI execution of both tests and unchanged-source proof. The mock-contract evidence issue is closed. Live-provider, production-default, Stage 3 quality, and Stage 6 gates remain separate and open.
 
 ## Confirmed blockers and verified fixes
 
