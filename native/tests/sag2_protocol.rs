@@ -19,6 +19,7 @@ struct LoggedRequest {
     seq: usize,
     method: String,
     path: String,
+    header_wire_bytes: usize,
     body_bytes: usize,
     parsed_json: Option<Value>,
     question_keys: Vec<String>,
@@ -40,6 +41,15 @@ enum MockReply {
         extra_headers: Vec<(String, String)>,
         body: Vec<u8>,
         delay: Duration,
+    },
+    LengthlessRaw {
+        status: u16,
+        body: Vec<u8>,
+    },
+    PartialRaw {
+        status: u16,
+        declared_len: usize,
+        prefix: Vec<u8>,
     },
     ChunkedRaw {
         status: u16,
@@ -169,10 +179,15 @@ fn handle_connection(
     let path = parts.next().unwrap_or("").to_owned();
 
     let mut headers = HashMap::new();
+    let mut header_wire_bytes = 0usize;
     let mut content_len = 0usize;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        header_wire_bytes += line.len();
+        if line == "\r\n" || line == "\n" {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
@@ -228,6 +243,7 @@ fn handle_connection(
         seq,
         method,
         path,
+        header_wire_bytes,
         body_bytes: body.len(),
         parsed_json: parsed_json.clone(),
         question_keys,
@@ -255,6 +271,24 @@ fn handle_connection(
 
     match reply {
         MockReply::DropConnection => {}
+        MockReply::LengthlessRaw { status, body } => {
+            let head = format!("HTTP/1.1 {status} OK\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+        MockReply::PartialRaw {
+            status,
+            declared_len,
+            prefix,
+        } => {
+            let head = format!(
+                "HTTP/1.1 {status} OK\r\nConnection: close\r\nContent-Length: {declared_len}\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&prefix);
+            let _ = stream.flush();
+        }
         MockReply::Redirect { status, location } => {
             let head = format!(
                 "HTTP/1.1 {status} Redirect\r\nConnection: close\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
@@ -1376,6 +1410,365 @@ fn group4_strict_wire_rejection_and_secret_redaction() {
         assert_err_json(&out, 5, Some("JEV_INVALID_RESPONSE"));
         assert_eq!(srv.logs().len(), 1, "{kind}");
     }
+}
+
+#[test]
+fn group4_observed_response_bytes_on_failure_and_exact_128k() {
+    let corpus = publish_and_sync_corpus(
+        &[("w1", "W1")],
+        &[("w1", "a.txt", "Doc", "document", "極光訊號校準。", None)],
+    );
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let srv_exact = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| {
+            let mut body = serde_json::to_vec(&score_all_answers(req, 0.7, "m")).unwrap();
+            let pad = 131_072 - body.len();
+            body.extend(std::iter::repeat_n(b' ', pad));
+            MockReply::Raw {
+                status: 200,
+                extra_headers: Vec::new(),
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let ok_128k = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &srv_exact.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(ok_128k["data"]["consumption"]["responseBytes"], 131_072);
+
+    let srv_cl_over = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, _| MockReply::Raw {
+            status: 200,
+            extra_headers: Vec::new(),
+            body: vec![b' '; 131_073],
+            delay: Duration::ZERO,
+        }),
+    );
+    let err_cl_over = assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_cl_over.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("JEV_INVALID_RESPONSE"),
+    );
+    assert_eq!(err_cl_over["error"]["sag2Stage"]["responseBytes"], 0);
+
+    let srv_partial = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, _| MockReply::PartialRaw {
+            status: 200,
+            declared_len: 100_000,
+            prefix: vec![b'x'; 65_536],
+        }),
+    );
+    let err_partial = assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_partial.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        4,
+        Some("TRANSFER_FAILED"),
+    );
+    assert_eq!(err_partial["error"]["sag2Stage"]["httpAttempts"], 1);
+    assert_eq!(err_partial["error"]["sag2Stage"]["responseBytes"], 65_536);
+
+    let srv_oversize = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, _| MockReply::LengthlessRaw {
+            status: 200,
+            body: vec![b'x'; 131_073],
+        }),
+    );
+    let err_oversize = assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_oversize.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("JEV_INVALID_RESPONSE"),
+    );
+    assert_eq!(err_oversize["error"]["sag2Stage"]["httpAttempts"], 1);
+    assert_eq!(err_oversize["error"]["sag2Stage"]["responseBytes"], 131_073);
+}
+
+#[test]
+fn group4_header_cap_includes_generated_headers_and_framing() {
+    let corpus = publish_and_sync_corpus(
+        &[("w1", "W1")],
+        &[("w1", "a.txt", "Doc", "document", "極光訊號校準。", None)],
+    );
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cold_dir = tmp.path().join("cold_header_overflow");
+    let cold_s = cold_dir.display().to_string();
+    let long_host_url = format!("https://{}.example.com/decisions", "a".repeat(8200));
+    assert_err_json(
+        &run_clec(
+            &["--data-dir", &cold_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &long_host_url),
+                ("JEV_API_KEY", "short-key"),
+            ],
+        ),
+        2,
+        Some("INVALID_JEV_CONFIG"),
+    );
+    assert!(!cold_dir.exists());
+
+    let srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.7, "m"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let url = srv.url("/decisions");
+
+    assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    ));
+    let base_log = &srv.logs()[0];
+    let base_cl_digits = base_log.body_bytes.to_string().len();
+    let base_wire = base_log.header_wire_bytes;
+    let delta_to_8192 = 8192usize
+        .checked_sub(base_wire)
+        .expect("base header wire bytes below 8192");
+    let exact_key = "k".repeat(SENTINEL_KEY.len() + delta_to_8192);
+    srv.clear_logs();
+    assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", &exact_key)],
+    ));
+    assert_eq!(srv.logs()[0].header_wire_bytes, 8192);
+
+    let one_over_key = format!("{exact_key}x");
+    srv.clear_logs();
+    let over_out = run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", &one_over_key)],
+    );
+    assert_eq!(over_out.status.code(), Some(2));
+    assert!(
+        srv.logs().is_empty(),
+        "one-over header (8193) must fail before HTTP dispatch"
+    );
+
+    let key_for_5digit_overflow =
+        "k".repeat(SENTINEL_KEY.len() + delta_to_8192 + base_cl_digits - 4);
+    let mut big_sources: Vec<OwnedSourceSpec<'_>> = Vec::new();
+    for i in 0..4usize {
+        big_sources.push((
+            Box::leak(format!("bw_{i}").into_boxed_str()),
+            Box::leak(format!("b_{i}.txt").into_boxed_str()),
+            Box::leak(format!("Big {i}").into_boxed_str()),
+            "document",
+            format!("邊界標記 {i} {}", "z".repeat(2500)),
+            None,
+        ));
+    }
+    let big_refs: Vec<SourceSpec<'_>> = big_sources
+        .iter()
+        .map(|(w, p, t, r, b, d)| (*w, *p, *t, *r, b.as_str(), *d))
+        .collect();
+    let big_corpus = publish_and_sync_corpus(
+        &big_sources
+            .iter()
+            .map(|(w, _, t, _, _, _)| (*w, *t))
+            .collect::<Vec<_>>(),
+        &big_refs,
+    );
+    let big_dir_s = big_corpus.data_dir.display().to_string();
+    srv.clear_logs();
+    let cl_digit_over = run_clec(
+        &["--data-dir", &big_dir_s, "search", "邊界標記", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &url),
+            ("JEV_API_KEY", &key_for_5digit_overflow),
+        ],
+    );
+    assert_eq!(cl_digit_over.status.code(), Some(2));
+    assert!(
+        srv.logs().is_empty(),
+        "payload-specific 5-digit Content-Length overflow must fail before HTTP dispatch"
+    );
+
+    let key_8089 = "s".repeat(8089);
+    srv.clear_logs();
+    let over_8089 = run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", &key_8089)],
+    );
+    assert_eq!(over_8089.status.code(), Some(2));
+    assert!(
+        srv.logs().is_empty(),
+        "8089-byte key generates >8192 wire headers and must fail before dispatch"
+    );
+}
+
+#[test]
+fn group4_usage_and_cost_overflow_fail_closed() {
+    let corpus = publish_and_sync_corpus(
+        &[("w1", "W1"), ("w2", "W2")],
+        &[
+            ("w1", "a.txt", "Doc1", "document", "極光訊號校準一。", None),
+            (
+                "w2",
+                "b.txt",
+                "Doc2",
+                "document",
+                "「校準二」延伸段落。",
+                None,
+            ),
+        ],
+    );
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let srv_int_overflow = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut body = score_all_answers(req, if seq == 1 { 0.9 } else { 0.8 }, "m");
+            body["usage"] = serde_json::json!({
+                "input_tokens": u64::MAX,
+                "output_tokens": 1,
+                "cost": 0.1
+            });
+            MockReply::Json {
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let int_err = assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_int_overflow.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("JEV_INVALID_RESPONSE"),
+    );
+    assert_eq!(int_err["error"]["sag2Stage"]["httpAttempts"], 2);
+    assert_eq!(int_err["error"]["sag2Stage"]["successfulBatches"], 1);
+    assert!(
+        int_err["error"]["sag2Stage"]["responseBytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let srv_cost_overflow = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut body = score_all_answers(req, if seq == 1 { 0.9 } else { 0.8 }, "m");
+            body["usage"] = serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 1,
+                "cost": 1.0e308_f64
+            });
+            MockReply::Json {
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let cost_err = assert_err_json(
+        &run_clec(
+            &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+            &[
+                ("JEV_BASE_URL", &srv_cost_overflow.url("/decisions")),
+                ("JEV_API_KEY", SENTINEL_KEY),
+            ],
+        ),
+        5,
+        Some("JEV_INVALID_RESPONSE"),
+    );
+    assert_eq!(cost_err["error"]["sag2Stage"]["httpAttempts"], 2);
+    assert_eq!(cost_err["error"]["sag2Stage"]["successfulBatches"], 1);
+
+    let srv_valid_max = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut body = score_all_answers(req, if seq == 1 { 0.9 } else { 0.8 }, "m");
+            let (inp, out) = if seq == 1 {
+                (u64::MAX - 5, 5u64)
+            } else {
+                (5, u64::MAX - 5)
+            };
+            body["usage"] = serde_json::json!({
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cost": 0.25
+            });
+            MockReply::Json {
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let max_ok = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &srv_valid_max.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(max_ok["data"]["usage"]["status"], "reported");
+    assert_eq!(max_ok["data"]["usage"]["inputTokens"], u64::MAX);
+    assert_eq!(max_ok["data"]["usage"]["outputTokens"], u64::MAX);
+    assert_eq!(max_ok["data"]["usage"]["costStatus"], "reported");
+
+    let srv_missing_usage = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|seq, _, req| {
+            let mut body = score_all_answers(req, if seq == 1 { 0.9 } else { 0.8 }, "m");
+            if seq == 1 {
+                body["usage"] =
+                    serde_json::json!({"input_tokens": 10, "output_tokens": 2, "cost": 0.1});
+            }
+            MockReply::Json {
+                status: 200,
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
+    let missing_ok = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "極光訊號", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &srv_missing_usage.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(missing_ok["data"]["usage"]["status"], "unknown");
+    assert!(missing_ok["data"]["usage"]["inputTokens"].is_null());
+    assert_eq!(missing_ok["data"]["usage"]["costStatus"], "unknown");
+    assert!(missing_ok["data"]["usage"]["costUsd"].is_null());
 }
 
 #[test]
