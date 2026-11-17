@@ -32,22 +32,77 @@ class _CliStepDict(TypedDict):
     stderrUtf8: str
 
 
+def _adapter_search_argv(
+    clec_bin: Path | str,
+    data_dir: Path | str,
+    queries: list[str],
+    release_sha: str,
+    *,
+    match_mode: str = "any",
+    limit: int = 5,
+    per_work: int = 2,
+    max_bytes: int = 65536,
+) -> list[str]:
+    return [
+        str(clec_bin),
+        "--data-dir",
+        str(data_dir),
+        "--offline",
+        "--json",
+        "--max-bytes",
+        str(max_bytes),
+        "search",
+        *queries,
+        "--match-mode",
+        match_mode,
+        "--limit",
+        str(limit),
+        "--per-work",
+        str(per_work),
+        "--release",
+        release_sha,
+    ]
+
+
+def _adapter_read_argv(
+    clec_bin: Path | str,
+    data_dir: Path | str,
+    passage_ids: list[str],
+    *,
+    context: int = 1,
+    max_bytes: int = 65536,
+) -> list[str]:
+    return [
+        str(clec_bin),
+        "--data-dir",
+        str(data_dir),
+        "--offline",
+        "--json",
+        "--max-bytes",
+        str(max_bytes),
+        "read",
+        *passage_ids,
+        "--context",
+        str(context),
+    ]
+
+
 def _make_v2_outcome(
     qid: str,
     steps: list[_CliStepDict],
     *,
+    queries: list[str],
     status: str = "completed",
     stop_reason: str | None = None,
     mode: str = "single_query_product_baseline",
     query_angle: str = "question",
-    queries: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "outcomeSchemaVersion": 2,
         "id": qid,
         "mode": mode,
         "queryAngle": query_angle,
-        "queries": queries or ["synthetic"],
+        "queries": queries,
         "status": status,
         "stopReason": stop_reason,
         "steps": steps,
@@ -59,6 +114,7 @@ def _make_cli_step(
     release_sha: str,
     payload_items: list[dict[str, object]],
     *,
+    argv: list[str],
     extra_data: dict[str, object] | None = None,
     exit_code: int | None = 0,
     timed_out: bool = False,
@@ -78,7 +134,7 @@ def _make_cli_step(
     ) + "\n"
     return {
         "step": step_name,
-        "argv": ["clec", step_name],
+        "argv": argv,
         "exitCode": exit_code,
         "timedOut": timed_out,
         "elapsedSeconds": 0.001,
@@ -450,12 +506,47 @@ class Phase3HarnessTests(unittest.TestCase):
                 },
             ],
         }
+        zh_p0_hit = {k: v for k, v in zh_p0_read.items() if k not in ("kind", "context")}
+        zh_p1_hit = {k: v for k, v in zh_p1_read.items() if k not in ("kind", "context")}
         zh_summary = score.summarize_evaluation(
             zh_partial_fail_ds,
             [
-                _make_v2_outcome("q-zh-partial-fail", [_make_cli_step("read", self.corpus_sha, [zh_p1_read])]),
-                _make_v2_outcome("q-zh-disjoint-fail", [_make_cli_step("read", self.corpus_sha, [zh_p1_read])]),
-                _make_v2_outcome("q-zh-sub-pass", [_make_cli_step("read", self.corpus_sha, [zh_p0_read])]),
+                _make_v2_outcome(
+                    "q-zh-partial-fail",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [zh_p1_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["中文完整區間"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["中文完整區間"],
+                ),
+                _make_v2_outcome(
+                    "q-zh-disjoint-fail",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [zh_p1_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["中文不相交區間"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["中文不相交區間"],
+                ),
+                _make_v2_outcome(
+                    "q-zh-sub-pass",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [zh_p0_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["中文部分子區間"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["中文部分子區間"],
+                ),
             ],
             self.corpus,
             self.corpus_sha,
@@ -563,13 +654,61 @@ class Phase3HarnessTests(unittest.TestCase):
                 },
             ],
         }
+        en_p0_hit = {k: v for k, v in en_p0_read.items() if k not in ("kind", "context")}
+        en_p1_hit = {k: v for k, v in en_p1_read.items() if k not in ("kind", "context")}
         en_summary = score.summarize_evaluation(
             en_ds,
             [
-                _make_v2_outcome("q-en-partial-fail", [_make_cli_step("read", self.corpus_sha, [en_p1_read])]),
-                _make_v2_outcome("q-en-disjoint-fail", [_make_cli_step("read", self.corpus_sha, [en_p1_read])]),
-                _make_v2_outcome("q-en-mid", [_make_cli_step("read", self.corpus_sha, [en_p0_read])]),
-                _make_v2_outcome("q-en-tail", [_make_cli_step("read", self.corpus_sha, [en_p1_read])]),
+                _make_v2_outcome(
+                    "q-en-partial-fail",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [en_p1_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["english full token"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["english full token"],
+                ),
+                _make_v2_outcome(
+                    "q-en-disjoint-fail",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [en_p1_hit],
+                            argv=_adapter_search_argv(
+                                self.clec_bin, self.data_dir, ["english disjoint within same word"], self.corpus_sha
+                            ),
+                        )
+                    ],
+                    queries=["english disjoint within same word"],
+                ),
+                _make_v2_outcome(
+                    "q-en-mid",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [en_p0_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["english subrange"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["english subrange"],
+                ),
+                _make_v2_outcome(
+                    "q-en-tail",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [en_p1_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["english tail subrange"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["english tail subrange"],
+                ),
             ],
             self.corpus,
             self.corpus_sha,
@@ -617,7 +756,22 @@ class Phase3HarnessTests(unittest.TestCase):
                 }
             ],
         }
-        only_hop1 = [_make_v2_outcome("q-two-hop", [_make_cli_step("search", self.corpus_sha, [ep1_cond_hit])])]
+        only_hop1 = [
+            _make_v2_outcome(
+                "q-two-hop",
+                [
+                    _make_cli_step(
+                        "search",
+                        self.corpus_sha,
+                        [ep1_cond_hit],
+                        argv=_adapter_search_argv(
+                            self.clec_bin, self.data_dir, ["匯回臺灣的條件與2022年反例為何？"], self.corpus_sha
+                        ),
+                    )
+                ],
+                queries=["匯回臺灣的條件與2022年反例為何？"],
+            )
+        ]
         summary = score.summarize_evaluation(dataset, only_hop1, self.corpus, self.corpus_sha)
         row = summary["perQuestion"][0]
         self.assertEqual(row["evidenceCoverage"], 0.5)
@@ -657,7 +811,22 @@ class Phase3HarnessTests(unittest.TestCase):
         }
         summary = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-wrong-occ", [_make_cli_step("search", self.corpus_sha, [first_passage_hit])])],
+            [
+                _make_v2_outcome(
+                    "q-wrong-occ",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [first_passage_hit],
+                            argv=_adapter_search_argv(
+                                self.clec_bin, self.data_dir, ["重複片語第二次出現的位置？"], self.corpus_sha
+                            ),
+                        )
+                    ],
+                    queries=["重複片語第二次出現的位置？"],
+                )
+            ],
             self.corpus,
             self.corpus_sha,
         )
@@ -697,7 +866,20 @@ class Phase3HarnessTests(unittest.TestCase):
         }
         alias_occ_summary = score.summarize_evaluation(
             alias_occ_ds,
-            [_make_v2_outcome("q-alias-wrong-occ", [_make_cli_step("search", self.corpus_sha, [ep1_first_passage])])],
+            [
+                _make_v2_outcome(
+                    "q-alias-wrong-occ",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [ep1_first_passage],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["結尾重複句？"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["結尾重複句？"],
+                )
+            ],
             self.corpus,
             self.corpus_sha,
         )
@@ -731,7 +913,20 @@ class Phase3HarnessTests(unittest.TestCase):
         }
         md_res = score.summarize_evaluation(
             md_alias_ds,
-            [_make_v2_outcome("q-md-alias", [_make_cli_step("search", self.corpus_sha, [ep1_cond_hit])])],
+            [
+                _make_v2_outcome(
+                    "q-md-alias",
+                    [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [ep1_cond_hit],
+                            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["md 條件"], self.corpus_sha),
+                        )
+                    ],
+                    queries=["md 條件"],
+                )
+            ],
             self.corpus,
             self.corpus_sha,
         )
@@ -785,8 +980,30 @@ class Phase3HarnessTests(unittest.TestCase):
             ],
         }
         outcomes = [
-            _make_v2_outcome("q-canon-alias", [_make_cli_step("search", self.corpus_sha, [ep1_cond_hit])]),
-            _make_v2_outcome("q-same-name-diff-work", [_make_cli_step("search", self.corpus_sha, [alpha_hit])]),
+            _make_v2_outcome(
+                "q-canon-alias",
+                [
+                    _make_cli_step(
+                        "search",
+                        self.corpus_sha,
+                        [ep1_cond_hit],
+                        argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["ep1 匯回條件？"], self.corpus_sha),
+                    )
+                ],
+                queries=["ep1 匯回條件？"],
+            ),
+            _make_v2_outcome(
+                "q-same-name-diff-work",
+                [
+                    _make_cli_step(
+                        "search",
+                        self.corpus_sha,
+                        [alpha_hit],
+                        argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["Beta 資產配置？"], self.corpus_sha),
+                    )
+                ],
+                queries=["Beta 資產配置？"],
+            ),
         ]
         summary = score.summarize_evaluation(dataset, outcomes, self.corpus, self.corpus_sha)
         self.assertTrue(summary["perQuestion"][0]["completeChain"])
@@ -821,11 +1038,12 @@ class Phase3HarnessTests(unittest.TestCase):
             ],
         }
 
+        prov_search_argv = _adapter_search_argv(self.clec_bin, self.data_dir, ["稅務條件？"], self.corpus_sha)
         fabricated = copy.deepcopy(valid_hit)
         fabricated["text"] = "這是一段改寫摘要而不是原文"
         fab_summary = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-prov", [_make_cli_step("search", self.corpus_sha, [fabricated])])],
+            [_make_v2_outcome("q-prov", [_make_cli_step("search", self.corpus_sha, [fabricated], argv=prov_search_argv)], queries=["稅務條件？"])],
             self.corpus,
             self.corpus_sha,
         )
@@ -846,7 +1064,7 @@ class Phase3HarnessTests(unittest.TestCase):
         spoof["work"] = {"workId": "w_" + "0" * 24, "workKey": "fake"}
         spoof_summary = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-prov", [_make_cli_step("search", self.corpus_sha, [spoof])])],
+            [_make_v2_outcome("q-prov", [_make_cli_step("search", self.corpus_sha, [spoof], argv=prov_search_argv)], queries=["稅務條件？"])],
             self.corpus,
             self.corpus_sha,
         )
@@ -860,7 +1078,7 @@ class Phase3HarnessTests(unittest.TestCase):
         bad_tail["text"] = "outside-topk-fabrication"
         mixed_summary = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-prov", [_make_cli_step("search", self.corpus_sha, [valid_hit, bad_tail])])],
+            [_make_v2_outcome("q-prov", [_make_cli_step("search", self.corpus_sha, [valid_hit, bad_tail], argv=prov_search_argv)], queries=["稅務條件？"])],
             self.corpus,
             self.corpus_sha,
             top_k=1,
@@ -875,24 +1093,10 @@ class Phase3HarnessTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        overview_step: _CliStepDict = {
-            "step": "read",
-            "argv": ["clec", "read", sid_srt],
-            "exitCode": 0,
-            "timedOut": False,
-            "elapsedSeconds": 0.001,
-            "stdoutUtf8": overview_proc.stdout,
-            "stderrUtf8": overview_proc.stderr,
-        }
-        overview_res = score.summarize_evaluation(
-            dataset,
-            [_make_v2_outcome("q-prov", [overview_step])],
-            self.corpus,
-            self.corpus_sha,
-        )
-        self.assertTrue(overview_res["perQuestion"][0]["citationRawSpanValid"])
-        self.assertEqual(overview_res["perQuestion"][0]["evidenceCoverage"], 0.0)
-        self.assertFalse(overview_res["perQuestion"][0]["completeChain"])
+        overview_item = json.loads(overview_proc.stdout)["data"]["items"][0]
+        overview_val, overview_errs = score.validate_returned_item(overview_item, self.corpus, item_index=0)
+        self.assertIsNone(overview_val)
+        self.assertEqual(overview_errs, [])
 
         orig_proc = subprocess.run(
             [str(self.clec_bin), "--data-dir", str(self.data_dir), "--json", "read", self.sid_by_path["ep1.txt"], "--original"],
@@ -900,45 +1104,16 @@ class Phase3HarnessTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        orig_step: _CliStepDict = {
-            "step": "read",
-            "argv": ["clec", "read", self.sid_by_path["ep1.txt"], "--original"],
-            "exitCode": 0,
-            "timedOut": False,
-            "elapsedSeconds": 0.001,
-            "stdoutUtf8": orig_proc.stdout,
-            "stderrUtf8": orig_proc.stderr,
-        }
-        orig_res = score.summarize_evaluation(
-            dataset,
-            [_make_v2_outcome("q-prov", [orig_step])],
-            self.corpus,
-            self.corpus_sha,
-        )
-        self.assertTrue(orig_res["perQuestion"][0]["citationRawSpanValid"])
-        self.assertTrue(orig_res["perQuestion"][0]["completeChain"])
+        orig_item = json.loads(orig_proc.stdout)["data"]["items"][0]
+        orig_val, orig_errs = score.validate_returned_item(orig_item, self.corpus, item_index=0)
+        self.assertIsNotNone(orig_val)
+        self.assertEqual(orig_errs, [])
 
-        spoof_orig_payload = json.loads(orig_proc.stdout)
-        spoof_orig_payload["data"]["items"][0]["originalText"] = "spoofed original text"
-        spoof_orig_payload["data"].pop("budget", None)
-        spoof_orig_step: _CliStepDict = {
-            "step": orig_step["step"],
-            "argv": orig_step["argv"],
-            "exitCode": orig_step["exitCode"],
-            "timedOut": orig_step["timedOut"],
-            "elapsedSeconds": orig_step["elapsedSeconds"],
-            "stdoutUtf8": json.dumps(spoof_orig_payload, ensure_ascii=False, separators=(",", ":")) + "\n",
-            "stderrUtf8": orig_step["stderrUtf8"],
-        }
-        spoof_orig_res = score.summarize_evaluation(
-            dataset,
-            [_make_v2_outcome("q-prov", [spoof_orig_step])],
-            self.corpus,
-            self.corpus_sha,
-        )
-        self.assertFalse(spoof_orig_res["perQuestion"][0]["citationRawSpanValid"])
-        self.assertEqual(spoof_orig_res["perQuestion"][0]["evidenceCoverage"], 0.0)
-        self.assertFalse(spoof_orig_res["perQuestion"][0]["completeChain"])
+        spoof_orig_item = copy.deepcopy(orig_item)
+        spoof_orig_item["originalText"] = "spoofed original text"
+        spoof_orig_val, spoof_orig_errs = score.validate_returned_item(spoof_orig_item, self.corpus, item_index=0)
+        self.assertIsNone(spoof_orig_val)
+        self.assertGreater(len(spoof_orig_errs), 0)
 
         ep1_first = sorted(self.p_by_path["ep1.srt"], key=lambda h: h["ordinal"])[0]
         ctx_proc = subprocess.run(
@@ -951,9 +1126,10 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertGreaterEqual(len(ctx_payload["data"]["items"][0]["context"]), 1)
         ctx_payload["data"]["items"][0]["context"][0]["text"] = "spoofed context text"
         ctx_payload["data"].pop("budget", None)
+        ctx_search_step = _make_cli_step("search", self.corpus_sha, [ep1_first], argv=prov_search_argv)
         ctx_spoof_step: _CliStepDict = {
             "step": "read",
-            "argv": ["clec", "read", ep1_first["passageId"], "--context", "1"],
+            "argv": _adapter_read_argv(self.clec_bin, self.data_dir, [ep1_first["passageId"]]),
             "exitCode": 0,
             "timedOut": False,
             "elapsedSeconds": 0.001,
@@ -962,7 +1138,7 @@ class Phase3HarnessTests(unittest.TestCase):
         }
         ctx_spoof_res = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-prov", [ctx_spoof_step])],
+            [_make_v2_outcome("q-prov", [ctx_search_step, ctx_spoof_step], queries=["稅務條件？"])],
             self.corpus,
             self.corpus_sha,
         )
@@ -1000,10 +1176,12 @@ class Phase3HarnessTests(unittest.TestCase):
             ],
         }
 
+        budget_search_argv = _adapter_search_argv(self.clec_bin, self.data_dir, ["2022反例？"], self.corpus_sha)
         envelope_step = _make_cli_step(
             "search",
             self.corpus_sha,
             [sum_hit],
+            argv=budget_search_argv,
             extra_data={"metadata": "x" * 600},
             stderr_utf8="warning on stderr not counted toward stdout\n",
         )
@@ -1012,7 +1190,7 @@ class Phase3HarnessTests(unittest.TestCase):
 
         over_budget_res = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-budget", [envelope_step])],
+            [_make_v2_outcome("q-budget", [envelope_step], queries=["2022反例？"])],
             self.corpus,
             self.corpus_sha,
             stdout_byte_budget=compact_item_bytes,
@@ -1025,8 +1203,19 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertFalse(over_budget_res["gates"]["zeroBudgetViolations"])
 
         ep1_cond_hit = next(h for h in self.p_by_path["ep1.srt"] if "若無稅務問題才能匯回臺灣" in h["text"])
-        big_first_step = _make_cli_step("search", self.corpus_sha, [ep1_cond_hit], extra_data={"metadata": "y" * 1200})
-        small_read_step = _make_cli_step("read", self.corpus_sha, [{**sum_hit, "kind": "passage", "context": []}])
+        big_first_step = _make_cli_step(
+            "search",
+            self.corpus_sha,
+            [ep1_cond_hit, sum_hit],
+            argv=budget_search_argv,
+            extra_data={"metadata": "y" * 1200},
+        )
+        small_read_step = _make_cli_step(
+            "read",
+            self.corpus_sha,
+            [{**ep1_cond_hit, "kind": "passage", "context": []}],
+            argv=_adapter_read_argv(self.clec_bin, self.data_dir, [ep1_cond_hit["passageId"]]),
+        )
         big_len = len(big_first_step["stdoutUtf8"].encode("utf-8"))
         small_len = len(small_read_step["stdoutUtf8"].encode("utf-8"))
         cum_cap = max(small_len + 50, big_len - 1)
@@ -1034,7 +1223,7 @@ class Phase3HarnessTests(unittest.TestCase):
 
         no_skip_res = score.summarize_evaluation(
             dataset,
-            [_make_v2_outcome("q-budget", [big_first_step, small_read_step])],
+            [_make_v2_outcome("q-budget", [big_first_step, small_read_step], queries=["2022反例？"])],
             self.corpus,
             self.corpus_sha,
             stdout_byte_budget=big_len + 100,
@@ -1059,11 +1248,12 @@ class Phase3HarnessTests(unittest.TestCase):
             "search",
             self.corpus_sha,
             [sum_hit],
+            argv=budget_search_argv,
             extra_data={"budget": {"maxBytes": 65536, "usedBytes": 10, "omittedCount": 0, "omittedIds": []}},
         )
         tampered_used_res = score.score_question(
             dataset["questions"][0],
-            _make_v2_outcome("q-budget", [tampered_used_bytes_step]),
+            _make_v2_outcome("q-budget", [tampered_used_bytes_step], queries=["2022反例？"]),
             self.corpus,
         )
         self.assertEqual(tampered_used_res["status"], "error")
@@ -1113,10 +1303,15 @@ class Phase3HarnessTests(unittest.TestCase):
                 },
             ],
         }
-        empty_search_step = _make_cli_step("search", self.corpus_sha, [])
+        empty_search_step = _make_cli_step(
+            "search",
+            self.corpus_sha,
+            [],
+            argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["星際橙子基金何時發行？"], self.corpus_sha),
+        )
         timeout_step: _CliStepDict = {
             "step": "search",
-            "argv": ["clec", "search"],
+            "argv": _adapter_search_argv(self.clec_bin, self.data_dir, ["稅務條件？"], self.corpus_sha),
             "exitCode": None,
             "timedOut": True,
             "elapsedSeconds": 0.05,
@@ -1124,8 +1319,14 @@ class Phase3HarnessTests(unittest.TestCase):
             "stderrUtf8": "",
         }
         outcomes = [
-            _make_v2_outcome("q-timeout", [timeout_step], status="timeout", stop_reason="search_timeout_0.05s"),
-            _make_v2_outcome("q-unans", [empty_search_step]),
+            _make_v2_outcome(
+                "q-timeout",
+                [timeout_step],
+                queries=["稅務條件？"],
+                status="timeout",
+                stop_reason="search_timeout_0.05s",
+            ),
+            _make_v2_outcome("q-unans", [empty_search_step], queries=["星際橙子基金何時發行？"]),
         ]
         summary = score.summarize_evaluation(dataset, outcomes, self.corpus, self.corpus_sha)
         self.assertEqual(summary["verdict"], "inconclusive_errors_present")
@@ -1459,10 +1660,12 @@ class Phase3HarnessTests(unittest.TestCase):
     def test_execution_boundary_rejects_failed_timedout_and_incoherent_steps(self) -> None:
         sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
         valid_hit = next(h for h in self.p_by_path["ep1.srt"] if "若無稅務問題才能匯回臺灣" in h["text"])
-        valid_search = _make_cli_step("search", self.corpus_sha, [valid_hit])
-        failed_read = _make_cli_step("read", self.corpus_sha, [], exit_code=2, stderr_utf8="read error")
-        timed_out_read = _make_cli_step("read", self.corpus_sha, [], exit_code=None, timed_out=True)
-        incoherent_to_zero = _make_cli_step("read", self.corpus_sha, [valid_hit], exit_code=0, timed_out=True)
+        boundary_search_argv = _adapter_search_argv(self.clec_bin, self.data_dir, ["稅務條件"], self.corpus_sha)
+        boundary_read_argv = _adapter_read_argv(self.clec_bin, self.data_dir, [valid_hit["passageId"]])
+        valid_search = _make_cli_step("search", self.corpus_sha, [valid_hit], argv=boundary_search_argv)
+        failed_read = _make_cli_step("read", self.corpus_sha, [], argv=boundary_read_argv, exit_code=2, stderr_utf8="read error")
+        timed_out_read = _make_cli_step("read", self.corpus_sha, [], argv=boundary_read_argv, exit_code=None, timed_out=True)
+        incoherent_to_zero = _make_cli_step("read", self.corpus_sha, [valid_hit], argv=boundary_read_argv, exit_code=0, timed_out=True)
 
         questions = [
             {
@@ -1491,13 +1694,13 @@ class Phase3HarnessTests(unittest.TestCase):
             "questions": questions,
         }
         outcomes = [
-            _make_v2_outcome("q-0", [valid_search, failed_read], status="error", stop_reason="read_cli_error:2"),
-            _make_v2_outcome("q-1", [valid_search, failed_read], status="completed"),
-            _make_v2_outcome("q-2", [valid_search, timed_out_read], status="completed"),
-            _make_v2_outcome("q-3", [valid_search, incoherent_to_zero], status="completed"),
-            _make_v2_outcome("q-4", [], status="completed"),
-            _make_v2_outcome("q-5", [valid_search], status="timeout", stop_reason="forged_timeout"),
-            _make_v2_outcome("q-6", [valid_search], status="partial"),
+            _make_v2_outcome("q-0", [valid_search, failed_read], queries=["稅務條件"], status="error", stop_reason="read_cli_error:2"),
+            _make_v2_outcome("q-1", [valid_search, failed_read], queries=["稅務條件"], status="completed"),
+            _make_v2_outcome("q-2", [valid_search, timed_out_read], queries=["稅務條件"], status="completed"),
+            _make_v2_outcome("q-3", [valid_search, incoherent_to_zero], queries=["稅務條件"], status="completed"),
+            _make_v2_outcome("q-4", [], queries=["稅務條件"], status="completed"),
+            _make_v2_outcome("q-5", [valid_search], queries=["稅務條件"], status="timeout", stop_reason="forged_timeout"),
+            _make_v2_outcome("q-6", [valid_search], queries=["稅務條件"], status="partial"),
         ]
         summary = score.summarize_evaluation(dataset, outcomes, self.corpus, self.corpus_sha)
         self.assertEqual(summary["verdict"], "inconclusive_errors_present")
@@ -1595,7 +1798,22 @@ class Phase3HarnessTests(unittest.TestCase):
         )
         outcomes_path = self.tmp / "coherence-outcomes.json"
         outcomes_path.write_text(
-            json.dumps([_make_v2_outcome("q-coh", [_make_cli_step("search", self.corpus_sha, [valid_hit])])]),
+            json.dumps(
+                [
+                    _make_v2_outcome(
+                        "q-coh",
+                        [
+                            _make_cli_step(
+                                "search",
+                                self.corpus_sha,
+                                [valid_hit],
+                                argv=_adapter_search_argv(self.clec_bin, self.data_dir, ["匯回臺灣 稅務問題"], self.corpus_sha),
+                            )
+                        ],
+                        queries=["匯回臺灣 稅務問題"],
+                    )
+                ]
+            ),
             encoding="utf-8",
         )
         eval_py = Path(__file__).resolve().parent / "eval.py"
@@ -1796,7 +2014,20 @@ class Phase3HarnessTests(unittest.TestCase):
             }
             res = score.summarize_evaluation(
                 ds,
-                [_make_v2_outcome("q-empty-no-crash", [_make_cli_step("search", sha, [])])],
+                [
+                    _make_v2_outcome(
+                        "q-empty-no-crash",
+                        [
+                            _make_cli_step(
+                                "search",
+                                sha,
+                                [],
+                                argv=_adapter_search_argv(self.clec_bin, data_dir, ["sep"], sha),
+                            )
+                        ],
+                        queries=["sep"],
+                    )
+                ],
                 parity_corpus,
                 sha,
             )
@@ -1836,8 +2067,30 @@ class Phase3HarnessTests(unittest.TestCase):
             inc = score.summarize_evaluation(
                 ds_mixed,
                 [
-                    _make_v2_outcome("q-empty-no-crash", [_make_cli_step("search", sha, [])]),
-                    _make_v2_outcome("q-valid-sibling", [_make_cli_step("search", sha, [])]),
+                    _make_v2_outcome(
+                        "q-empty-no-crash",
+                        [
+                            _make_cli_step(
+                                "search",
+                                sha,
+                                [],
+                                argv=_adapter_search_argv(self.clec_bin, data_dir, ["sep"], sha),
+                            )
+                        ],
+                        queries=["sep"],
+                    ),
+                    _make_v2_outcome(
+                        "q-valid-sibling",
+                        [
+                            _make_cli_step(
+                                "search",
+                                sha,
+                                [],
+                                argv=_adapter_search_argv(self.clec_bin, data_dir, ["vtt"], sha),
+                            )
+                        ],
+                        queries=["vtt"],
+                    ),
                 ],
                 parity_corpus,
                 sha,
@@ -2088,6 +2341,404 @@ class Phase3HarnessTests(unittest.TestCase):
             rep = json.loads(out_p.read_text(encoding="utf-8"))
             self.assertEqual(rep["comparisonStatus"], "IDENTICAL_QUERY_PLANS", case_name)
             self.assertEqual(rep["comparisonVerdict"], "no_comparison_identical_query_plans", case_name)
+
+    def test_execution_grammar_score_outcomes_positives_and_negatives(self) -> None:
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        sid_sum, sp_sum = self._span_for("ep1_summary.txt", "曾說不應留現金")
+        eval_py = Path(__file__).resolve().parent / "eval.py"
+
+        def _run_score_outcomes(ds_obj: dict[str, object], outcomes_obj: list[dict[str, object]], tag: str) -> tuple[int, dict[str, object]]:
+            ds_p = self.tmp / f"grammar-ds-{tag}.json"
+            out_p = self.tmp / f"grammar-out-{tag}.json"
+            rep_p = self.tmp / f"grammar-rep-{tag}.json"
+            ds_p.write_text(json.dumps(ds_obj, ensure_ascii=False), encoding="utf-8")
+            out_p.write_text(json.dumps(outcomes_obj, ensure_ascii=False), encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(eval_py),
+                    "score-outcomes",
+                    "--dataset",
+                    str(ds_p),
+                    "--outcomes",
+                    str(out_p),
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--corpus-sha256",
+                    self.corpus_sha,
+                    "--output",
+                    str(rep_p),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            return proc.returncode, json.loads(rep_p.read_text(encoding="utf-8"))
+
+        q_base = {
+            "id": "q-grammar",
+            "category": "condition",
+            "question": "核心條件 匯回臺灣 稅務問題",
+            "answerable": True,
+            "workKeys": ["w:ep1"],
+            "evidence": [
+                {
+                    "claimId": "c1",
+                    "sourceId": sid_srt,
+                    "path": "ep1.srt",
+                    "spans": [sp_srt],
+                    "quote": "若無稅務問題才能匯回臺灣",
+                    "kind": "condition",
+                }
+            ],
+        }
+        ds_single = {
+            "schemaVersion": 1,
+            "corpusSha256": self.corpus_sha,
+            "split": "development",
+            "questions": [q_base],
+        }
+
+        search_only_out, _ = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=[q_base],
+            read_top_n=0,
+        )
+        rc_so, rep_so = _run_score_outcomes(ds_single, search_only_out, "pos-search-only")
+        self.assertEqual(rc_so, 0)
+        self.assertEqual(rep_so["verdict"], "complete")
+        self.assertTrue(all(rep_so["gates"].values()))
+        self.assertEqual(rep_so["perQuestion"][0]["evidenceCoverage"], 1.0)
+        self.assertTrue(rep_so["perQuestion"][0]["completeChain"])
+
+        search_read_out, _ = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=[q_base],
+            read_top_n=1,
+        )
+        rc_sr, rep_sr = _run_score_outcomes(ds_single, search_read_out, "pos-search-read")
+        self.assertEqual(rc_sr, 0)
+        self.assertEqual(rep_sr["verdict"], "complete")
+        self.assertTrue(all(rep_sr["gates"].values()))
+        self.assertEqual(rep_sr["perQuestion"][0]["evidenceCoverage"], 1.0)
+        self.assertTrue(rep_sr["perQuestion"][0]["completeChain"])
+
+        q_kw = copy.deepcopy(q_base)
+        q_kw["id"] = "q-kw"
+        q_kw["question"] = "read --context 1 --release 匯回臺灣 稅務問題"
+        ds_kw = {**ds_single, "questions": [q_kw]}
+        kw_out, _ = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=[q_kw],
+            read_top_n=1,
+        )
+        rc_kw, rep_kw = _run_score_outcomes(ds_kw, kw_out, "pos-keywords-in-query")
+        self.assertEqual(rc_kw, 0)
+        self.assertEqual(rep_kw["verdict"], "complete")
+        self.assertTrue(rep_kw["perQuestion"][0]["completeChain"])
+
+        q_trim = {
+            "id": "q-trim",
+            "category": "condition",
+            "question": "稅務問題 融資",
+            "answerable": True,
+            "workKeys": ["w:ep1"],
+            "evidence": [
+                {
+                    "claimId": "c1",
+                    "sourceId": sid_sum,
+                    "path": "ep1_summary.txt",
+                    "spans": [sp_sum],
+                    "quote": "曾說不應留現金",
+                    "kind": "condition",
+                }
+            ],
+        }
+        ds_trim = {**ds_single, "questions": [q_trim]}
+        search_two_hits = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=[q_trim],
+            limit=2,
+            per_work=2,
+            read_top_n=2,
+        )[0][0]
+        self.assertEqual(len(search_two_hits["steps"]), 2)
+        search_step_2 = search_two_hits["steps"][0]
+        read_ids_2 = [h["passageId"] for h in json.loads(search_step_2["stdoutUtf8"])["data"]["hits"]]
+        self.assertEqual(len(read_ids_2), 2)
+        first_read_len = len(
+            subprocess.run(
+                [str(self.clec_bin), "--data-dir", str(self.data_dir), "--offline", "--json", "read", read_ids_2[0], "--context", "1"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.encode("utf-8")
+        )
+        trimmed_out = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=[q_trim],
+            limit=2,
+            per_work=2,
+            read_max_bytes=first_read_len + 40,
+            read_top_n=2,
+        )[0]
+        trimmed_read_payload = json.loads(trimmed_out[0]["steps"][1]["stdoutUtf8"])["data"]
+        self.assertEqual(trimmed_read_payload["budget"]["omittedCount"], 1)
+        rc_trim, rep_trim = _run_score_outcomes(ds_trim, trimmed_out, "pos-trimmed-read")
+        self.assertEqual(rc_trim, 0)
+        self.assertEqual(rep_trim["verdict"], "complete")
+        self.assertEqual(rep_trim["perQuestion"][0]["status"], "completed")
+        self.assertIn(rep_trim["perQuestion"][0]["evidenceCoverage"], (0.0, 1.0))
+
+        blind_q_path = self.tmp / "grammar-blind.json"
+        blind_q_path.write_text(
+            json.dumps([{"id": "q-grammar", "queries": ["匯回臺灣", "稅務問題"]}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        rrf_out, _ = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=[q_base],
+            mode="rrf_multiquery",
+            query_angle="blind_rewrite",
+            blind_queries_path=blind_q_path,
+            read_top_n=1,
+        )
+        rc_rrf, rep_rrf = _run_score_outcomes(ds_single, rrf_out, "pos-rrf-blind")
+        self.assertEqual(rc_rrf, 0)
+        self.assertEqual(rep_rrf["verdict"], "complete")
+        self.assertTrue(rep_rrf["perQuestion"][0]["completeChain"])
+
+        orig_proc = subprocess.run(
+            [str(self.clec_bin), "--data-dir", str(self.data_dir), "--json", "read", self.sid_by_path["ep1.txt"], "--original"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        orig_read_only_step: _CliStepDict = {
+            "step": "read",
+            "argv": [
+                str(self.clec_bin),
+                "--data-dir",
+                str(self.data_dir),
+                "--offline",
+                "--json",
+                "--max-bytes",
+                "65536",
+                "read",
+                self.sid_by_path["ep1.txt"],
+                "--original",
+            ],
+            "exitCode": 0,
+            "timedOut": False,
+            "elapsedSeconds": 0.001,
+            "stdoutUtf8": orig_proc.stdout,
+            "stderrUtf8": orig_proc.stderr,
+        }
+
+        base_o = copy.deepcopy(search_read_out[0])
+        search_s = copy.deepcopy(base_o["steps"][0])
+        read_s = copy.deepcopy(base_o["steps"][1])
+        other_pid = next(h["passageId"] for h in self.p_by_path["ep1_summary.txt"])
+
+        negatives: list[tuple[str, dict[str, object]]] = [
+            ("read_only", {**copy.deepcopy(base_o), "steps": [copy.deepcopy(read_s)]}),
+            ("read_original_only", {**copy.deepcopy(base_o), "steps": [orig_read_only_step]}),
+            ("read_before_search", {**copy.deepcopy(base_o), "steps": [copy.deepcopy(read_s), copy.deepcopy(search_s)]}),
+            ("duplicate_search", {**copy.deepcopy(base_o), "steps": [copy.deepcopy(search_s), copy.deepcopy(search_s)]}),
+            ("duplicate_read", {**copy.deepcopy(base_o), "steps": [copy.deepcopy(search_s), copy.deepcopy(read_s), copy.deepcopy(read_s)]}),
+            (
+                "read_after_empty_search",
+                {
+                    **copy.deepcopy(base_o),
+                    "steps": [
+                        _make_cli_step(
+                            "search",
+                            self.corpus_sha,
+                            [],
+                            argv=copy.deepcopy(search_s["argv"]),
+                        ),
+                        copy.deepcopy(read_s),
+                    ],
+                },
+            ),
+            ("contradictory_stop_reason", {**copy.deepcopy(base_o), "stopReason": "read_cli_error:2"}),
+            ("argv_command_mismatch", {**copy.deepcopy(base_o), "steps": [{**copy.deepcopy(search_s), "argv": ["clec", "read", "invented"]}, copy.deepcopy(read_s)]}),
+            ("read_argv_command_mismatch", {**copy.deepcopy(base_o), "steps": [copy.deepcopy(search_s), {**copy.deepcopy(read_s), "argv": ["clec", "search", "x"]}]}),
+            ("argv_missing", {**copy.deepcopy(base_o), "steps": [{k: v for k, v in search_s.items() if k != "argv"}, copy.deepcopy(read_s)]}),
+            ("argv_malformed_type", {**copy.deepcopy(base_o), "steps": [{**copy.deepcopy(search_s), "argv": "clec search"}, copy.deepcopy(read_s)]}),
+            ("argv_missing_adapter_flags", {**copy.deepcopy(base_o), "steps": [{**copy.deepcopy(search_s), "argv": ["clec", "search", q_base["question"]]}, copy.deepcopy(read_s)]}),
+            (
+                "argv_release_mismatch",
+                {
+                    **copy.deepcopy(base_o),
+                    "steps": [
+                        {
+                            **copy.deepcopy(search_s),
+                            "argv": _adapter_search_argv(self.clec_bin, self.data_dir, [q_base["question"]], "0" * 64),
+                        },
+                        copy.deepcopy(read_s),
+                    ],
+                },
+            ),
+            ("declared_queries_mismatch", {**copy.deepcopy(base_o), "queries": ["unrelated query"]}),
+            ("invalid_mode", {**copy.deepcopy(base_o), "mode": "unsupported_mode"}),
+            (
+                "blind_rewrite_over_4_queries",
+                {
+                    **copy.deepcopy(base_o),
+                    "mode": "rrf_multiquery",
+                    "queryAngle": "blind_rewrite",
+                    "queries": ["q1", "q2", "q3", "q4", "q5"],
+                    "steps": [
+                        {
+                            **copy.deepcopy(search_s),
+                            "argv": _adapter_search_argv(self.clec_bin, self.data_dir, ["q1", "q2", "q3", "q4", "q5"], self.corpus_sha),
+                        }
+                    ],
+                },
+            ),
+            (
+                "single_query_mode_multi_queries",
+                {
+                    **copy.deepcopy(base_o),
+                    "queries": [q_base["question"], "extra"],
+                    "steps": [
+                        {
+                            **copy.deepcopy(search_s),
+                            "argv": _adapter_search_argv(self.clec_bin, self.data_dir, [q_base["question"], "extra"], self.corpus_sha),
+                        },
+                    ],
+                },
+            ),
+            (
+                "read_wrong_context_flag",
+                {
+                    **copy.deepcopy(base_o),
+                    "steps": [
+                        copy.deepcopy(search_s),
+                        {
+                            **copy.deepcopy(read_s),
+                            "argv": _adapter_read_argv(
+                                self.clec_bin,
+                                self.data_dir,
+                                [json.loads(search_s["stdoutUtf8"])["data"]["hits"][0]["passageId"]],
+                                context=0,
+                            ),
+                        },
+                    ],
+                },
+            ),
+            (
+                "read_id_unbound_to_search",
+                {
+                    **copy.deepcopy(base_o),
+                    "steps": [
+                        copy.deepcopy(search_s),
+                        {
+                            **copy.deepcopy(read_s),
+                            "argv": _adapter_read_argv(self.clec_bin, self.data_dir, [other_pid]),
+                        },
+                    ],
+                },
+            ),
+        ]
+
+        tampered_read_payload = json.loads(read_s["stdoutUtf8"])
+        tampered_read_payload["data"]["items"][0]["passageId"] = other_pid
+        negatives.append(
+            (
+                "read_stdout_id_mismatch",
+                {
+                    **copy.deepcopy(base_o),
+                    "steps": [
+                        copy.deepcopy(search_s),
+                        {
+                            **copy.deepcopy(read_s),
+                            "stdoutUtf8": json.dumps(tampered_read_payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+                        },
+                    ],
+                },
+            )
+        )
+
+        tampered_search_payload = json.loads(search_s["stdoutUtf8"])
+        tampered_search_payload["data"]["queries"] = [{"query": "spoofed query", "terms": ["spoof"]}]
+        tampered_search_payload["data"].pop("budget", None)
+        negatives.append(
+            (
+                "search_stdout_queries_mismatch",
+                {
+                    **copy.deepcopy(base_o),
+                    "steps": [
+                        {
+                            **copy.deepcopy(search_s),
+                            "stdoutUtf8": json.dumps(tampered_search_payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+                        }
+                    ],
+                },
+            )
+        )
+
+        for neg_name, neg_outcome in negatives:
+            rc, rep = _run_score_outcomes(ds_single, [neg_outcome], f"neg-{neg_name}")
+            self.assertNotEqual(rc, 0, neg_name)
+            self.assertEqual(rep["verdict"], "inconclusive_errors_present", neg_name)
+            self.assertEqual(rep["counts"]["scheduledQuestions"], 1, neg_name)
+            self.assertEqual(rep["counts"]["errorsOrTimeouts"], 1, neg_name)
+            self.assertFalse(rep["gates"]["zeroErrorsInDenominator"], neg_name)
+            self.assertFalse(rep["gates"]["zeroCriticalConditionLoss"], neg_name)
+            row = rep["perQuestion"][0]
+            self.assertNotEqual(row["status"], "completed", neg_name)
+            self.assertIsNone(row["evidenceCoverage"], neg_name)
+            self.assertIsNone(row["completeChain"], neg_name)
+            self.assertIsNone(row["conditionLoss"], neg_name)
+            self.assertIsNone(row["counterexampleLoss"], neg_name)
+
+        batch_questions = []
+        batch_outcomes = []
+        pos_o = copy.deepcopy(search_only_out[0])
+        pos_o["id"] = "batch-pos"
+        q_pos = copy.deepcopy(q_base)
+        q_pos["id"] = "batch-pos"
+        batch_questions.append(q_pos)
+        batch_outcomes.append(pos_o)
+        for idx, (neg_name, neg_outcome) in enumerate(negatives):
+            qid = f"batch-neg-{idx}-{neg_name}"
+            q_i = copy.deepcopy(q_base)
+            q_i["id"] = qid
+            o_i = copy.deepcopy(neg_outcome)
+            o_i["id"] = qid
+            batch_questions.append(q_i)
+            batch_outcomes.append(o_i)
+
+        rc_batch, rep_batch = _run_score_outcomes(
+            {"schemaVersion": 1, "corpusSha256": self.corpus_sha, "split": "development", "questions": batch_questions},
+            batch_outcomes,
+            "mixed-batch",
+        )
+        self.assertNotEqual(rc_batch, 0)
+        self.assertEqual(rep_batch["verdict"], "inconclusive_errors_present")
+        self.assertEqual(rep_batch["counts"]["scheduledQuestions"], 1 + len(negatives))
+        self.assertEqual(rep_batch["counts"]["errorsOrTimeouts"], len(negatives))
+        self.assertEqual(rep_batch["counts"]["completedAnswerable"], 1)
+        self.assertEqual(rep_batch["perQuestion"][0]["status"], "completed")
+        self.assertTrue(rep_batch["perQuestion"][0]["completeChain"])
+        for row in rep_batch["perQuestion"][1:]:
+            self.assertNotEqual(row["status"], "completed")
+            self.assertIsNone(row["evidenceCoverage"])
+            self.assertIsNone(row["completeChain"])
+            self.assertIsNone(row["conditionLoss"])
 
 
 if __name__ == "__main__":
