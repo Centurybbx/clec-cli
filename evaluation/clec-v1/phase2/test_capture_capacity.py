@@ -424,6 +424,61 @@ class CaptureCapacityTests(unittest.TestCase):
             self.assertFalse(stale_bin_out["usableSemanticEquivalence"])
             self.assertEqual(stale_bin_out["structuralValidity"]["right"]["status"], "stale_receipt")
 
+            stale_git_receipt = tmp / "stale-git-receipt.json"
+            g_obj = json.loads(right_receipt.read_text(encoding="utf-8"))
+            g_obj["gitHead"] = "0" * 40
+            stale_git_receipt.write_text(json.dumps(g_obj), encoding="utf-8")
+            stale_git_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(sem_script),
+                    "--left",
+                    str(clean_db),
+                    "--right",
+                    str(vacuumed_db),
+                    "--validator",
+                    str(val_bin),
+                    "--left-receipt",
+                    str(left_receipt),
+                    "--right-receipt",
+                    str(stale_git_receipt),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(stale_git_proc.returncode, 0)
+            stale_git_out = json.loads(stale_git_proc.stdout)
+            self.assertFalse(stale_git_out["usableSemanticEquivalence"])
+            self.assertEqual(stale_git_out["structuralValidity"]["right"]["status"], "stale_receipt")
+
+            invalid_flag_receipt = tmp / "invalid-flag-receipt.json"
+            inv_obj = json.loads(right_receipt.read_text(encoding="utf-8"))
+            inv_obj["valid"] = False
+            inv_obj["errorCode"] = "INTEGRITY_MISMATCH"
+            inv_obj["errorMessage"] = "synthetic invalid flag"
+            invalid_flag_receipt.write_text(json.dumps(inv_obj), encoding="utf-8")
+            inv_flag_res = sc.compare_databases(
+                clean_db,
+                vacuumed_db,
+                validator_bin=val_bin,
+                left_receipt_path=left_receipt,
+                right_receipt_path=invalid_flag_receipt,
+            )
+            self.assertFalse(inv_flag_res["usableSemanticEquivalence"])
+            self.assertEqual(inv_flag_res["structuralValidity"]["right"]["status"], "invalid")
+
+            no_val_receipt_res = sc.compare_databases(
+                clean_db,
+                vacuumed_db,
+                validator_bin=None,
+                left_receipt_path=left_receipt,
+                right_receipt_path=right_receipt,
+            )
+            self.assertTrue(no_val_receipt_res["contentEqual"])
+            self.assertFalse(no_val_receipt_res["usableSemanticEquivalence"])
+            self.assertEqual(no_val_receipt_res["structuralValidity"]["left"]["status"], "inconclusive")
+            self.assertEqual(no_val_receipt_res["structuralValidity"]["right"]["status"], "inconclusive")
+
             changed_db = tmp / "changed.sqlite"
             shutil.copy2(vacuumed_db, changed_db)
             with sqlite3.connect(changed_db) as conn:
