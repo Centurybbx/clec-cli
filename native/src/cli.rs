@@ -1941,4 +1941,44 @@ mod tests {
         }
         assert!(!nonexistent_dir.exists());
     }
+
+    #[test]
+    fn tiny_positive_max_bytes_rejected_before_key_file_store_and_bootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cold_dir = tmp.path().join("cold_never_created_budget");
+        let dir_arg = cold_dir.display().to_string();
+        let missing_key = tmp.path().join("unreadable_missing.key");
+        let key_arg = missing_key.display().to_string();
+
+        let sag2_cli = Cli::try_parse_from([
+            "clec",
+            "--data-dir",
+            &dir_arg,
+            "--max-bytes",
+            "1",
+            "search",
+            "anchor",
+            "--sag2",
+            "--key-file",
+            &key_arg,
+        ])
+        .unwrap();
+        let err_sag2 = dispatch(&sag2_cli, true, &RuntimeOptions::shipped()).unwrap_err();
+        assert_eq!(err_sag2.code, ErrorCode::OutputBudgetTooSmall);
+        assert!(err_sag2.sag2_stage.is_none());
+
+        let local_cli = Cli::try_parse_from([
+            "clec",
+            "--data-dir",
+            &dir_arg,
+            "--max-bytes",
+            "1",
+            "search",
+            "anchor",
+        ])
+        .unwrap();
+        let err_local = dispatch(&local_cli, true, &RuntimeOptions::shipped()).unwrap_err();
+        assert_eq!(err_local.code, ErrorCode::OutputBudgetTooSmall);
+        assert!(!cold_dir.exists());
+    }
 }

@@ -782,6 +782,140 @@ fn group1_zero_api_and_pre_bootstrap_validation() {
 }
 
 #[test]
+fn group1_tiny_positive_max_bytes_rejected_before_io() {
+    let srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.8, "synthetic"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let corpus = publish_and_sync_corpus(
+        &[("w1", "Alpha Work")],
+        &[(
+            "w1",
+            "a.txt",
+            "Alpha Doc",
+            "document",
+            "星雲指南：第一條基本準則。",
+            Some("2025-01-01"),
+        )],
+    );
+    let warm_s = corpus.data_dir.display().to_string();
+    let url = srv.url("/decisions");
+    let key_env = [
+        ("JEV_BASE_URL", url.as_str()),
+        ("JEV_API_KEY", SENTINEL_KEY),
+    ];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cold_dir = tmp.path().join("cold_never_created_tiny_budget");
+    let cold_s = cold_dir.display().to_string();
+    let missing_key = tmp.path().join("unreadable_sentinel.key");
+    let missing_key_s = missing_key.display().to_string();
+
+    for data_s in [warm_s.as_str(), cold_s.as_str()] {
+        for budget in ["1", "500", "1000"] {
+            let err = assert_err_json(
+                &run_clec(
+                    &[
+                        "--data-dir",
+                        data_s,
+                        "--max-bytes",
+                        budget,
+                        "search",
+                        "星雲指南",
+                        "--sag2",
+                        "--key-file",
+                        &missing_key_s,
+                    ],
+                    &key_env,
+                ),
+                2,
+                Some("OUTPUT_BUDGET_TOO_SMALL"),
+            );
+            assert!(
+                err["error"]["sag2Stage"].is_null(),
+                "pre-I/O rejection must occur before SAG2 stages (budget={budget})"
+            );
+        }
+    }
+
+    let local_cold = assert_err_json(
+        &run_clec(
+            &[
+                "--data-dir",
+                &cold_s,
+                "--max-bytes",
+                "1",
+                "search",
+                "星雲指南",
+            ],
+            &[],
+        ),
+        2,
+        Some("OUTPUT_BUDGET_TOO_SMALL"),
+    );
+    assert!(local_cold["error"]["sag2Stage"].is_null());
+
+    assert!(
+        !cold_dir.exists(),
+        "tiny --max-bytes must not create cold --data-dir"
+    );
+    assert!(
+        srv.logs().is_empty(),
+        "tiny --max-bytes must make 0 model HTTP requests"
+    );
+
+    let no_cand_out = run_clec(
+        &[
+            "--data-dir",
+            &warm_s,
+            "search",
+            "zzznomatchtoken999",
+            "--sag2",
+        ],
+        &key_env,
+    );
+    assert_ok_json(&no_cand_out);
+    let no_cand_len = no_cand_out.stdout.len();
+    assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &warm_s,
+            "--max-bytes",
+            &no_cand_len.to_string(),
+            "search",
+            "zzznomatchtoken999",
+            "--sag2",
+        ],
+        &key_env,
+    ));
+    let one_under = assert_err_json(
+        &run_clec(
+            &[
+                "--data-dir",
+                &warm_s,
+                "--max-bytes",
+                &(no_cand_len - 1).to_string(),
+                "search",
+                "zzznomatchtoken999",
+                "--sag2",
+            ],
+            &key_env,
+        ),
+        2,
+        Some("OUTPUT_BUDGET_TOO_SMALL"),
+    );
+    assert_eq!(
+        one_under["error"]["sag2Stage"]["completedStage"],
+        "output_budget"
+    );
+    assert!(srv.logs().is_empty());
+}
+
+#[test]
 fn group2_one_hop_bridge_and_natural_stops() {
     let corpus = publish_and_sync_corpus(
         &[
