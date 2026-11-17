@@ -582,9 +582,13 @@ fn build_in_staging(
     let (bytes, sha256_str) = file_size_and_sha256(&sqlite_path)?;
     let release = ReleaseHash::parse(&sha256_str)?;
 
-    {
-        let store = CorpusStore::open_readonly(&sqlite_path, release.clone())?;
-        store.validate_full(&counts)?;
+    CorpusStore::validate_staging_db(&sqlite_path, release.clone(), &counts)?;
+    let (post_bytes, post_sha) = file_size_and_sha256(&sqlite_path)?;
+    if post_bytes != bytes || post_sha != sha256_str {
+        return Err(ClecError::new(
+            ErrorCode::InternalError,
+            "Staging database bytes changed during validation.",
+        ));
     }
 
     {
@@ -952,10 +956,7 @@ where
             ));
         }
 
-        {
-            let store = CorpusStore::open_readonly(&staging_db, manifest.sha256.clone())?;
-            store.validate_full(&manifest.counts)?;
-        }
+        CorpusStore::validate_staging_db(&staging_db, manifest.sha256.clone(), &manifest.counts)?;
 
         fs::rename(&staging_db, &final_db).map_err(map_io)?;
 

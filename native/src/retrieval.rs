@@ -396,8 +396,8 @@ mod tests {
         drop(conn);
 
         let release = ReleaseHash::parse(&"c".repeat(64)).unwrap();
+        CorpusStore::validate_staging_db(&db_path, release.clone(), &counts).unwrap();
         let store = CorpusStore::open_readonly(&db_path, release).unwrap();
-        store.validate_full(&counts).unwrap();
         (dir, store)
     }
 

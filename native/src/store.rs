@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, params};
@@ -283,6 +283,34 @@ impl CorpusStore {
         Ok(store)
     }
 
+    pub(crate) fn validate_staging_db(
+        path: &Path,
+        release: ReleaseHash,
+        expected_counts: &CorpusCounts,
+    ) -> Result<(), ClecError> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            ClecError::new(
+                ErrorCode::InvalidPackage,
+                format!("Cannot open staging corpus SQLite: {e}"),
+            )
+        })?;
+
+        conn.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    format!("SQLite pragma failed: {e}"),
+                )
+            })?;
+
+        let store = Self { conn, release };
+        store.validate_full(expected_counts)
+    }
+
     pub(crate) fn query_bm25_candidates(
         &self,
         fts_query: &str,
@@ -437,7 +465,7 @@ impl CorpusStore {
         })
     }
 
-    pub fn validate_full(&self, expected_counts: &CorpusCounts) -> Result<(), ClecError> {
+    fn validate_full(&self, expected_counts: &CorpusCounts) -> Result<(), ClecError> {
         let actual_schema = collect_schema_rows(&self.conn)?;
         let expected_conn = Connection::open_in_memory().map_err(|e| {
             ClecError::new(
@@ -473,6 +501,7 @@ impl CorpusStore {
         }
 
         self.verify_format_header()?;
+        self.run_native_fts5_integrity_check()?;
 
         let actual_counts = self.counts()?;
         if &actual_counts != expected_counts {
@@ -487,6 +516,28 @@ impl CorpusStore {
         let source_map = self.validate_sources(&work_ids, &blobs_map)?;
         let extractions = self.validate_cues_and_diagnostics(&source_map, &blobs_map)?;
         self.validate_passages_and_fts(&source_map, &blobs_map, &extractions)
+    }
+
+    fn run_native_fts5_integrity_check(&self) -> Result<(), ClecError> {
+        self.conn
+            .execute_batch("PRAGMA query_only=OFF; BEGIN;")
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    format!("Cannot start SQLite FTS5 integrity-check transaction: {e}"),
+                )
+            })?;
+        let check_res = self
+            .conn
+            .execute("INSERT INTO search(search) VALUES('integrity-check')", []);
+        let _ = self.conn.execute_batch("ROLLBACK; PRAGMA query_only=ON;");
+        check_res.map_err(|e| {
+            ClecError::new(
+                ErrorCode::IntegrityMismatch,
+                format!("SQLite FTS5 integrity-check failed: {e}"),
+            )
+        })?;
+        Ok(())
     }
 
     fn validate_blobs(&self) -> Result<HashMap<String, Vec<u8>>, ClecError> {
@@ -1076,7 +1127,124 @@ impl CorpusStore {
         let _ = self
             .conn
             .execute_batch("DROP TABLE IF EXISTS temp.__clec_fts_vocab; PRAGMA query_only=ON;");
-        inspect_res
+        inspect_res?;
+        self.validate_fts_bm25_probe(expected_postings, expected_docsize)
+    }
+
+    fn validate_fts_bm25_probe(
+        &self,
+        expected_postings: &BTreeMap<(i64, String, usize), String>,
+        expected_docsize: &HashMap<i64, (usize, usize)>,
+    ) -> Result<(), ClecError> {
+        let total_tokens: usize = expected_docsize.values().map(|(t, b)| t + b).sum();
+        if expected_postings.is_empty() || expected_docsize.is_empty() || total_tokens == 0 {
+            return Ok(());
+        }
+
+        let mut term_docs: BTreeMap<&str, HashSet<i64>> = BTreeMap::new();
+        for ((rowid, _col, _off), tok) in expected_postings {
+            term_docs.entry(tok.as_str()).or_default().insert(*rowid);
+        }
+        let Some((probe_tok, _)) = term_docs
+            .iter()
+            .min_by_key(|(tok, docs)| (docs.len(), *tok))
+        else {
+            return Ok(());
+        };
+
+        let mut doc_weights: BTreeMap<i64, f64> = BTreeMap::new();
+        for ((rowid, col, _off), tok) in expected_postings {
+            if tok == probe_tok {
+                let weight = if col == "title_tokens" { 4.0 } else { 1.0 };
+                *doc_weights.entry(*rowid).or_insert(0.0) += weight;
+            }
+        }
+
+        let n_row = expected_docsize.len() as f64;
+        let n_hit = doc_weights.len() as f64;
+        let avgdl = (total_tokens as f64) / n_row;
+        let idf_raw = ((n_row - n_hit + 0.5) / (n_hit + 0.5)).ln();
+        let idf = if idf_raw.is_finite() && idf_raw > 0.0 {
+            idf_raw
+        } else {
+            1e-6
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rowid, bm25(search, 4.0, 1.0) FROM search WHERE search MATCH ?1 ORDER BY rowid",
+            )
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("FTS5 BM25 health check prepare failed: {e}"),
+                )
+            })?;
+        let mut rows = stmt.query([*probe_tok]).map_err(|e| {
+            ClecError::new(
+                ErrorCode::IntegrityMismatch,
+                format!("FTS5 BM25 health check query failed: {e}"),
+            )
+        })?;
+
+        let mut actual_scores: BTreeMap<i64, f64> = BTreeMap::new();
+        loop {
+            let row = rows.next().map_err(|e| {
+                ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("FTS5 BM25 health check failed: {e}"),
+                )
+            })?;
+            let Some(row) = row else {
+                break;
+            };
+            let rowid: i64 = row.get(0).map_err(|e| {
+                ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("FTS5 BM25 health check rowid error: {e}"),
+                )
+            })?;
+            let score_opt: Option<f64> = row.get(1).map_err(|e| {
+                ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    format!("FTS5 BM25 health check score error: {e}"),
+                )
+            })?;
+            let score = score_opt.ok_or_else(|| {
+                ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "FTS5 BM25 health check returned NULL/NaN score (corrupt FTS5 global statistics).",
+                )
+            })?;
+            actual_scores.insert(rowid, score);
+        }
+
+        if actual_scores.len() != doc_weights.len() {
+            return Err(ClecError::new(
+                ErrorCode::IntegrityMismatch,
+                "FTS5 BM25 health check row count mismatch.",
+            ));
+        }
+
+        for (rowid, freq) in doc_weights {
+            let Some(&actual) = actual_scores.get(&rowid) else {
+                return Err(ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "FTS5 BM25 health check missing expected rowid.",
+                ));
+            };
+            let (t_len, b_len) = expected_docsize[&rowid];
+            let doc_len = (t_len + b_len) as f64;
+            let expected = -idf * (freq * 2.2) / (freq + 1.2 * (0.25 + 0.75 * doc_len / avgdl));
+            if !actual.is_finite() || (actual - expected).abs() > 1e-9 {
+                return Err(ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "FTS5 BM25 score mismatch indicates corrupt FTS5 global statistics.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn load_work(&self, work_id: &WorkId) -> Result<WorkRecord, ClecError> {
@@ -1882,7 +2050,6 @@ mod tests {
         drop(conn);
 
         let release = ReleaseHash::parse(&"b".repeat(64)).unwrap();
-        let store = CorpusStore::open_readonly(&db_path, release.clone()).unwrap();
         let counts = CorpusCounts {
             works: 2,
             sources: 2,
@@ -1891,7 +2058,8 @@ mod tests {
             cues: 0,
             inventory: 2,
         };
-        store.validate_full(&counts).unwrap();
+        CorpusStore::validate_staging_db(&db_path, release.clone(), &counts).unwrap();
+        let store = CorpusStore::open_readonly(&db_path, release.clone()).unwrap();
         let read1 = store.read_passage(&p1, 0, None).unwrap();
         let read2 = store.read_passage(&p2, 0, None).unwrap();
         assert_eq!(read1.work.work_id, w1);
@@ -1909,11 +2077,13 @@ mod tests {
             .unwrap();
         drop(conn2);
 
-        let store2 = CorpusStore::open_readonly(&db_path, release).unwrap();
         assert_eq!(
-            store2.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&db_path, release.clone(), &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::IntegrityMismatch
         );
+        let store2 = CorpusStore::open_readonly(&db_path, release).unwrap();
         assert_eq!(
             store2.read_passage(&p1, 0, None).unwrap_err().code,
             ErrorCode::IntegrityMismatch
@@ -1983,9 +2153,10 @@ mod tests {
             .unwrap();
         }
         let release = ReleaseHash::parse(&"d".repeat(64)).unwrap();
-        let store_empty = CorpusStore::open_readonly(&empty_db, release.clone()).unwrap();
         assert_eq!(
-            store_empty.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&empty_db, release.clone(), &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::IntegrityMismatch
         );
 
@@ -2005,9 +2176,10 @@ mod tests {
             )
             .unwrap();
         }
-        let store_swap_col = CorpusStore::open_readonly(&swap_col_db, release.clone()).unwrap();
         assert_eq!(
-            store_swap_col.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&swap_col_db, release.clone(), &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::IntegrityMismatch
         );
 
@@ -2027,11 +2199,68 @@ mod tests {
             )
             .unwrap();
         }
-        let store_swap_pos = CorpusStore::open_readonly(&swap_pos_db, release).unwrap();
         assert_eq!(
-            store_swap_pos.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&swap_pos_db, release, &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::IntegrityMismatch
         );
+    }
+
+    #[test]
+    fn rejects_corrupt_fts_engine_state_and_preserves_valid_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db_path, counts) = publish_and_extract_sqlite(
+            tmp.path(),
+            &[
+                ("a.txt", "Title Alpha", "alpha first body"),
+                ("b.txt", "Title Beta", "beta second body"),
+                ("c.txt", "Title Gamma", "gamma third body"),
+            ],
+        );
+        let release = ReleaseHash::parse(&"f".repeat(64)).unwrap();
+
+        let original_bytes = fs::read(&db_path).unwrap();
+        let original_hash = sha256_hex(&original_bytes);
+        CorpusStore::validate_staging_db(&db_path, release.clone(), &counts).unwrap();
+        let after_bytes = fs::read(&db_path).unwrap();
+        assert_eq!(sha256_hex(&after_bytes), original_hash);
+        assert_eq!(after_bytes, original_bytes);
+
+        for (name, sql) in [
+            (
+                "bad_stats_zero",
+                "UPDATE search_data SET block=x'000000' WHERE id=1",
+            ),
+            (
+                "bad_stats_skewed",
+                "UPDATE search_data SET block=x'010101' WHERE id=1",
+            ),
+            (
+                "corrupt_structure",
+                "UPDATE search_data SET block=x'ffffffffffffffff' WHERE id=10",
+            ),
+            (
+                "corrupt_segment",
+                "UPDATE search_data SET block=x'ff00ff' WHERE id > 10",
+            ),
+        ] {
+            let p = tmp.path().join(format!("{name}.sqlite"));
+            fs::copy(&db_path, &p).unwrap();
+            {
+                let conn = Connection::open(&p).unwrap();
+                conn.execute(sql, []).unwrap();
+            }
+            let err =
+                CorpusStore::validate_staging_db(&p, release.clone(), &counts).expect_err(name);
+            assert!(
+                matches!(
+                    err.code,
+                    ErrorCode::IntegrityMismatch | ErrorCode::InvalidPackage
+                ),
+                "unexpected error for {name}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -2051,9 +2280,10 @@ mod tests {
             )
             .unwrap();
         }
-        let store_shift = CorpusStore::open_readonly(&cue_shift_db, release.clone()).unwrap();
         assert_eq!(
-            store_shift.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&cue_shift_db, release.clone(), &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidPackage
         );
 
@@ -2067,9 +2297,10 @@ mod tests {
             )
             .unwrap();
         }
-        let store_wrong_cue = CorpusStore::open_readonly(&wrong_cue_db, release.clone()).unwrap();
         assert_eq!(
-            store_wrong_cue.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&wrong_cue_db, release.clone(), &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidPackage
         );
 
@@ -2083,9 +2314,10 @@ mod tests {
             )
             .unwrap();
         }
-        let store_bad_cont = CorpusStore::open_readonly(&bad_cont_db, release.clone()).unwrap();
         assert_eq!(
-            store_bad_cont.validate_full(&counts).unwrap_err().code,
+            CorpusStore::validate_staging_db(&bad_cont_db, release.clone(), &counts)
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidPackage
         );
 
@@ -2096,7 +2328,6 @@ mod tests {
             publish_and_extract_sqlite(tmp_hc.path(), &[("long.srt", "Long Cue", &hc_srt)]);
         assert_eq!(hc_counts.cues, 1);
         assert_eq!(hc_counts.passages, 2);
-        let store_hc = CorpusStore::open_readonly(&hc_db, release).unwrap();
-        store_hc.validate_full(&hc_counts).unwrap();
+        CorpusStore::validate_staging_db(&hc_db, release, &hc_counts).unwrap();
     }
 }
