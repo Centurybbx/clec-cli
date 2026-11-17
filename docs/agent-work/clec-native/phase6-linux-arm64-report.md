@@ -4,7 +4,7 @@ This report records real `linux/arm64` (`aarch64-unknown-linux-musl`) container 
 
 ## Verdict and scope boundaries
 
-The `linux-arm64` container verification gate passed across all six verifiable units in `evaluation/clec-v1/phase6/platform/linux-arm64/PROTOCOL.md`. Parent independent review of this new Linux ARM64 unit remains pending.
+The author passed all six units at `6fdeaad612da052903f85e994e95405e15fc7a15`. Independent review also passed fresh installation and native execution in both guest environments, exact UTF-8, budgets, rollback and cleanup. That review requested a bounded driver fix because reruns reused output directories and cleanup selected containers by shared prefix. Acceptance of the repaired rerun workflow remains pending independent recheck.
 
 This gate provides container-guest execution evidence on a local macOS `arm64` host running Docker Desktop `4.40.0` (`ServerVersion 28.0.4`, `OSType linux`, `Architecture aarch64`, kernel `6.10.14-linuxkit`). It does not establish bare-metal Linux behavior, minimum kernel baselines, `darwin-x64`, `linux-x64`, `win32-x64` (`cmd`/PowerShell), Stage 6B host-answer quality, production endpoint availability (`defaultConfigured: false`), live Jev verification (`providerVerified: false`), rights or licensing (`cli/NOTICES.md` unassigned), or Stage 3 retrieval quality.
 
@@ -73,3 +73,11 @@ To rerun the full pipeline from scratch:
 ```sh
 python3 evaluation/clec-v1/phase6/platform/linux-arm64/verify_linux_arm64.py --unit all
 ```
+
+The repaired driver creates a fresh run under `.cache/phase6-linux-arm64-runs/` and prints its path. Use `--run-root PATH` to run successive units in one dedicated directory. Units cannot be repeated there, even after failure. Earlier `.cache/phase6-linux-arm64/` evidence stays unchanged.
+
+## Coordinator ownership repair
+
+The coordinator fixed this bounded review finding directly. Each run now owns an exclusive directory, driver lock, one-shot unit markers, unique labeled Docker names, and Docker-created CID records. Cleanup checks exact recorded IDs and labels, with no shared-prefix search. A foreign label or failed ownership observation stops cleanup. No native or packaging source changed.
+
+Six local ownership controls pass, including two independent run contexts, failed-unit log preservation, legacy-directory refusal, concurrent-writer refusal, foreign resource rejection, and exact CID selection. Fresh fixture publishing and both guest runs exercise the repaired driver using copies of the retained Linux artifacts. This is a driver rerun, not a new Rust build. New receipts and the original-evidence hash check are recorded in the coordinator's ignored `.cache/linux-ownership-fix.json`.

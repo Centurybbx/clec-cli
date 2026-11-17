@@ -9,11 +9,16 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
+from contextlib import contextmanager
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 UNIT_DIR = pathlib.Path(__file__).resolve().parent
 FIXTURES_DIR = UNIT_DIR / "fixtures"
-CACHE_ROOT = REPO_ROOT / ".cache" / "phase6-linux-arm64"
+CACHE_ROOT = None
+RUN = None
+OWNER_LABEL = "org.clec.linux-arm64.run"
 
 PINNED_IMAGES = {
     "builder_rust": {
@@ -33,7 +38,90 @@ PINNED_IMAGES = {
     },
 }
 
-CARGO_VOLUME = "clec-linux-arm64-cargo"
+class VerificationRun:
+    def __init__(self, root):
+        self.root = pathlib.Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = self.root / ".driver.lock"
+        self.lock_fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            manifest = self.root / "run.json"
+            if manifest.exists():
+                record = json.loads(manifest.read_text())
+                self.id = record["runId"]
+                if record.get("schemaVersion") != 1 or not re.fullmatch(r"[0-9a-f]{32}", self.id):
+                    raise RuntimeError("Invalid verification run identity")
+                if record.get("root") != str(self.root):
+                    raise RuntimeError("Verification run root changed")
+            else:
+                if set(self.root.iterdir()) != {self.lock}:
+                    raise RuntimeError("Existing output directory has no run identity")
+                self.id = uuid.uuid4().hex
+                with manifest.open("x") as fh:
+                    json.dump({"schemaVersion": 1, "runId": self.id, "root": str(self.root)}, fh)
+            self.resources = self.root / "resources"
+            self.resources.mkdir(exist_ok=True)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def volume(self):
+        return f"clec-linux-arm64-{self.id}-cargo"
+
+    def close(self):
+        os.close(self.lock_fd)
+        self.lock.unlink()
+
+    @contextmanager
+    def unit(self, name):
+        marker = self.root / f"unit-{name}.started"
+        with marker.open("x") as fh:
+            fh.write(name + "\n")
+        yield
+        with (self.root / f"unit-{name}.completed").open("x") as fh:
+            fh.write(name + "\n")
+
+    def container_command(self, cmd):
+        if cmd[:2] != ["docker", "run"]:
+            return cmd
+        cmd = list(cmd)
+        if "--name" in cmd:
+            idx = cmd.index("--name") + 1
+            cmd[idx] = f"{cmd[idx]}-{self.id}"
+        cid = self.resources / f"{uuid.uuid4().hex}.cid"
+        return cmd[:2] + ["--label", f"{OWNER_LABEL}={self.id}", "--cidfile", str(cid)] + cmd[2:]
+
+    def inspect_owned(self, kind, identity):
+        res = subprocess.run(["docker", kind, "inspect", identity], text=True, capture_output=True, timeout=30)
+        if res.returncode:
+            if "no such container" in res.stderr.lower() or "no such volume" in res.stderr.lower():
+                return None
+            raise RuntimeError(f"Cannot establish resource ownership: {res.stderr}")
+        obj = json.loads(res.stdout)[0]
+        labels = obj.get("Config", {}).get("Labels", {}) if kind == "container" else obj.get("Labels", {})
+        if not labels or labels.get(OWNER_LABEL) != self.id:
+            raise RuntimeError(f"Resource ownership mismatch: {identity}")
+        return obj
+
+    def cleanup_resources(self):
+        containers = []
+        for cid_file in sorted(self.resources.glob("*.cid")):
+            identity = cid_file.read_text().strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", identity):
+                raise RuntimeError(f"Invalid recorded container ID: {cid_file}")
+            if self.inspect_owned("container", identity) is not None:
+                run_checked(["docker", "rm", "-f", identity])
+                containers.append(identity)
+        volumes = []
+        if self.inspect_owned("volume", self.volume) is not None:
+            run_checked(["docker", "volume", "rm", self.volume])
+            volumes.append(self.volume)
+        return containers, volumes
+
+
+def run_process(cmd, **kwargs):
+    return subprocess.run(RUN.container_command(cmd) if RUN else cmd, timeout=kwargs.pop("timeout", 3600), **kwargs)
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -45,7 +133,7 @@ def sha256_file(path: pathlib.Path) -> str:
 
 
 def run_checked(cmd, cwd=None, capture=True):
-    res = subprocess.run(cmd, cwd=cwd, text=True, capture_output=capture)
+    res = run_process(cmd, cwd=cwd, text=True, capture_output=capture)
     if res.returncode != 0:
         raise RuntimeError(
             f"Command failed ({res.returncode}): {' '.join(cmd)}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
@@ -54,7 +142,7 @@ def run_checked(cmd, cwd=None, capture=True):
 
 
 def ensure_dirs():
-    for sub in ("logs", "logs/build", "logs/fixtures", "logs/glibc", "logs/musl", "receipts", "bin", "releases"):
+    for sub in ("logs", "logs/build", "logs/fixtures", "receipts", "bin", "releases"):
         (CACHE_ROOT / sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -96,7 +184,10 @@ def unit_build():
     if native_hashes.get("native/Cargo.lock") != repo_lock_sha:
         raise RuntimeError("Exported Cargo.lock SHA-256 mismatch")
 
-    run_checked(["docker", "volume", "create", CARGO_VOLUME])
+    if RUN.inspect_owned("volume", RUN.volume) is not None:
+        raise RuntimeError("Build volume already exists")
+    run_checked(["docker", "volume", "create", "--label", f"{OWNER_LABEL}={RUN.id}", RUN.volume])
+    RUN.inspect_owned("volume", RUN.volume)
 
     bin_dir = CACHE_ROOT / "bin"
     release_out = bin_dir / "release"
@@ -128,7 +219,6 @@ cargo test --manifest-path /src/native/Cargo.toml --locked -j 2
 echo "===TEST_DONE==="
 """
     cname = "clec-linux-arm64-builder"
-    subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
 
     docker_cmd = [
         "docker",
@@ -143,7 +233,7 @@ echo "===TEST_DONE==="
         "-v",
         f"{src_export}:/src:ro",
         "-v",
-        f"{CARGO_VOLUME}:/work:rw",
+        f"{RUN.volume}:/work:rw",
         "-v",
         f"{bin_dir}:/out:rw",
         "-e",
@@ -159,7 +249,7 @@ echo "===TEST_DONE==="
         "-c",
         container_script,
     ]
-    res = subprocess.run(docker_cmd, text=True, capture_output=True)
+    res = run_process(docker_cmd, text=True, capture_output=True)
     (CACHE_ROOT / "logs" / "build" / "builder.stdout.log").write_text(res.stdout, encoding="utf-8")
     (CACHE_ROOT / "logs" / "build" / "builder.stderr.log").write_text(res.stderr, encoding="utf-8")
     if res.returncode != 0:
@@ -236,8 +326,8 @@ echo "===TEST_DONE==="
         "containerCargoTestFailed": total_failed,
         "binaries": elf_checks,
         "logs": {
-            "stdout": ".cache/phase6-linux-arm64/logs/build/builder.stdout.log",
-            "stderr": ".cache/phase6-linux-arm64/logs/build/builder.stderr.log",
+            "stdout": str(CACHE_ROOT / "logs/build/builder.stdout.log"),
+            "stderr": str(CACHE_ROOT / "logs/build/builder.stderr.log"),
         },
     }
     (CACHE_ROOT / "receipts" / "container-build-observation.json").write_text(
@@ -319,7 +409,6 @@ def unit_stage():
     if prov["provenanceClassification"] != "inspected-prebuilt":
         raise RuntimeError("Expected inspected-prebuilt provenance classification")
 
-    # Verify SKILL.md and README.md byte equality inside npm tarball and consumer archive
     inspect_tmp = CACHE_ROOT / "stage-inspect-tmp"
     if inspect_tmp.exists():
         shutil.rmtree(inspect_tmp)
@@ -438,7 +527,6 @@ cp /tmp/pub-b.json /releases/publish-b.json
     )
     (CACHE_ROOT / "logs" / "fixtures" / "publish.log").write_text(res.stdout + res.stderr, encoding="utf-8")
 
-    # Create corrupt release-b copy (tampered corpus.sqlite.zst)
     corrupt_dir = rel_dir / "release-b-corrupt"
     shutil.copytree(rel_dir / "release-b", corrupt_dir)
     zst_path = corrupt_dir / "corpus.sqlite.zst"
@@ -518,7 +606,7 @@ def unit_guests():
             "-c",
             "mkdir -p /tmp/clec-home && node /verify/guest_verify.mjs",
         ]
-        res = subprocess.run(cmd, text=True, capture_output=True)
+        res = run_process(cmd, text=True, capture_output=True)
         (out_dir / "runner.stdout.log").write_text(res.stdout, encoding="utf-8")
         (out_dir / "runner.stderr.log").write_text(res.stderr, encoding="utf-8")
         if res.returncode != 0:
@@ -533,26 +621,14 @@ def unit_guests():
 
 
 def unit_cleanup():
-    # Remove only task-owned containers, volume, and regenerable intermediate dirs after retaining binaries/logs/receipts/staged outputs
-    ps = run_checked(["docker", "ps", "-a", "--format", "{{.Names}}"]).stdout.splitlines()
-    removed_containers = []
-    for name in ps:
-        if name.startswith("clec-linux-arm64-"):
-            run_checked(["docker", "rm", "-f", name])
-            removed_containers.append(name)
-
-    vols = run_checked(["docker", "volume", "ls", "--format", "{{.Name}}"]).stdout.splitlines()
-    removed_volumes = []
-    if CARGO_VOLUME in vols:
-        run_checked(["docker", "volume", "rm", CARGO_VOLUME])
-        removed_volumes.append(CARGO_VOLUME)
+    removed_containers, removed_volumes = RUN.cleanup_resources()
 
     removed_dirs = []
     for sub in ("src-export", "maintainer-bin", "consumer-bin", "docker-cfg"):
         p = CACHE_ROOT / sub
         if p.exists():
             shutil.rmtree(p)
-            removed_dirs.append(str(p.relative_to(REPO_ROOT)))
+            removed_dirs.append(str(p.relative_to(CACHE_ROOT)))
 
     summary = {
         "unit": "cleanup",
@@ -565,29 +641,31 @@ def unit_cleanup():
 
 
 def main():
+    global CACHE_ROOT, RUN
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--unit",
         choices=["build", "stage", "fixtures", "guests", "cleanup", "all"],
         default="all",
     )
+    parser.add_argument("--run-root", type=pathlib.Path, help="Dedicated run directory; completed or failed units cannot be repeated here")
     args = parser.parse_args()
-    if args.unit == "build":
-        unit_build()
-    elif args.unit == "stage":
-        unit_stage()
-    elif args.unit == "fixtures":
-        unit_fixtures()
-    elif args.unit == "guests":
-        unit_guests()
-    elif args.unit == "cleanup":
-        unit_cleanup()
+    if args.run_root is None:
+        parent = REPO_ROOT / ".cache" / "phase6-linux-arm64-runs"
+        parent.mkdir(parents=True, exist_ok=True)
+        root = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=parent))
     else:
-        unit_build()
-        unit_stage()
-        unit_fixtures()
-        unit_guests()
-        unit_cleanup()
+        root = args.run_root
+    RUN = VerificationRun(root)
+    CACHE_ROOT = RUN.root
+    print(json.dumps({"runId": RUN.id, "runRoot": str(CACHE_ROOT)}), flush=True)
+    units = {"build": unit_build, "stage": unit_stage, "fixtures": unit_fixtures, "guests": unit_guests, "cleanup": unit_cleanup}
+    try:
+        for name in units if args.unit == "all" else (args.unit,):
+            with RUN.unit(name):
+                units[name]()
+    finally:
+        RUN.close()
 
 
 if __name__ == "__main__":
