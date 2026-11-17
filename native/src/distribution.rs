@@ -1,27 +1,24 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[cfg(any(test, feature = "test-hooks"))]
-use std::cell::RefCell;
-use std::sync::Arc;
-#[cfg(any(test, feature = "test-hooks"))]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::thread;
-
-use reqwest::blocking::{Client, ClientBuilder, Response};
-use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, LOCATION};
-use reqwest::{StatusCode, Url, redirect, retry};
+use reqwest::Url;
+use reqwest::header::LOCATION;
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
     CORPUS_FORMAT, ClecError, DICTIONARY_REVISION, EQUIVALENCE_REVISION, ErrorCode,
     NORMALIZATION_REVISION, SCHEMA_VERSION, SEGMENTATION_REVISION, TOKENIZATION_REVISION,
     hex_encode,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::http_transport::current_test_hooks;
+use crate::http_transport::{
+    AddressFailureReason, DnsFailureReason, EncodingFailureReason, HttpRequest,
+    RedirectFailureReason, RemoteTransfer, SendReadFailureReason, SetupFailureReason,
+    TransferEvent, TransferLimits, TransportFailure, WorkerContext, is_localhost_domain,
+    is_loopback_literal_host,
 };
 use crate::snapshot::{ReleaseManifest, file_size_and_sha256, map_io};
 
@@ -160,23 +157,6 @@ pub(crate) fn validate_remote_url(raw: &str, err_code: ErrorCode) -> Result<Url,
         .map_err(|_| ClecError::new(err_code, "Expected a valid absolute HTTP(S) URL."))?;
     check_remote_url_policy(&url, err_code)?;
     Ok(url)
-}
-
-fn is_localhost_domain(url: &Url) -> bool {
-    url.host_str()
-        .is_some_and(|h| h.eq_ignore_ascii_case("localhost"))
-}
-
-fn is_loopback_literal_host(host: &str) -> bool {
-    if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        return v4.is_loopback();
-    }
-    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-        && let Ok(v6) = inner.parse::<Ipv6Addr>()
-    {
-        return v6.is_loopback();
-    }
-    false
 }
 
 fn check_remote_url_policy(url: &Url, err_code: ErrorCode) -> Result<(), ClecError> {
@@ -430,9 +410,9 @@ pub(crate) fn read_bounded_bytes<R: Read>(
 fn ensure_localhost_loopback_with<F>(
     url: &Url,
     resolver: F,
-) -> Result<Option<Vec<SocketAddr>>, ClecError>
+) -> Result<Option<Vec<std::net::SocketAddr>>, ClecError>
 where
-    F: FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>>,
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<std::net::SocketAddr>>,
 {
     if url.scheme() != "http" || !is_localhost_domain(url) {
         return Ok(None);
@@ -457,172 +437,6 @@ where
     Ok(Some(addrs))
 }
 
-fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    Ok((host, port).to_socket_addrs()?.collect())
-}
-
-#[derive(Debug)]
-struct ImmediateFailResolver;
-
-impl reqwest::dns::Resolve for ImmediateFailResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
-        Box::pin(std::future::ready(Err(Box::new(io::Error::other(format!(
-            "Unpinned DNS resolution refused for '{host}'"
-        )))
-            as Box<dyn std::error::Error + Send + Sync>)))
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) type ResolveHookFn = Arc<dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync>;
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, Default)]
-pub(crate) struct TestTransferHooks {
-    pub resolve_hook: Option<ResolveHookFn>,
-    pub client_setup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub pre_completion_cleanup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub worker_spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub worker_exit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub chunks_sent_count: Option<Arc<AtomicUsize>>,
-    pub on_chunk_consumed: Option<Arc<dyn Fn(usize) + Send + Sync>>,
-    pub drop_before_finished: bool,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-thread_local! {
-    static ACTIVE_TEST_HOOKS: RefCell<Option<TestTransferHooks>> = const { RefCell::new(None) };
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) struct TestHooksGuard {
-    prev: Option<TestTransferHooks>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl Drop for TestHooksGuard {
-    fn drop(&mut self) {
-        let prev = self.prev.take();
-        ACTIVE_TEST_HOOKS.with(|slot| {
-            *slot.borrow_mut() = prev;
-        });
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn install_test_hooks_guard(hooks: TestTransferHooks) -> TestHooksGuard {
-    let prev = ACTIVE_TEST_HOOKS.with(|slot| slot.borrow_mut().replace(hooks));
-    TestHooksGuard { prev }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn current_test_hooks() -> TestTransferHooks {
-    ACTIVE_TEST_HOOKS.with(|slot| slot.borrow().clone().unwrap_or_default())
-}
-
-#[cfg(test)]
-pub(crate) fn system_resolve_for_test(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    system_resolve(host, port)
-}
-
-#[cfg(feature = "test-hooks")]
-fn append_hook_log(path: Option<&Path>, line: &str) {
-    if let Some(p) = path
-        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p)
-    {
-        let _ = writeln!(f, "{line}");
-    }
-}
-
-#[cfg(feature = "test-hooks")]
-pub(crate) fn install_fixture_hooks_guard(
-    resolver_delay_ms: Option<u64>,
-    resolver_delay_host: Option<String>,
-    setup_delay_ms: Option<u64>,
-    cleanup_delay_ms: Option<u64>,
-    hook_log_path: Option<PathBuf>,
-) -> TestHooksGuard {
-    let log_for_resolve = hook_log_path.clone();
-    let resolve_hook: Option<ResolveHookFn> =
-        if resolver_delay_ms.is_some() || log_for_resolve.is_some() {
-            Some(Arc::new(move |host: &str, port: u16| {
-                append_hook_log(
-                    log_for_resolve.as_deref(),
-                    &format!("resolve_enter:{host}:{port}"),
-                );
-                let host_matches = resolver_delay_host
-                    .as_deref()
-                    .is_none_or(|target| target.eq_ignore_ascii_case(host));
-                if host_matches && let Some(ms) = resolver_delay_ms {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-                append_hook_log(
-                    log_for_resolve.as_deref(),
-                    &format!("resolve_exit:{host}:{port}"),
-                );
-                system_resolve(host, port)
-            }))
-        } else {
-            None
-        };
-
-    let log_for_setup = hook_log_path.clone();
-    let client_setup_hook: Option<Arc<dyn Fn() + Send + Sync>> =
-        if setup_delay_ms.is_some() || log_for_setup.is_some() {
-            Some(Arc::new(move || {
-                append_hook_log(log_for_setup.as_deref(), "setup_enter");
-                if let Some(ms) = setup_delay_ms {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-                append_hook_log(log_for_setup.as_deref(), "setup_exit");
-            }))
-        } else {
-            None
-        };
-
-    let log_for_cleanup = hook_log_path.clone();
-    let pre_completion_cleanup_hook: Option<Arc<dyn Fn() + Send + Sync>> =
-        if cleanup_delay_ms.is_some() || log_for_cleanup.is_some() {
-            Some(Arc::new(move || {
-                append_hook_log(log_for_cleanup.as_deref(), "cleanup_enter");
-                if let Some(ms) = cleanup_delay_ms {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-                append_hook_log(log_for_cleanup.as_deref(), "cleanup_exit");
-            }))
-        } else {
-            None
-        };
-
-    let log_for_spawn = hook_log_path;
-    let worker_spawn_hook: Option<Arc<dyn Fn() + Send + Sync>> = log_for_spawn.map(|p| {
-        Arc::new(move || {
-            append_hook_log(Some(&p), "worker_spawn");
-        }) as Arc<dyn Fn() + Send + Sync>
-    });
-
-    install_test_hooks_guard(TestTransferHooks {
-        resolve_hook,
-        client_setup_hook,
-        pre_completion_cleanup_hook,
-        worker_spawn_hook,
-        ..Default::default()
-    })
-}
-
-fn resolve_host_for_worker(
-    host: &str,
-    port: u16,
-    #[cfg(any(test, feature = "test-hooks"))] hooks: &TestTransferHooks,
-) -> io::Result<Vec<SocketAddr>> {
-    #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(hook) = hooks.resolve_hook.as_ref() {
-        return hook(host, port);
-    }
-    system_resolve(host, port)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferPhase {
     Manifest,
@@ -645,670 +459,251 @@ impl TransferPhase {
     }
 }
 
-struct TransferRequest {
-    initial_url: Url,
-    policy: TransferPolicy,
-    phase: TransferPhase,
-    deadline: Instant,
-    max_body_bytes: u64,
-    #[cfg(any(test, feature = "test-hooks"))]
-    hooks: TestTransferHooks,
-}
-
-enum TransferEvent {
-    Head {
-        final_url: Url,
-        content_length: Option<u64>,
-    },
-    Chunk(Vec<u8>),
-    Finished(Result<(), ClecError>),
-}
-
-struct RemoteTransfer {
-    rx: Option<mpsc::Receiver<TransferEvent>>,
-    cancel: Arc<AtomicBool>,
-    deadline: Instant,
-    phase: TransferPhase,
-    safe_url: String,
-    finished: bool,
-}
-
-impl Drop for RemoteTransfer {
-    fn drop(&mut self) {
-        self.cancel_and_disconnect();
-    }
-}
-
-impl RemoteTransfer {
-    fn start(request: TransferRequest) -> Result<Self, ClecError> {
-        let safe_url = redact_url_for_error(&request.initial_url);
-        let phase = request.phase;
-        let deadline = request.deadline;
-        if Instant::now() >= deadline {
-            return Err(ClecError::new(
-                ErrorCode::TransferTimeout,
-                format!("{} transfer timed out for {safe_url}.", phase.title()),
-            ));
-        }
-
-        let (tx, rx) = mpsc::sync_channel::<TransferEvent>(1);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(hook) = request.hooks.worker_spawn_hook.as_ref() {
-            hook();
-        }
-
-        let handle = thread::Builder::new()
-            .name(format!("clec-transfer-{}", phase.label()))
-            .spawn(move || run_transfer_worker(request, worker_cancel, tx))
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!(
-                        "Failed to start {} transfer worker for {safe_url}: {e}",
-                        phase.label()
-                    ),
-                )
-            })?;
-        drop(handle);
-
-        Ok(Self {
-            rx: Some(rx),
-            cancel,
-            deadline,
-            phase,
-            safe_url,
-            finished: false,
-        })
-    }
-
-    fn timeout_err(&self) -> ClecError {
-        ClecError::new(
+fn map_transport_failure(err: TransportFailure, phase: TransferPhase, safe_url: &str) -> ClecError {
+    let label = phase.label();
+    let title = phase.title();
+    match err {
+        TransportFailure::Timeout => ClecError::new(
             ErrorCode::TransferTimeout,
-            format!(
-                "{} transfer timed out for {}.",
-                self.phase.title(),
-                self.safe_url
-            ),
-        )
-    }
-
-    fn cancel_and_disconnect(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        self.rx.take();
-    }
-
-    fn recv_event(&mut self) -> Result<TransferEvent, ClecError> {
-        if self.finished {
-            return Err(ClecError::new(
-                ErrorCode::TransferFailed,
-                format!(
-                    "{} transfer stream already finished for {}.",
-                    self.phase.label(),
-                    self.safe_url
-                ),
-            ));
-        }
-        let now = Instant::now();
-        let Some(remaining) = self.deadline.checked_duration_since(now) else {
-            self.cancel_and_disconnect();
-            return Err(self.timeout_err());
-        };
-        if remaining.is_zero() {
-            self.cancel_and_disconnect();
-            return Err(self.timeout_err());
-        }
-        let Some(rx) = self.rx.as_ref() else {
-            self.cancel_and_disconnect();
-            return Err(self.timeout_err());
-        };
-        match rx.recv_timeout(remaining) {
-            Ok(event) => {
-                if Instant::now() >= self.deadline {
-                    self.cancel_and_disconnect();
-                    return Err(self.timeout_err());
-                }
-                match &event {
-                    TransferEvent::Head { final_url, .. } => {
-                        self.safe_url = redact_url_for_error(final_url);
-                    }
-                    TransferEvent::Finished(_) => {
-                        self.finished = true;
-                    }
-                    TransferEvent::Chunk(_) => {}
-                }
-                Ok(event)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.cancel_and_disconnect();
-                Err(self.timeout_err())
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.cancel_and_disconnect();
-                if Instant::now() >= self.deadline {
-                    Err(self.timeout_err())
-                } else {
-                    Err(ClecError::new(
-                        ErrorCode::TransferFailed,
-                        format!(
-                            "{} transfer worker disconnected unexpectedly for {}.",
-                            self.phase.label(),
-                            self.safe_url
-                        ),
-                    ))
-                }
-            }
-        }
-    }
-
-    fn recv_head(&mut self) -> Result<(Url, Option<u64>), ClecError> {
-        match self.recv_event()? {
-            TransferEvent::Head {
-                final_url,
-                content_length,
-            } => Ok((final_url, content_length)),
-            TransferEvent::Finished(Err(err)) => Err(err),
-            TransferEvent::Finished(Ok(())) | TransferEvent::Chunk(_) => Err(ClecError::new(
-                ErrorCode::TransferFailed,
-                format!(
-                    "{} transfer ended before response headers for {}.",
-                    self.phase.label(),
-                    self.safe_url
-                ),
-            )),
-        }
-    }
-}
-
-fn check_worker_active(
-    cancel: &AtomicBool,
-    deadline: Instant,
-    phase: TransferPhase,
-    safe_url: &str,
-) -> Result<Duration, ClecError> {
-    if cancel.load(Ordering::SeqCst) {
-        return Err(ClecError::new(
-            ErrorCode::TransferTimeout,
-            format!("{} transfer timed out for {safe_url}.", phase.title()),
-        ));
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(ClecError::new(
-            ErrorCode::TransferTimeout,
-            format!("{} transfer timed out for {safe_url}.", phase.title()),
-        ));
-    }
-    Ok(remaining)
-}
-
-fn is_literal_ip_host(host: &str) -> bool {
-    if host.parse::<Ipv4Addr>().is_ok() {
-        return true;
-    }
-    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        return inner.parse::<Ipv6Addr>().is_ok();
-    }
-    false
-}
-
-fn resolve_and_pin_hop(
-    url: &Url,
-    safe_url: &str,
-    cancel: &AtomicBool,
-    deadline: Instant,
-    phase: TransferPhase,
-    #[cfg(any(test, feature = "test-hooks"))] hooks: &TestTransferHooks,
-) -> Result<Option<(String, Vec<SocketAddr>)>, ClecError> {
-    let Some(host) = url.host_str().filter(|h| !h.is_empty()) else {
-        return Err(ClecError::new(
+            format!("{title} transfer timed out for {safe_url}."),
+        ),
+        TransportFailure::Cancelled => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("{label} transfer cancelled for {safe_url}."),
+        ),
+        TransportFailure::SpawnFailed => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Failed to start {label} transfer worker for {safe_url}."),
+        ),
+        TransportFailure::Disconnected => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("{label} transfer worker disconnected unexpectedly for {safe_url}."),
+        ),
+        TransportFailure::Dns(DnsFailureReason::MissingHost) => ClecError::new(
             ErrorCode::TransferFailed,
             format!("URL missing host for {safe_url}."),
-        ));
-    };
-    if is_literal_ip_host(host) {
-        return Ok(None);
-    }
-
-    let default_port = if url.scheme() == "https" { 443 } else { 80 };
-    let port = url.port_or_known_default().unwrap_or(default_port);
-    let res = resolve_host_for_worker(
-        host,
-        port,
-        #[cfg(any(test, feature = "test-hooks"))]
-        hooks,
-    );
-    check_worker_active(cancel, deadline, phase, safe_url)?;
-    let addrs = res.map_err(|e| {
-        ClecError::new(
+        ),
+        TransportFailure::Dns(DnsFailureReason::ResolveError) => ClecError::new(
             ErrorCode::TransferFailed,
-            format!("Failed to resolve {host} for {safe_url}: {e}"),
-        )
-    })?;
-    if addrs.is_empty() {
-        return Err(ClecError::new(
+            format!("Failed to resolve host for {safe_url}."),
+        ),
+        TransportFailure::Dns(DnsFailureReason::EmptyAddresses) => ClecError::new(
             ErrorCode::TransferFailed,
             format!("DNS resolution returned no addresses for {safe_url}."),
-        ));
-    }
-    if url.scheme() == "http" && !addrs.iter().all(|addr| addr.ip().is_loopback()) {
-        return Err(ClecError::new(
+        ),
+        TransportFailure::AddressPolicy(AddressFailureReason::DisallowedUrl) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Disallowed URL policy for {safe_url}."),
+        ),
+        TransportFailure::AddressPolicy(AddressFailureReason::NonLoopbackHttp) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Refusing plain HTTP to non-loopback address for {safe_url}."),
+        ),
+        TransportFailure::AddressPolicy(AddressFailureReason::UnpinnedRemote) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Connected address did not match resolved host addresses for {safe_url}."),
+        ),
+        #[cfg(any(test, feature = "test-hooks"))]
+        TransportFailure::Setup(SetupFailureReason::InvalidFixtureCert) => ClecError::new(
+            ErrorCode::InternalError,
+            "Invalid fixture root certificate PEM.",
+        ),
+        TransportFailure::Setup(SetupFailureReason::ClientBuildFailed) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("HTTP client initialization failed for {safe_url}."),
+        ),
+        TransportFailure::SendOrRead(
+            SendReadFailureReason::SendFailed | SendReadFailureReason::ReadFailed,
+        ) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("{label} transfer failed for {safe_url}."),
+        ),
+        TransportFailure::Encoding(EncodingFailureReason::InvalidHeader) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Invalid Content-Encoding header during {label} fetch from {safe_url}."),
+        ),
+        TransportFailure::Encoding(EncodingFailureReason::NonIdentity) => ClecError::new(
             ErrorCode::TransferFailed,
             format!(
-                "Refusing plain HTTP for {safe_url}: localhost resolved to non-loopback address."
+                "Unsupported Content-Encoding during {label} fetch from {safe_url}; expected identity."
             ),
-        ));
-    }
-    Ok(Some((host.to_owned(), addrs)))
-}
-
-fn build_hop_client(
-    connect_timeout: Duration,
-    pinned: Option<&(String, Vec<SocketAddr>)>,
-    #[cfg(any(test, feature = "test-hooks"))] extra_root_pem: Option<&[u8]>,
-    #[cfg(any(test, feature = "test-hooks"))] hooks: &TestTransferHooks,
-) -> Result<Client, ClecError> {
-    let mut builder = ClientBuilder::new()
-        .no_proxy()
-        .dns_resolver(Arc::new(ImmediateFailResolver))
-        .redirect(redirect::Policy::none())
-        .retry(retry::never())
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .no_zstd()
-        .connect_timeout(connect_timeout)
-        .user_agent(concat!("clec/", env!("CARGO_PKG_VERSION")));
-
-    if let Some((domain, addrs)) = pinned {
-        builder = builder.resolve_to_addrs(domain, addrs);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(pem) = extra_root_pem {
-        let certs = reqwest::Certificate::from_pem_bundle(pem).map_err(|e| {
-            ClecError::new(
-                ErrorCode::InternalError,
-                format!("Invalid fixture root certificate PEM: {e}"),
-            )
-        })?;
-        builder = builder.tls_certs_merge(certs);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(hook) = hooks.client_setup_hook.as_ref() {
-        hook();
-    }
-
-    builder.build().map_err(|e| {
-        ClecError::new(
+        ),
+        TransportFailure::RedirectPolicy(RedirectFailureReason::TooMany) => ClecError::new(
             ErrorCode::TransferFailed,
-            format!("HTTP client initialization failed: {}", e.without_url()),
-        )
-    })
-}
-
-fn is_reqwest_timeout(err: &reqwest::Error) -> bool {
-    if err.is_timeout() {
-        return true;
-    }
-    let mut source = std::error::Error::source(err);
-    while let Some(cause) = source {
-        if let Some(io_err) = cause.downcast_ref::<io::Error>()
-            && io_err.kind() == io::ErrorKind::TimedOut
-        {
-            return true;
-        }
-        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>()
-            && req_err.is_timeout()
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-    false
-}
-
-fn format_reqwest_error_without_url(err: reqwest::Error) -> (bool, String) {
-    let timed_out = is_reqwest_timeout(&err);
-    let stripped = err.without_url();
-    let mut parts = vec![stripped.to_string()];
-    let mut cur: Option<&dyn std::error::Error> = std::error::Error::source(&stripped);
-    while let Some(src) = cur {
-        let s = src.to_string();
-        if !s.is_empty() && !parts.contains(&s) {
-            parts.push(s);
-        }
-        cur = src.source();
-    }
-    (timed_out, parts.join(": "))
-}
-
-fn classify_reqwest_err(
-    err: reqwest::Error,
-    deadline: Instant,
-    phase: &str,
-    safe_url: &str,
-) -> ClecError {
-    let (req_timed_out, detail) = format_reqwest_error_without_url(err);
-    let timed_out = req_timed_out || Instant::now() >= deadline;
-    if timed_out {
-        ClecError::new(
-            ErrorCode::TransferTimeout,
-            format!("{phase} transfer timed out for {safe_url}: {detail}"),
-        )
-    } else {
-        ClecError::new(
+            format!(
+                "Exceeded maximum of {MAX_REDIRECTS} HTTP redirects during {label} fetch from {safe_url}."
+            ),
+        ),
+        TransportFailure::RedirectPolicy(RedirectFailureReason::MissingLocation) => ClecError::new(
             ErrorCode::TransferFailed,
-            format!("{phase} transfer failed for {safe_url}: {detail}"),
-        )
-    }
-}
-
-fn classify_io_transfer_err(
-    err: &io::Error,
-    deadline: Instant,
-    phase: &str,
-    safe_url: &str,
-) -> ClecError {
-    let reqwest_timeout = err
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
-        .is_some_and(is_reqwest_timeout);
-    if err.kind() == io::ErrorKind::TimedOut || reqwest_timeout || Instant::now() >= deadline {
-        ClecError::new(
-            ErrorCode::TransferTimeout,
-            format!("{phase} transfer timed out for {safe_url}."),
-        )
-    } else {
-        ClecError::new(
+            format!("HTTP redirect missing Location header from {safe_url}."),
+        ),
+        TransportFailure::RedirectPolicy(RedirectFailureReason::InvalidLocation) => ClecError::new(
             ErrorCode::TransferFailed,
-            format!("{phase} transfer failed for {safe_url}: {err}"),
-        )
-    }
-}
-
-fn is_redirect_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    )
-}
-
-fn validate_response_encoding(
-    resp: &Response,
-    phase: &str,
-    safe_url: &str,
-) -> Result<(), ClecError> {
-    for val in resp.headers().get_all(CONTENT_ENCODING) {
-        let s = val.to_str().map_err(|_| {
+            format!("Invalid redirect Location header from {safe_url}."),
+        ),
+        TransportFailure::RedirectPolicy(RedirectFailureReason::Fragment) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Redirect target from {safe_url} must not contain a URL fragment."),
+        ),
+        TransportFailure::RedirectPolicy(RedirectFailureReason::MalformedLocation) => {
             ClecError::new(
                 ErrorCode::TransferFailed,
-                format!("Invalid Content-Encoding header during {phase} fetch from {safe_url}."),
+                format!("Malformed redirect Location header from {safe_url}."),
             )
-        })?;
-        for part in s.split(',') {
-            let trimmed = part.trim();
-            if !trimmed.eq_ignore_ascii_case("identity") {
-                return Err(ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!(
-                        "Unsupported Content-Encoding '{trimmed}' during {phase} fetch from {safe_url}; expected identity."
-                    ),
-                ));
-            }
         }
-    }
-    Ok(())
-}
-
-struct WorkerExitNotifier {
-    #[cfg(any(test, feature = "test-hooks"))]
-    hook: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl Drop for WorkerExitNotifier {
-    fn drop(&mut self) {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(hook) = self.hook.take() {
-            hook();
+        TransportFailure::RedirectPolicy(RedirectFailureReason::DisallowedTarget) => {
+            ClecError::new(
+                ErrorCode::TransferFailed,
+                format!("Redirect target violated URL policy from {safe_url}."),
+            )
         }
+        TransportFailure::RedirectPolicy(RedirectFailureReason::HttpsDowngrade) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Refusing HTTPS-to-HTTP redirect downgrade from {safe_url}."),
+        ),
+        TransportFailure::HttpStatus(status) => ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("HTTP {status} during {label} fetch from {safe_url}."),
+        ),
+        TransportFailure::InvalidRequest => ClecError::new(
+            ErrorCode::InternalError,
+            "Invalid HTTP request variant for GET transfer session.",
+        ),
     }
 }
 
-fn run_transfer_worker(
-    request: TransferRequest,
-    cancel: Arc<AtomicBool>,
-    tx: mpsc::SyncSender<TransferEvent>,
-) {
-    let _exit_guard = WorkerExitNotifier {
-        #[cfg(any(test, feature = "test-hooks"))]
-        hook: request.hooks.worker_exit_hook.clone(),
+fn run_get_session(request: HttpRequest, ctx: &WorkerContext) -> Result<(), TransportFailure> {
+    let HttpRequest::Get { url } = request else {
+        return Err(TransportFailure::InvalidRequest);
     };
-
-    let result = run_transfer_session(&request, &cancel, &tx);
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    if request.hooks.drop_before_finished {
-        return;
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    if !cancel.load(Ordering::SeqCst)
-        && let Some(hook) = request.hooks.pre_completion_cleanup_hook.as_ref()
-    {
-        hook();
-    }
-
-    let _ = tx.send(TransferEvent::Finished(result));
-}
-
-fn run_transfer_session(
-    request: &TransferRequest,
-    cancel: &AtomicBool,
-    tx: &mpsc::SyncSender<TransferEvent>,
-) -> Result<(), ClecError> {
-    let mut current_url = request.initial_url.clone();
-    let phase = request.phase;
-    let phase_label = phase.label();
+    let mut current_url = url;
 
     for hop in 0..=MAX_REDIRECTS {
-        let safe_url = redact_url_for_error(&current_url);
-        check_worker_active(cancel, request.deadline, phase, &safe_url)?;
-        check_remote_url_policy(&current_url, ErrorCode::TransferFailed)?;
-
-        let pinned = resolve_and_pin_hop(
-            &current_url,
-            &safe_url,
-            cancel,
-            request.deadline,
-            phase,
-            #[cfg(any(test, feature = "test-hooks"))]
-            &request.hooks,
-        )?;
-        let remaining = check_worker_active(cancel, request.deadline, phase, &safe_url)?;
-        let connect_timeout = request.policy.connect_timeout.min(remaining);
-
-        let client = build_hop_client(
-            connect_timeout,
-            pinned.as_ref(),
-            #[cfg(any(test, feature = "test-hooks"))]
-            request.policy.extra_root_pem.as_deref(),
-            #[cfg(any(test, feature = "test-hooks"))]
-            &request.hooks,
-        )?;
-        let remaining = check_worker_active(cancel, request.deadline, phase, &safe_url)?;
-
-        let resp = client
-            .get(current_url.clone())
-            .header(ACCEPT_ENCODING, "identity")
-            .timeout(remaining)
-            .send()
-            .map_err(|e| classify_reqwest_err(e, request.deadline, phase_label, &safe_url))?;
-        check_worker_active(cancel, request.deadline, phase, &safe_url)?;
-
-        if let Some(remote_addr) = resp.remote_addr() {
-            if current_url.scheme() == "http" && !remote_addr.ip().is_loopback() {
-                return Err(ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!("Plain HTTP connected to non-loopback address for {safe_url}."),
-                ));
-            }
-            if let Some((_, addrs)) = pinned.as_ref()
-                && !addrs.iter().any(|a| a.ip() == remote_addr.ip())
-            {
-                return Err(ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!(
-                        "Connected address did not match resolved host addresses for {safe_url}."
-                    ),
-                ));
-            }
+        ctx.check_active()?;
+        if check_remote_url_policy(&current_url, ErrorCode::TransferFailed).is_err() {
+            return Err(TransportFailure::RedirectPolicy(
+                RedirectFailureReason::DisallowedTarget,
+            ));
         }
 
+        let resp = ctx.send(HttpRequest::Get {
+            url: current_url.clone(),
+        })?;
         let status = resp.status();
-        if is_redirect_status(status) {
+
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if hop == MAX_REDIRECTS {
-                return Err(ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!(
-                        "Exceeded maximum of {MAX_REDIRECTS} HTTP redirects during {phase_label} fetch from {safe_url}."
-                    ),
+                return Err(TransportFailure::RedirectPolicy(
+                    RedirectFailureReason::TooMany,
                 ));
             }
-            let location_header = resp.headers().get(LOCATION).ok_or_else(|| {
-                ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!("HTTP {status} redirect missing Location header from {safe_url}."),
-                )
-            })?;
+            let location_header =
+                resp.headers()
+                    .get(LOCATION)
+                    .ok_or(TransportFailure::RedirectPolicy(
+                        RedirectFailureReason::MissingLocation,
+                    ))?;
             let location_str = location_header.to_str().map_err(|_| {
-                ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!("Invalid redirect Location header from {safe_url}."),
-                )
+                TransportFailure::RedirectPolicy(RedirectFailureReason::InvalidLocation)
             })?;
             if location_str.contains('#') {
-                return Err(ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!("Redirect target from {safe_url} must not contain a URL fragment."),
+                return Err(TransportFailure::RedirectPolicy(
+                    RedirectFailureReason::Fragment,
                 ));
             }
-            let next_url = current_url.join(location_str).map_err(|_| {
-                ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!("Malformed redirect Location header from {safe_url}."),
-                )
+            let next_url = resp.url().join(location_str).map_err(|_| {
+                TransportFailure::RedirectPolicy(RedirectFailureReason::MalformedLocation)
             })?;
-            check_remote_url_policy(&next_url, ErrorCode::TransferFailed)?;
+            if check_remote_url_policy(&next_url, ErrorCode::TransferFailed).is_err() {
+                return Err(TransportFailure::RedirectPolicy(
+                    RedirectFailureReason::DisallowedTarget,
+                ));
+            }
             if current_url.scheme() == "https" && next_url.scheme() != "https" {
-                return Err(ClecError::new(
-                    ErrorCode::TransferFailed,
-                    format!("Refusing HTTPS-to-HTTP redirect downgrade from {safe_url}."),
+                return Err(TransportFailure::RedirectPolicy(
+                    RedirectFailureReason::HttpsDowngrade,
                 ));
             }
             drop(resp);
-            drop(client);
-            check_worker_active(
-                cancel,
-                request.deadline,
-                phase,
-                &redact_url_for_error(&next_url),
-            )?;
+            ctx.check_active()?;
             current_url = next_url;
             continue;
         }
 
-        if status != StatusCode::OK {
-            return Err(ClecError::new(
-                ErrorCode::TransferFailed,
-                format!(
-                    "HTTP {} during {phase_label} fetch from {safe_url}.",
-                    status.as_u16()
-                ),
-            ));
+        if status != 200 {
+            return Err(TransportFailure::HttpStatus(status));
         }
 
-        validate_response_encoding(&resp, phase_label, &safe_url)?;
-        check_worker_active(cancel, request.deadline, phase, &safe_url)?;
-
-        let content_length = resp.content_length();
-        if tx
-            .send(TransferEvent::Head {
-                final_url: current_url.clone(),
-                content_length,
-            })
-            .is_err()
-        {
-            return Err(ClecError::new(
-                ErrorCode::TransferFailed,
-                format!("{phase_label} transfer cancelled by caller for {safe_url}."),
-            ));
-        }
-
-        return stream_response_body(resp, request, cancel, tx, &safe_url);
+        return ctx.stream(resp);
     }
 
-    Err(ClecError::new(
-        ErrorCode::TransferFailed,
-        format!("Redirect loop exceeded during {phase_label} fetch."),
+    Err(TransportFailure::RedirectPolicy(
+        RedirectFailureReason::TooMany,
     ))
 }
 
-fn stream_response_body(
-    mut resp: Response,
-    request: &TransferRequest,
-    cancel: &AtomicBool,
-    tx: &mpsc::SyncSender<TransferEvent>,
-    safe_url: &str,
-) -> Result<(), ClecError> {
-    let phase = request.phase;
-    let phase_label = phase.label();
-    let mut buf = vec![0u8; 65_536];
-    let mut sent_bytes = 0u64;
+fn start_get_transfer(
+    url: &Url,
+    phase: TransferPhase,
+    deadline: Instant,
+    max_body_bytes: u64,
+    transfer_policy: &TransferPolicy,
+    #[cfg(any(test, feature = "test-hooks"))] hooks: crate::http_transport::TestTransferHooks,
+) -> Result<(RemoteTransfer, String), ClecError> {
+    let safe_url = redact_url_for_error(url);
+    let limits = TransferLimits {
+        deadline,
+        connect_timeout: transfer_policy.connect_timeout,
+        max_body_bytes,
+        #[cfg(any(test, feature = "test-hooks"))]
+        extra_root_pem: transfer_policy.extra_root_pem.clone(),
+        #[cfg(any(test, feature = "test-hooks"))]
+        hooks,
+    };
+    let transfer = RemoteTransfer::start(
+        HttpRequest::Get { url: url.clone() },
+        limits,
+        run_get_session,
+    )
+    .map_err(|err| map_transport_failure(err, phase, &safe_url))?;
+    Ok((transfer, safe_url))
+}
 
-    loop {
-        check_worker_active(cancel, request.deadline, phase, safe_url)?;
-        let remaining_limit = request.max_body_bytes.saturating_sub(sent_bytes);
-        if remaining_limit == 0 {
-            break;
-        }
-        let to_read = (remaining_limit.min(buf.len() as u64)) as usize;
-        let n = match resp.read(&mut buf[..to_read]) {
-            Ok(n) => n,
-            Err(e) => {
-                return Err(classify_io_transfer_err(
-                    &e,
-                    request.deadline,
-                    phase_label,
+fn recv_get_head(
+    transfer: &mut RemoteTransfer,
+    phase: TransferPhase,
+    safe_url: &mut String,
+) -> Result<(Url, Option<u64>), ClecError> {
+    match transfer
+        .recv_event()
+        .map_err(|err| map_transport_failure(err, phase, safe_url))?
+    {
+        TransferEvent::Head {
+            final_url,
+            status,
+            content_length,
+        } => {
+            *safe_url = redact_url_for_error(&final_url);
+            if status != 200 {
+                return Err(map_transport_failure(
+                    TransportFailure::HttpStatus(status),
+                    phase,
                     safe_url,
                 ));
             }
-        };
-        if n == 0 {
-            break;
+            Ok((final_url, content_length))
         }
-        check_worker_active(cancel, request.deadline, phase, safe_url)?;
-        sent_bytes = sent_bytes.saturating_add(n as u64);
-        if tx.send(TransferEvent::Chunk(buf[..n].to_vec())).is_err() {
-            return Err(ClecError::new(
-                ErrorCode::TransferFailed,
-                format!("{phase_label} transfer cancelled by caller for {safe_url}."),
-            ));
-        }
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(counter) = request.hooks.chunks_sent_count.as_ref() {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }
+        TransferEvent::Finished(Err(err)) => Err(map_transport_failure(err, phase, safe_url)),
+        TransferEvent::Finished(Ok(())) | TransferEvent::Chunk(_) => Err(ClecError::new(
+            ErrorCode::TransferFailed,
+            format!(
+                "{} transfer ended before response headers for {}.",
+                phase.label(),
+                safe_url
+            ),
+        )),
     }
-
-    Ok(())
 }
 
 fn resolve_remote_artifact_url(
@@ -1395,17 +790,18 @@ pub(crate) fn load_manifest(
             #[cfg(any(test, feature = "test-hooks"))]
             let hooks = current_test_hooks();
 
-            let mut transfer = RemoteTransfer::start(TransferRequest {
-                initial_url: url.clone(),
-                policy: transfer_policy.clone(),
-                phase: TransferPhase::Manifest,
+            let (mut transfer, mut safe_url) = start_get_transfer(
+                url,
+                TransferPhase::Manifest,
                 deadline,
-                max_body_bytes: (MAX_MANIFEST_BYTES as u64) + 1,
+                (MAX_MANIFEST_BYTES as u64) + 1,
+                transfer_policy,
                 #[cfg(any(test, feature = "test-hooks"))]
-                hooks: hooks.clone(),
-            })?;
+                hooks.clone(),
+            )?;
 
-            let (final_url, content_length) = transfer.recv_head()?;
+            let (final_url, content_length) =
+                recv_get_head(&mut transfer, TransferPhase::Manifest, &mut safe_url)?;
             if let Some(len) = content_length
                 && len > MAX_MANIFEST_BYTES as u64
             {
@@ -1417,7 +813,10 @@ pub(crate) fn load_manifest(
 
             let mut manifest_raw = Vec::new();
             loop {
-                match transfer.recv_event()? {
+                match transfer
+                    .recv_event()
+                    .map_err(|err| map_transport_failure(err, TransferPhase::Manifest, &safe_url))?
+                {
                     TransferEvent::Chunk(chunk) => {
                         #[cfg(any(test, feature = "test-hooks"))]
                         if let Some(cb) = hooks.on_chunk_consumed.as_ref() {
@@ -1432,7 +831,13 @@ pub(crate) fn load_manifest(
                         manifest_raw.extend_from_slice(&chunk);
                     }
                     TransferEvent::Finished(Ok(())) => break,
-                    TransferEvent::Finished(Err(err)) => return Err(err),
+                    TransferEvent::Finished(Err(err)) => {
+                        return Err(map_transport_failure(
+                            err,
+                            TransferPhase::Manifest,
+                            &safe_url,
+                        ));
+                    }
                     TransferEvent::Head { .. } => {
                         return Err(ClecError::new(
                             ErrorCode::TransferFailed,
@@ -1501,17 +906,18 @@ pub(crate) fn acquire_artifact(
             #[cfg(any(test, feature = "test-hooks"))]
             let hooks = current_test_hooks();
 
-            let mut transfer = RemoteTransfer::start(TransferRequest {
-                initial_url: url.clone(),
-                policy: transfer_policy.clone(),
-                phase: TransferPhase::Artifact,
+            let (mut transfer, mut safe_url) = start_get_transfer(
+                url,
+                TransferPhase::Artifact,
                 deadline,
-                max_body_bytes: expected_bytes.saturating_add(1),
+                expected_bytes.saturating_add(1),
+                transfer_policy,
                 #[cfg(any(test, feature = "test-hooks"))]
-                hooks: hooks.clone(),
-            })?;
+                hooks.clone(),
+            )?;
 
-            let (_, content_length) = transfer.recv_head()?;
+            let (_, content_length) =
+                recv_get_head(&mut transfer, TransferPhase::Artifact, &mut safe_url)?;
             if let Some(declared_len) = content_length
                 && declared_len != expected_bytes
             {
@@ -1537,7 +943,10 @@ pub(crate) fn acquire_artifact(
             let mut hasher = Sha256::new();
             let mut total = 0u64;
             loop {
-                match transfer.recv_event()? {
+                match transfer
+                    .recv_event()
+                    .map_err(|err| map_transport_failure(err, TransferPhase::Artifact, &safe_url))?
+                {
                     TransferEvent::Chunk(chunk) => {
                         #[cfg(any(test, feature = "test-hooks"))]
                         if let Some(cb) = hooks.on_chunk_consumed.as_ref() {
@@ -1560,7 +969,13 @@ pub(crate) fn acquire_artifact(
                         dst.write_all(&chunk).map_err(map_io)?;
                     }
                     TransferEvent::Finished(Ok(())) => break,
-                    TransferEvent::Finished(Err(err)) => return Err(err),
+                    TransferEvent::Finished(Err(err)) => {
+                        return Err(map_transport_failure(
+                            err,
+                            TransferPhase::Artifact,
+                            &safe_url,
+                        ));
+                    }
                     TransferEvent::Head { .. } => {
                         return Err(ClecError::new(
                             ErrorCode::TransferFailed,
@@ -1601,12 +1016,15 @@ pub(crate) fn acquire_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_transport::{
+        TestTransferHooks, install_test_hooks_guard, system_resolve_for_test,
+    };
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Cursor};
-    use std::net::{IpAddr, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::Ordering;
-    use std::sync::{Condvar, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
 
     struct TestLatch {

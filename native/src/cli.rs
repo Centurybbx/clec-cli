@@ -359,7 +359,7 @@ pub fn run_cli_with_test_options(options: TestFixtureOptions) -> i32 {
             extra_root_pem: options.extra_root_pem,
         },
     };
-    let _hooks_guard = crate::distribution::install_fixture_hooks_guard(
+    let _hooks_guard = crate::http_transport::install_fixture_hooks_guard(
         options.resolver_delay_ms,
         options.resolver_delay_host,
         options.setup_delay_ms,
