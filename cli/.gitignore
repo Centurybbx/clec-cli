@@ -1,5 +1,7 @@
 node_modules/
-dist/
+artifacts/
+payloads/
+inventory.json
 *.tgz
 .env
 .env.*

@@ -1,78 +1,53 @@
-# CLEC offline evidence search
+# CLEC native evidence CLI (`@clec/cli`)
 
-The CLI searches CLEC evidence with BM25 and reads exact original text. The host agent plans follow-up queries, compares sources, and writes the answer. Node.js 22.19.0 or later is required.
+`clec` searches `clec-native-v2` corpora with BM25 + RRF and reads exact verbatim UTF-8 text and byte spans. The host agent plans queries, follows links, and writes answers.
 
-## Install and start
+## Local installation from a staged tarball
 
-Install the release tarball. This package is not published to the npm registry. Installation requires network access for npm dependencies or a prepared npm cache. After installation and corpus sync, search and reads run offline without Python, an API key, or a server.
+Staged npm packages install a native binary into package-local `bin/clec.exe` during `npm install`. After installation completes, `clec` runs without Node.js, Python, or a background server.
 
 ```sh
-npm install --prefix /tmp/clec https://github.com/Centurybbx/clec-cli/releases/download/v0.3.0/clec-cli-0.3.0.tgz
-/tmp/clec/node_modules/.bin/clec --help
-/tmp/clec/node_modules/.bin/clec sync --manifest /absolute/path/to/release/manifest.json
-/tmp/clec/node_modules/.bin/clec guide research
+npm install --global /path/to/staged/clec-cli-1.0.0-dev.0.tgz
+clec --version
+clec schema
+clec status
 ```
 
-No public corpus manifest endpoint is supplied. Obtain a publisher manifest separately. Choose a corpus directory with `--data-dir PATH` or `CLEC_DATA_DIR`; the default is `~/.local/share/clec`. Repeat `clec sync` to use the last successful origin.
+Installing with `--ignore-scripts` is unsupported for the aggregate npm package because the shipped placeholder at `bin/clec.exe` requires the `postinstall` verification and copy step. Use the per-target archive (`clec-v1.0.0-dev.0-<tuple>.tar.gz` or `.zip`) when lifecycle scripts are disabled.
+
+No public corpus manifest endpoint is configured (`defaultConfigured: false`, `providerVerified: false`). Obtain a `clec-native-v2` publisher manifest and synchronize explicitly:
 
 ```sh
-clec coverage --format json
-clec sources '退休' --format json
-clec search '退休 生活費' --format json
-clec search '退休 現金' --match all --format json
-clec source 'RELEASE:SOURCE' --limit 20 --format json
-clec read 'RELEASE:SECTION' --context 1 --format json
-clec find '每年提領' --format json
-clec read-range 'RELEASE:SOURCE' --start 0 --end 200 --format json
+clec sync --manifest /absolute/path/to/release/manifest.json
+clec search '退休 提領' --offline
+clec sources '退休' --canonical-only
+clec read '<PassageId>' --context 1
+clec read '<SourceId>' --original --find '每年提領'
 ```
 
-Copy real references from returned results. A reference binds a section or source to the active release SHA-256. Updating the corpus makes old references unavailable. Restart discovery and pagination after `VERSION_UNAVAILABLE`.
+## Cache directory ownership
 
-## Search and read contracts
+Data directory precedence is `--data-dir PATH`, then nonempty `CLEC_DATA_DIR`, then the platform default:
 
-Search normalizes traditional and simplified characters and uses SQLite FTS5 BM25 with title weight 4 and section text weight 1. Source and date filters apply to all matching sections. Each source contributes at most `--per-source` sections, default two, selected by BM25. Results sort by ascending SQLite BM25 score, then section ID; lower scores rank first. Pagination follows this per-source cap across the complete filtered match set. This preserves the 0.2 BM25 ranking and pagination behavior.
+- Unix: `~/.local/share/clec/native-v2`
+- Windows: `%LOCALAPPDATA%\clec\native-v2` (with `%USERPROFILE%\AppData\Local\clec\native-v2` fallback)
 
-A null `page.nextOffset` exhausts the matches allowed by these options; it does not establish that no other relevant evidence exists. There is no fixed candidate limit. Repeat identical options with `--release HASH` when paging. Date filters exclude unknown dates. `coverage` reports admission outcomes, quality labels, extraction diagnostics, and unknown dates.
+Commands `schema`, `--help`, and `--version` work without a home directory. Legacy directories containing a `current` marker are rejected before sync mutation; pass a separate `--data-dir` rather than sharing a legacy cache.
 
-`--match any` uses token OR; `--match all` uses token AND. Neither is phrase matching. Queries allow 1..512 UTF-16 units and at most 64 distinct tokens. Search uses literal token overlap and cannot discover evidence solely through conceptual similarity. Vary terminology and follow source references across multiple rounds. There is no search mode option. Existing format 1 corpora remain searchable; new publications use format 3. Trial format 2 is rejected explicitly and must be rebuilt.
+## Skill and discovery
 
-`find` uses exact original substrings without normalization. It reports original UTF-16 offsets and overlapping section references. `read-range` accepts a source reference and an interval of 1..20000 UTF-16 units. It rejects intervals that split a surrogate pair.
+The distributable agent Skill lives at `skills/clec/SKILL.md`. Neither `npm` install hooks nor `clec` write into user-global Skill directories automatically. Copy `skills/clec/SKILL.md` manually into your host Skill directory if desired.
 
-`read` returns exact originals and up to two neighboring sections on each side. Each context section carries its own reference. Subtitle originals retain timestamps and markup. Cue metadata reports subtitle-file times and original text offsets; these times are not verified video seek locations. Partial cue extraction retains the whole original for search and reads, with diagnostics in read metadata and coverage.
+## Staged local packaging and maintainer binaries
 
-Source metadata distinguishes unverified transcripts, mixed summary pages, and introductions with comments. Source type and quality labels never establish who spoke. Repeated editions and pages describing one episode are not independent witnesses. Search previews help navigation; cite text actually read.
-
-## Output and lifecycle
-
-Text is the default, including in pipes. Explicit JSON produces one stdout document with `{schemaVersion:1,ok:true,command,data}`. Errors leave stdout empty and write `{schemaVersion:1,ok:false,command,error}` to stderr. Single and batch `read` results always use `data.items`. A batch preserves input order and duplicates and fails atomically.
+Build native binaries from `native/` without `test-hooks`, then stage archives and the npm tarball into a new directory:
 
 ```sh
-clec search '退休 提領' --limit 3 --format json |
-  jq -r '.data.hits[].ref' |
-  clec read --stdin --format json
-```
-
-Handle an empty hit list before calling `read --stdin`. Stdin accepts 1..50 newline references and at most 64 KiB. `clec help COMMAND` lists bounds and options. Run `clec guide research` for the packaged multi-round evidence workflow.
-
-Sync verifies one SQLite artifact, including its exact schema, source identities and hashes, complete section coverage, and format 3 extraction metadata/cues, before atomically activating it. Failed transfer or validation retains the previous active release. Artifacts are capped at 2 GiB. Incoming transfer requires its bytes plus 5 GiB reserve. The CLI keeps only the current corpus and does not promise archival reference retention.
-
-Exit codes are 0 for success, 2 for invalid input, 3 for unavailable data, 4 for transfer or filesystem failures, 5 for package integrity failures, 1 for unexpected errors, and 130 for interruption.
-
-## Build a publisher release
-
-From the repository root:
-
-```sh
-npm ci --prefix cli
-npm run typecheck --prefix cli
+cargo build --manifest-path native/Cargo.toml --locked --release --bins
+node cli/scripts/stage.mjs --input /path/to/inputs.json --output /path/to/staged --allow-partial
 npm test --prefix cli
-node cli/dist/publisher.js \
-  --workspace "$PWD" \
-  --intake /absolute/path/to/intake.json \
-  --output /absolute/path/to/new-release
-npm pack ./cli
 ```
 
-The publisher requires a new output directory and an intake with `schemaVersion: 1` and a `sources` array. Each source records `path`, `title`, `type`, `quality`, and `status`; known dates require `date` and `dateBasis`. It admits ready UTF-8 `.md`, `.txt`, `.srt`, `.str`, and `.vtt` sources. Subtitle files need at least one usable cue. Unsupported formats require upstream text extraction. Quarantine, missing files, unsupported encodings, empty sources, and metadata-only records remain visible in inventory rather than silently becoming evidence. Optional `--artifact-url URL` sets the manifest download URL.
+Use `--allow-partial` only for local non-publishable staging when fewer than all five target tuples (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`) are present. Production staging rejects incomplete inventories.
 
-Tests use tiny authored fixtures to verify build, sync, search, exact reads, subtitle diagnostics, rollback, and format compatibility. They do not establish full-corpus retrieval quality or support for untested platforms.
+Maintainer corpus tools (`clec-publish` and `clec-validate`) ship in separate maintainer archives and are excluded from consumer packages. Recorded repository metadata (`Centurybbx/clec-cli`) and distribution licensing remain unverified for public release.

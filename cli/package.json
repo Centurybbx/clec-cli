@@ -1,31 +1,24 @@
 {
   "name": "@clec/cli",
-  "version": "0.3.0",
-  "description": "Offline CLEC evidence search and exact source reads",
+  "version": "1.0.0-dev.0",
+  "description": "Offline CLEC evidence search, exact byte-span reads, and static snapshot sync",
   "type": "module",
   "bin": {
-    "clec": "dist/cli.js"
-  },
-  "engines": {
-    "node": ">=22.19.0"
+    "clec": "bin/clec.exe"
   },
   "files": [
-    "dist/*.js",
-    "docs/*.md"
+    "bin/clec.exe",
+    "scripts/install.mjs",
+    "scripts/targets.mjs",
+    "skills/clec/SKILL.md",
+    "NOTICES.md",
+    "README.md",
+    "inventory.json",
+    "payloads/"
   ],
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "build:corpus": "node dist/publisher.js",
-    "prepare": "npm run build",
+    "postinstall": "node scripts/install.mjs",
     "test": "node --test test/*.test.mjs"
-  },
-  "dependencies": {
-    "opencc-js": "1.0.5"
-  },
-  "devDependencies": {
-    "@types/node": "25.5.0",
-    "typescript": "5.9.3"
   },
   "repository": {
     "type": "git",
