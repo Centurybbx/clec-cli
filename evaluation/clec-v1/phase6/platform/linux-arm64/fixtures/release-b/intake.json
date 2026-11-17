@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "works": [
+    {
+      "key": "work-update",
+      "title": "Release B 更新測試"
+    }
+  ],
+  "sources": [
+    {
+      "work": "work-update",
+      "path": "update.txt",
+      "title": "Release B 更新文件",
+      "role": "document",
+      "attribution": "authored_fixture",
+      "quality": "fixture",
+      "status": "ready",
+      "date": "2026-02-01",
+      "dateBasis": "authored_fixture"
+    }
+  ]
+}
