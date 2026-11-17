@@ -750,6 +750,8 @@ pub enum ErrorCode {
     UnsupportedFeature,
     OfflineRequired,
     OutputBudgetTooSmall,
+    InvalidJevConfig,
+    Sag2BudgetExhausted,
     NoData,
     VersionUnavailable,
     EvidenceNotFound,
@@ -757,9 +759,11 @@ pub enum ErrorCode {
     InvalidDataDir,
     TransferFailed,
     TransferTimeout,
+    JevHttpStatus,
     IoError,
     InvalidPackage,
     IntegrityMismatch,
+    JevInvalidResponse,
     InvalidManifest,
     EmptyCorpus,
     OutputExists,
@@ -775,16 +779,20 @@ impl ErrorCode {
             | Self::InvalidReference
             | Self::UnsupportedFeature
             | Self::OfflineRequired
-            | Self::OutputBudgetTooSmall => 2,
+            | Self::OutputBudgetTooSmall
+            | Self::InvalidJevConfig
+            | Self::Sag2BudgetExhausted => 2,
             Self::NoData | Self::VersionUnavailable | Self::EvidenceNotFound => 3,
             Self::SyncLocked
             | Self::InvalidDataDir
             | Self::TransferFailed
             | Self::TransferTimeout
+            | Self::JevHttpStatus
             | Self::IoError
             | Self::OutputExists => 4,
             Self::InvalidPackage
             | Self::IntegrityMismatch
+            | Self::JevInvalidResponse
             | Self::InvalidManifest
             | Self::EmptyCorpus
             | Self::UnsafePath => 5,
@@ -812,6 +820,12 @@ impl ErrorCode {
             Self::OutputBudgetTooSmall => {
                 "Increase --max-bytes so at least the response envelope and one whole result fit."
             }
+            Self::InvalidJevConfig => {
+                "Configure a valid HTTPS or literal-loopback JEV_BASE_URL, JEV_MODEL, and matching API credential (--key-file, OPENROUTER_API_KEY, or JEV_API_KEY)."
+            }
+            Self::Sag2BudgetExhausted => {
+                "Reduce query scope, candidate size, or retry ordinary local `clec search`."
+            }
             Self::NoData => {
                 "Run `clec sync --manifest PATH_OR_HTTPS_URL` to install a corpus snapshot."
             }
@@ -830,8 +844,9 @@ impl ErrorCode {
             Self::TransferFailed => {
                 "Verify network connectivity, TLS certificates, and the manifest or artifact URL, then retry."
             }
-            Self::TransferTimeout => {
-                "Check network latency against transfer deadlines and retry `clec sync`."
+            Self::TransferTimeout => "Check network latency against transfer deadlines and retry.",
+            Self::JevHttpStatus => {
+                "Check Jev endpoint status and credentials, or retry ordinary local `clec search`."
             }
             Self::IoError => {
                 "Check filesystem paths, permissions, and available disk space, then retry."
@@ -841,6 +856,9 @@ impl ErrorCode {
             }
             Self::IntegrityMismatch => {
                 "Re-run `clec sync --manifest PATH_OR_HTTPS_URL` from an unmodified publisher release."
+            }
+            Self::JevInvalidResponse => {
+                "Inspect the Jev endpoint protocol compatibility; the provider returned a malformed or policy-invalid response."
             }
             Self::InvalidManifest => {
                 "Fix the manifest or intake JSON fields and rebuild the release."
@@ -865,10 +883,44 @@ impl ErrorCode {
             Self::VersionUnavailable => "clec status",
             Self::EvidenceNotFound => "clec sources",
             Self::OutputBudgetTooSmall => "clec search QUERY --max-bytes 65536",
-            Self::InvalidArgument | Self::UnsupportedFeature => "clec schema",
+            Self::InvalidArgument | Self::UnsupportedFeature | Self::InvalidJevConfig => {
+                "clec schema"
+            }
+            Self::Sag2BudgetExhausted | Self::JevHttpStatus | Self::JevInvalidResponse => {
+                "clec search QUERY"
+            }
             _ => "clec status",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Sag2Stage {
+    Init,
+    InitialRetrieval,
+    InitialScoring,
+    ExpansionTerms,
+    ExpansionRetrieval,
+    ExpansionScoring,
+    DppRanking,
+    Materialization,
+    OutputBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Sag2ErrorContext {
+    pub completed_stage: Sag2Stage,
+    pub rounds_completed: usize,
+    pub http_attempts: usize,
+    pub successful_batches: usize,
+    pub scored_occurrences: usize,
+    pub sql_candidate_queries: usize,
+    pub df_lookups_distinct: usize,
+    pub request_bytes: usize,
+    pub response_bytes: usize,
+    pub estimated_token_units: usize,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -877,6 +929,7 @@ pub struct ClecError {
     pub code: ErrorCode,
     pub message: String,
     pub input_index: Option<usize>,
+    pub sag2_stage: Option<Box<Sag2ErrorContext>>,
 }
 
 impl ClecError {
@@ -885,11 +938,17 @@ impl ClecError {
             code,
             message: message.into(),
             input_index: None,
+            sag2_stage: None,
         }
     }
 
     pub fn with_input_index(mut self, index: usize) -> Self {
         self.input_index = Some(index);
+        self
+    }
+
+    pub fn with_sag2_stage(mut self, stage: Sag2ErrorContext) -> Self {
+        self.sag2_stage = Some(Box::new(stage));
         self
     }
 }
@@ -903,6 +962,8 @@ pub struct ErrorBody {
     pub next: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sag2_stage: Option<Sag2ErrorContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -926,6 +987,7 @@ impl ErrorEnvelope {
                 remedy: err.code.remedy().to_owned(),
                 next: err.code.next_action().to_owned(),
                 input_index: err.input_index,
+                sag2_stage: err.sag2_stage.as_deref().cloned(),
             },
         }
     }

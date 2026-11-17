@@ -5,5 +5,6 @@ pub(crate) mod http_transport;
 pub(crate) mod ingest;
 pub(crate) mod lexical;
 pub(crate) mod retrieval;
+pub(crate) mod sag2;
 pub mod snapshot;
 pub(crate) mod store;
