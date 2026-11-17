@@ -14,6 +14,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -33,6 +34,7 @@ import {
   PACKAGE_NAME,
   PACKAGE_VERSION,
   TARGET_MATRIX,
+  findTargetByPlatformArch,
   findTargetByTuple,
 } from '../scripts/targets.mjs';
 
@@ -726,3 +728,467 @@ test(
     }
   },
 );
+
+test(
+  'real binary inspection against unrelated checkout, unexecuted command, and stale new-HEAD checkout never promotes build provenance',
+  { skip: !existsSync(REAL_CLEC) },
+  () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'clec-misattribution-'));
+    try {
+      const unrelatedRepo = join(tmp, 'unrelated-repo');
+      mkdirSync(join(unrelatedRepo, 'native'), { recursive: true });
+      copyFileSync(join(REPO_ROOT, 'native', 'Cargo.lock'), join(unrelatedRepo, 'native', 'Cargo.lock'));
+      writeFileSync(join(unrelatedRepo, 'native', 'Cargo.toml'), '[package]\nname = "clec-native"\nversion = "1.0.0-dev.0"\n');
+      execFileSync('git', ['-C', unrelatedRepo, 'init']);
+      execFileSync('git', ['-C', unrelatedRepo, 'add', '.']);
+      execFileSync('git', ['-C', unrelatedRepo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'unrelated root without build.rs']);
+      const unrelatedCommit = execFileSync('git', ['-C', unrelatedRepo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+      const receiptPath = join(tmp, 'inspected-receipt.json');
+      const receipt = captureBuildReceipt({
+        tuple: 'darwin-arm64',
+        repoRoot: unrelatedRepo,
+        clec: REAL_CLEC,
+        toolchain: '1.89.0',
+        buildCommand: 'this command was never executed',
+        hostBaseline: 'darwin-arm64',
+        out: receiptPath,
+      });
+
+      assert.equal(receipt.schemaVersion, 2);
+      assert.equal(receipt.receiptKind, 'clec-inspected-prebuilt-receipt');
+      assert.equal('sourceCommit' in receipt, false);
+      assert.equal('sourceDirty' in receipt, false);
+      assert.equal('buildCommand' in receipt, false);
+      assert.equal(receipt.provenance.source.status, 'not_verified_unknown');
+      assert.equal(receipt.provenance.buildInvocation.status, 'not_verified_unknown');
+      assert.equal(receipt.captureObservation.observedGit.commit, unrelatedCommit);
+      assert.equal(receipt.captureObservation.observedGit.dirty, false);
+      assert.equal(receipt.captureObservation.declaredBuildCommand, 'this command was never executed');
+
+      const stageInput = join(tmp, 'stage-input.json');
+      writeFileSync(
+        stageInput,
+        JSON.stringify({
+          targets: { 'darwin-arm64': { clec: REAL_CLEC, buildReceipt: receiptPath } },
+        }),
+      );
+      const stagedOut = join(tmp, 'staged');
+      stageRelease({ input: stageInput, output: stagedOut, allowPartial: true }, CLI_ROOT);
+
+      const provenance = JSON.parse(readFileSync(join(stagedOut, 'provenance.json'), 'utf8'));
+      const inventory = JSON.parse(readFileSync(join(stagedOut, 'inventory.json'), 'utf8'));
+      assert.equal(provenance.schemaVersion, 2);
+      assert.equal(provenance.publishable, false);
+      assert.equal(provenance.provenanceClassification, 'inspected-prebuilt');
+      assert.equal(provenance.provenance.source.status, 'not_verified_unknown');
+      assert.equal(provenance.provenance.buildInvocation.status, 'not_verified_unknown');
+      assert.equal('sourceCommit' in provenance, false);
+      assert.equal('buildCommand' in provenance, false);
+      assert.equal(inventory.schemaVersion, 2);
+      assert.equal(inventory.targets['darwin-arm64'].provenance.source.status, 'not_verified_unknown');
+      assert.equal(inventory.targets['darwin-arm64'].provenance.buildInvocation.status, 'not_verified_unknown');
+
+      writeFileSync(join(unrelatedRepo, 'README.md'), 'new head same Cargo.lock\n');
+      execFileSync('git', ['-C', unrelatedRepo, 'add', 'README.md']);
+      execFileSync('git', ['-C', unrelatedRepo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'new head same lock']);
+      const newHeadCommit = execFileSync('git', ['-C', unrelatedRepo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const staleReceipt = captureBuildReceipt({
+        tuple: 'darwin-arm64',
+        repoRoot: unrelatedRepo,
+        clec: REAL_CLEC,
+        toolchain: '1.89.0',
+      });
+      assert.equal(staleReceipt.receiptKind, 'clec-inspected-prebuilt-receipt');
+      assert.equal(staleReceipt.provenance.source.status, 'not_verified_unknown');
+      assert.equal(staleReceipt.captureObservation.observedGit.commit, newHeadCommit);
+
+      assert.throws(
+        () =>
+          captureBuildReceipt({
+            tuple: 'darwin-arm64',
+            repoRoot: unrelatedRepo,
+            clec: REAL_CLEC,
+            buildCommand: 'unknown',
+          }),
+        /Invalid or unknown value/,
+      );
+
+      assert.throws(
+        () =>
+          stageRelease(
+            {
+              input: stageInput,
+              output: join(tmp, 'cli-override-fail'),
+              allowPartial: true,
+              sourceCommit: unrelatedCommit,
+            },
+            CLI_ROOT,
+          ),
+        /inspected-prebuilt|not_verified_unknown/,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  },
+);
+
+test('controlled --run-build establishes git source and executed cargo argv while rejecting path/command overrides, build failures, and mid-build checkout mutation', () => {
+  const hostMeta = findTargetByPlatformArch(process.platform, process.arch);
+  assert.ok(hostMeta, `Expected supported host target for ${process.platform}-${process.arch}`);
+  const tmp = mkdtempSync(join(tmpdir(), 'clec-controlled-build-'));
+  try {
+    const repo = join(tmp, 'repo');
+    const nativeDir = join(repo, 'native');
+    mkdirSync(join(nativeDir, 'src', 'bin'), { recursive: true });
+
+    writeFileSync(
+      join(nativeDir, 'Cargo.toml'),
+      `[package]
+name = "${NATIVE_CRATE_NAME}"
+version = "${PACKAGE_VERSION}"
+edition = "2021"
+
+[lib]
+name = "clec_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clec"
+path = "src/main.rs"
+
+[[bin]]
+name = "clec-publish"
+path = "src/bin/clec-publish.rs"
+
+[[bin]]
+name = "clec-validate"
+path = "src/bin/clec-validate.rs"
+`,
+    );
+    writeFileSync(
+      join(nativeDir, 'Cargo.lock'),
+      `# This file is automatically @generated by Cargo.\nversion = 3\n\n[[package]]\nname = "${NATIVE_CRATE_NAME}"\nversion = "${PACKAGE_VERSION}"\n`,
+    );
+    copyFileSync(join(REPO_ROOT, 'native', 'build.rs'), join(nativeDir, 'build.rs'));
+    copyFileSync(join(REPO_ROOT, 'native', 'src', 'build_identity.rs'), join(nativeDir, 'src', 'build_identity.rs'));
+    writeFileSync(join(nativeDir, 'src', 'lib.rs'), 'pub mod build_identity;\n');
+    const mkBinSrc = (kind) => `fn main() {\n  clec_core::build_identity::retain(clec_core::clec_build_identity!("${kind}"));\n}\n`;
+    writeFileSync(join(nativeDir, 'src', 'main.rs'), mkBinSrc('clec'));
+    writeFileSync(join(nativeDir, 'src', 'bin', 'clec-publish.rs'), mkBinSrc('clec-publish'));
+    writeFileSync(join(nativeDir, 'src', 'bin', 'clec-validate.rs'), mkBinSrc('clec-validate'));
+
+    execFileSync('git', ['-C', repo, 'init']);
+    execFileSync('git', ['-C', repo, 'add', '.']);
+    execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init minimal crate']);
+    const headCommit = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+    const targetDir = join(tmp, 'target');
+    const receiptPath = join(tmp, 'controlled-receipt.json');
+    const receipt = captureBuildReceipt({
+      tuple: hostMeta.tuple,
+      targetDir,
+      repoRoot: repo,
+      runBuild: true,
+      toolchain: '1.89.0',
+      hostBaseline: `${hostMeta.tuple}-test`,
+      out: receiptPath,
+    });
+
+    assert.equal(receipt.schemaVersion, 2);
+    assert.equal(receipt.receiptKind, 'clec-controlled-build-receipt');
+    assert.equal('captureObservation' in receipt, false);
+    assert.equal(receipt.provenance.source.status, 'established_local_git_checkout');
+    assert.equal(receipt.provenance.source.sourceCommit, headCommit);
+    assert.equal(receipt.provenance.source.sourceDirty, false);
+    assert.equal(receipt.provenance.buildInvocation.status, 'established_local_cargo_execution');
+    assert.equal(receipt.provenance.buildInvocation.executable, 'cargo');
+    assert.ok(receipt.provenance.buildInvocation.argv.includes('--locked'));
+    assert.ok(receipt.provenance.buildInvocation.argv.includes('--release'));
+    assert.equal(receipt.provenance.buildInvocation.hostBaseline, `${hostMeta.tuple}-test`);
+
+    const builtClec = join(targetDir, 'release', hostMeta.binaryName);
+    const builtPub = join(targetDir, 'release', hostMeta.maintainerBinaries[0]);
+    const builtVal = join(targetDir, 'release', hostMeta.maintainerBinaries[1]);
+    assert.equal(receipt.artifacts.clec.sha256, sha256(readFileSync(builtClec)));
+
+    const stageInput = join(tmp, 'controlled-input.json');
+    writeFileSync(
+      stageInput,
+      JSON.stringify({
+        targets: {
+          [hostMeta.tuple]: {
+            clec: builtClec,
+            clecPublish: builtPub,
+            clecValidate: builtVal,
+            buildReceipt: receiptPath,
+          },
+        },
+      }),
+    );
+    const stagedDir = join(tmp, 'staged-controlled');
+    stageRelease({ input: stageInput, output: stagedDir, allowPartial: true }, CLI_ROOT);
+    const prov = JSON.parse(readFileSync(join(stagedDir, 'provenance.json'), 'utf8'));
+    assert.equal(prov.provenanceClassification, 'controlled-executed-build');
+    assert.equal(prov.provenance.source.status, 'established_local_git_checkout');
+    assert.equal(prov.provenance.source.sourceCommit, headCommit);
+    assert.equal(prov.provenance.buildInvocation.status, 'established_local_cargo_execution');
+
+    assert.throws(
+      () =>
+        captureBuildReceipt({
+          tuple: hostMeta.tuple,
+          targetDir,
+          repoRoot: repo,
+          runBuild: true,
+          clec: builtClec,
+        }),
+      /Cannot override/,
+    );
+    assert.throws(
+      () =>
+        captureBuildReceipt({
+          tuple: hostMeta.tuple,
+          targetDir,
+          repoRoot: repo,
+          runBuild: true,
+          buildCommand: 'custom fake command',
+        }),
+      /Cannot combine --run-build with --build-command/,
+    );
+
+    const buildRsOrig = readFileSync(join(nativeDir, 'build.rs'), 'utf8');
+    writeFileSync(
+      join(nativeDir, 'build.rs'),
+      `${buildRsOrig.replace('fn main() {', 'fn main() {\n    std::fs::write("mid-build-dirty.txt", "changed").unwrap();')}`,
+    );
+    execFileSync('git', ['-C', repo, 'add', 'native/build.rs']);
+    execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'mutate checkout during build']);
+    assert.throws(
+      () =>
+        captureBuildReceipt({
+          tuple: hostMeta.tuple,
+          targetDir,
+          repoRoot: repo,
+          runBuild: true,
+          toolchain: '1.89.0',
+        }),
+      /Source working tree changed during controlled build/,
+    );
+
+    writeFileSync(join(nativeDir, 'src', 'main.rs'), 'this is invalid rust syntax;\n');
+    assert.throws(() =>
+      captureBuildReceipt({
+        tuple: hostMeta.tuple,
+        targetDir,
+        repoRoot: repo,
+        runBuild: true,
+        toolchain: '1.89.0',
+      }),
+    );
+    assert.equal(existsSync(builtClec), false);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('admitTargetArtifacts and installer reject interpreted/malformed PT_INTERP ELFs, legacy receipt shapes, and promoted unknown provenance', async () => {
+  const { admitTargetArtifacts } = await import('../scripts/artifact-admission.mjs');
+  const tmp = mkdtempSync(join(tmpdir(), 'clec-union-boundary-'));
+  try {
+    for (const tuple of ['linux-x64', 'linux-arm64']) {
+      const meta = findTargetByTuple(tuple);
+      for (const interp of ['/lib/ld-musl-x86_64.so.1', '/custom/loader', '']) {
+        const binBytes = makeSyntheticBinary({ tuple, headerOptions: { interp } });
+        const binPath = join(tmp, `${tuple}-${interp.length}.bin`);
+        const receiptPath = join(tmp, `${tuple}-${interp.length}.receipt.json`);
+        writeFileSync(binPath, binBytes);
+        writeFileSync(
+          receiptPath,
+          JSON.stringify({
+            schemaVersion: 2,
+            receiptKind: 'clec-inspected-prebuilt-receipt',
+            trustModel: 'unsigned-inspected-prebuilt-receipt',
+            packageName: PACKAGE_NAME,
+            packageVersion: PACKAGE_VERSION,
+            tuple: meta.tuple,
+            rustTarget: meta.rustTarget,
+            provenance: {
+              source: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+              buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+            },
+            captureObservation: {
+              observedGit: null,
+              declaredBuildCommand: null,
+              declaredHostBaseline: null,
+            },
+            verifiedEmbeddedMetadata: {
+              cargoLockSha256: DEFAULT_LOCK_SHA,
+              rustcVersion: DEFAULT_RUSTC,
+              profile: 'release',
+              features: [],
+              testHooksIncluded: false,
+            },
+            artifacts: {
+              clec: {
+                kind: 'clec',
+                binaryName: meta.binaryName,
+                bytes: binBytes.length,
+                sha256: sha256(binBytes),
+                embeddedMetadata: extractEmbeddedBuildIdentity(binBytes),
+              },
+            },
+          }),
+        );
+        assert.throws(
+          () =>
+            admitTargetArtifacts(
+              meta,
+              { clec: binPath, buildReceipt: receiptPath },
+              { packageVersion: PACKAGE_VERSION, allowPartial: false },
+            ),
+          /requires musl-static linkage/,
+        );
+      }
+
+      const hdr = makeContainerHeader(tuple, { interp: '' });
+      hdr.writeBigUInt64LE(0n, 96);
+      const id = extractEmbeddedBuildIdentity(makeSyntheticBinary({ tuple }));
+      const zeroLenElf = Buffer.concat([
+        hdr,
+        IDENTITY_PREFIX,
+        Buffer.from(JSON.stringify(id), 'utf8'),
+        IDENTITY_SUFFIX,
+      ]);
+      const zeroPath = join(tmp, `${tuple}-zero.bin`);
+      const zeroReceiptPath = join(tmp, `${tuple}-zero.receipt.json`);
+      writeFileSync(zeroPath, zeroLenElf);
+      writeFileSync(
+        zeroReceiptPath,
+        JSON.stringify({
+          schemaVersion: 2,
+          receiptKind: 'clec-inspected-prebuilt-receipt',
+          trustModel: 'unsigned-inspected-prebuilt-receipt',
+          packageName: PACKAGE_NAME,
+          packageVersion: PACKAGE_VERSION,
+          tuple: meta.tuple,
+          rustTarget: meta.rustTarget,
+          provenance: {
+            source: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+            buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+          },
+          captureObservation: {
+            observedGit: null,
+            declaredBuildCommand: null,
+            declaredHostBaseline: null,
+          },
+          verifiedEmbeddedMetadata: {
+            cargoLockSha256: DEFAULT_LOCK_SHA,
+            rustcVersion: DEFAULT_RUSTC,
+            profile: 'release',
+            features: [],
+            testHooksIncluded: false,
+          },
+          artifacts: {
+            clec: {
+              kind: 'clec',
+              binaryName: meta.binaryName,
+              bytes: zeroLenElf.length,
+              sha256: sha256(zeroLenElf),
+              embeddedMetadata: id,
+            },
+          },
+        }),
+      );
+      assert.throws(
+        () =>
+          admitTargetArtifacts(
+            meta,
+            { clec: zeroPath, buildReceipt: zeroReceiptPath },
+            { packageVersion: PACKAGE_VERSION, allowPartial: false },
+          ),
+        /requires musl-static linkage/,
+      );
+    }
+
+    const macMeta = findTargetByTuple('darwin-arm64');
+    const macBytes = makeSyntheticBinary({ tuple: 'darwin-arm64' });
+    const macPath = join(tmp, 'clec');
+    writeFileSync(macPath, macBytes);
+    const legacyReceiptPath = join(tmp, 'legacy-v1.json');
+    writeFileSync(
+      legacyReceiptPath,
+      JSON.stringify(makeBoundReceipt('darwin-arm64', { clec: { bytes: macBytes, binaryName: 'clec' } })),
+    );
+    assert.throws(
+      () =>
+        admitTargetArtifacts(
+          macMeta,
+          { clec: macPath, buildReceipt: legacyReceiptPath },
+          { packageVersion: PACKAGE_VERSION, allowPartial: true },
+        ),
+      /schemaVersion|legacy|clec-inspected-prebuilt-receipt/,
+    );
+
+    const fakePromotedReceiptPath = join(tmp, 'fake-promoted.json');
+    writeFileSync(
+      fakePromotedReceiptPath,
+      JSON.stringify({
+        schemaVersion: 2,
+        receiptKind: 'clec-inspected-prebuilt-receipt',
+        trustModel: 'unsigned-inspected-prebuilt-receipt',
+        packageName: PACKAGE_NAME,
+        packageVersion: PACKAGE_VERSION,
+        tuple: 'darwin-arm64',
+        rustTarget: 'aarch64-apple-darwin',
+        provenance: {
+          source: { status: 'established_local_git_checkout', sourceCommit: DEFAULT_COMMIT, sourceDirty: false },
+          buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+        },
+        captureObservation: { observedGit: null, declaredBuildCommand: null, declaredHostBaseline: null },
+        verifiedEmbeddedMetadata: {
+          cargoLockSha256: DEFAULT_LOCK_SHA,
+          rustcVersion: DEFAULT_RUSTC,
+          profile: 'release',
+          features: [],
+          testHooksIncluded: false,
+        },
+        artifacts: {
+          clec: {
+            kind: 'clec',
+            binaryName: 'clec',
+            bytes: macBytes.length,
+            sha256: sha256(macBytes),
+            embeddedMetadata: extractEmbeddedBuildIdentity(macBytes),
+          },
+        },
+      }),
+    );
+    assert.throws(
+      () =>
+        admitTargetArtifacts(
+          macMeta,
+          { clec: macPath, buildReceipt: fakePromotedReceiptPath },
+          { packageVersion: PACKAGE_VERSION, allowPartial: true },
+        ),
+      /not_verified_unknown/,
+    );
+
+    const badInvPkg = join(tmp, 'bad-inv-pkg');
+    makeFakeStagingPackage(badInvPkg, 'darwin-arm64', macBytes);
+    const badInv = JSON.parse(readFileSync(join(badInvPkg, 'inventory.json'), 'utf8'));
+    badInv.schemaVersion = 2;
+    badInv.targets['darwin-arm64'].provenance = {
+      source: { status: 'unknown', reason: 'invalid' },
+      buildInvocation: { status: 'not_verified_unknown', reason: 'inspected_prebuilt_without_controlled_build' },
+    };
+    writeFileSync(join(badInvPkg, 'inventory.json'), JSON.stringify(badInv));
+    assert.throws(
+      () => installFromRoot(badInvPkg, { platform: 'darwin', arch: 'arm64' }),
+      /provenance|status/,
+    );
+    assert.equal(readFileSync(join(badInvPkg, 'bin', 'clec.exe'))[0], 0);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
