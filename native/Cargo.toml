@@ -9,6 +9,10 @@ description = "Offline CLEC evidence search, exact byte-span reads, and local sn
 name = "clec_core"
 path = "src/lib.rs"
 
+[features]
+default = []
+test-hooks = []
+
 [[bin]]
 name = "clec"
 path = "src/bin/clec.rs"
@@ -25,6 +29,7 @@ path = "src/bin/clec-validate.rs"
 clap = { version = "4.6.8", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 ferrous-opencc = "0.4.0"
 jieba-rs = "0.11.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls", "http2"] }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::distribution::{
-    MAX_ARTIFACT_BYTES, ManifestLocation, NetworkPolicy, acquire_artifact, cleanup_stale_staging,
-    is_staging_temp_name, load_manifest, validate_relative_path, validate_remote_url_syntax,
+    MAX_ARTIFACT_BYTES, ManifestLocation, NetworkPolicy, TransferPolicy, acquire_artifact,
+    cleanup_stale_staging, is_staging_temp_name, load_manifest, validate_relative_path,
+    validate_remote_url_syntax,
 };
 use crate::domain::{
     Attribution, ByteSpan, CORPUS_FORMAT, CanonicalCandidate, ClecError, DICTIONARY_REVISION,
@@ -1075,6 +1076,7 @@ pub(crate) fn sync_local(
         manifest_arg,
         NetworkPolicy::Allowed,
         None,
+        &TransferPolicy::shipped(),
         |data| Ok(data.clone()),
     )
 }
@@ -1084,6 +1086,7 @@ pub(crate) fn sync_with_prepare<T, F>(
     manifest_arg: Option<&str>,
     network_policy: NetworkPolicy,
     default_origin: Option<&str>,
+    transfer_policy: &TransferPolicy,
     prepare_output: F,
 ) -> Result<T, ClecError>
 where
@@ -1122,6 +1125,7 @@ where
         manifest_arg,
         network_policy,
         default_origin,
+        transfer_policy,
         prepare_output,
     );
     let _ = lock_file.unlock();
@@ -1133,23 +1137,27 @@ fn resolve_sync_location(
     prev_state_res: &Result<Option<ActiveState>, ClecError>,
     default_origin: Option<&str>,
 ) -> Result<ManifestLocation, ClecError> {
-    let raw = match manifest_arg {
-        Some(raw) => raw.to_owned(),
+    match manifest_arg {
+        Some(raw) => ManifestLocation::parse(raw),
         None => {
             let prev = prev_state_res.as_ref().map_err(Clone::clone)?;
             if let Some(state) = prev {
-                state.manifest_path.clone()
+                ManifestLocation::parse(&state.manifest_path).map_err(|e| {
+                    ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        format!("Invalid saved manifestPath in active.json: {e}"),
+                    )
+                })
             } else if let Some(default_url) = default_origin {
-                default_url.to_owned()
+                ManifestLocation::parse(default_url)
             } else {
-                return Err(ClecError::new(
+                Err(ClecError::new(
                     ErrorCode::NoData,
                     "No manifest origin is configured. Pass --manifest PATH_OR_HTTPS_URL.",
-                ));
+                ))
             }
         }
-    };
-    ManifestLocation::parse(&raw)
+    }
 }
 
 fn sync_locked<T, F>(
@@ -1157,6 +1165,7 @@ fn sync_locked<T, F>(
     manifest_arg: Option<&str>,
     network_policy: NetworkPolicy,
     default_origin: Option<&str>,
+    transfer_policy: &TransferPolicy,
     prepare_output: F,
 ) -> Result<T, ClecError>
 where
@@ -1165,8 +1174,8 @@ where
     cleanup_stale_staging(data_dir);
     let prev_state_res = read_active_state(data_dir);
     let location = resolve_sync_location(manifest_arg, &prev_state_res, default_origin)?;
-    let loaded = load_manifest(&location, network_policy)?;
-    let acquired = acquire_artifact(&loaded, data_dir, network_policy)?;
+    let loaded = load_manifest(&location, network_policy, transfer_policy)?;
+    let acquired = acquire_artifact(&loaded, data_dir, network_policy, transfer_policy)?;
 
     let manifest = loaded.manifest;
     let manifest_path_str = loaded.persistent_origin;
@@ -1615,6 +1624,7 @@ mod tests {
             Some(&m_b_path),
             NetworkPolicy::Allowed,
             None,
+            &TransferPolicy::shipped(),
             |_| {
                 Err::<(), ClecError>(ClecError::new(
                     ErrorCode::OutputBudgetTooSmall,
@@ -2036,6 +2046,7 @@ mod tests {
             Some(&rel_url.join("manifest.json").display().to_string()),
             NetworkPolicy::Offline,
             None,
+            &TransferPolicy::shipped(),
             |d| Ok(d.clone()),
         )
         .unwrap();
@@ -2046,5 +2057,213 @@ mod tests {
         let err =
             sync_local(&data_dir, Some(&oversized_manifest.display().to_string())).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidManifest);
+    }
+
+    #[test]
+    fn http_sync_handles_redirects_reuse_chunked_encoding_and_shortened_timeouts() {
+        use std::io::{BufRead, BufReader as IoBufReader};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::thread;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "http transport fixture alpha").unwrap();
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            r#"{"schemaVersion":1,"works":[{"key":"w1","title":"W1"}],"sources":[{"work":"w1","path":"a.txt","title":"A","role":"document","attribution":"authored_fixture","quality":"fixture","status":"ready"}]}"#,
+        )
+        .unwrap();
+        let rel = tmp.path().join("rel");
+        let manifest = publish_release(&ws, &intake, &rel).unwrap();
+        let manifest_bytes = fs::read(rel.join("manifest.json")).unwrap();
+        let zst_bytes = fs::read(rel.join("corpus.sqlite.zst")).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let req_count_srv = Arc::clone(&req_count);
+        let zst_srv = zst_bytes.clone();
+        let manifest_srv = manifest_bytes.clone();
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = IoBufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" || h == "\n" {
+                        break;
+                    }
+                }
+                req_count_srv.fetch_add(1, AtomicOrdering::SeqCst);
+
+                if path == "/shutdown" {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    break;
+                } else if let Some(rest) = path.strip_prefix("/redir/") {
+                    let n: usize = rest.parse().unwrap_or(0);
+                    let loc = if n <= 1 {
+                        "/final/manifest.json?signed=secret".to_owned()
+                    } else {
+                        format!("/redir/{}", n - 1)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if path.starts_with("/final/manifest.json") {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        manifest_srv.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&manifest_srv);
+                } else if path == "/final/corpus.sqlite.zst" {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    for chunk in zst_srv.chunks(64) {
+                        let _ = write!(stream, "{:x}\r\n", chunk.len());
+                        let _ = stream.write_all(chunk);
+                        let _ = stream.write_all(b"\r\n");
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n");
+                } else if path == "/gzip/manifest.json" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\n{}",
+                    );
+                } else if path.starts_with("/slow-headers") {
+                    thread::sleep(Duration::from_millis(350));
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+                } else if path == "/trickle-body" {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+                    for _ in 0..10 {
+                        let _ = stream.write_all(b"1234567890");
+                        let _ = stream.flush();
+                        thread::sleep(Duration::from_millis(45));
+                    }
+                } else {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                }
+            }
+        });
+
+        let data_dir = tmp.path().join("data");
+        let policy = TransferPolicy::shipped();
+
+        let five_redir = format!("http://127.0.0.1:{port}/redir/5");
+        let synced = sync_with_prepare(
+            &data_dir,
+            Some(&five_redir),
+            NetworkPolicy::Allowed,
+            None,
+            &policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap();
+        assert_eq!(synced.release, manifest.sha256);
+        assert_eq!(synced.manifest_path, five_redir);
+        assert!(!data_dir.join(".incoming.zst.tmp").exists());
+        assert_eq!(
+            synced.storage_bytes,
+            data_dir_status(&data_dir).unwrap().storage_bytes
+        );
+
+        let before_reuse = req_count.load(AtomicOrdering::SeqCst);
+        let reused = sync_with_prepare(
+            &data_dir,
+            None,
+            NetworkPolicy::Allowed,
+            None,
+            &policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap();
+        assert!(reused.reused);
+        assert!(req_count.load(AtomicOrdering::SeqCst) > before_reuse);
+
+        let before_offline = req_count.load(AtomicOrdering::SeqCst);
+        let offline_err = sync_with_prepare(
+            &data_dir,
+            None,
+            NetworkPolicy::Offline,
+            None,
+            &policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(offline_err.code, ErrorCode::OfflineRequired);
+        assert_eq!(req_count.load(AtomicOrdering::SeqCst), before_offline);
+
+        let six_redir = format!("http://127.0.0.1:{port}/redir/6");
+        let err_6 = sync_with_prepare(
+            &data_dir,
+            Some(&six_redir),
+            NetworkPolicy::Allowed,
+            None,
+            &policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(err_6.code, ErrorCode::TransferFailed);
+
+        let gzip_url = format!("http://127.0.0.1:{port}/gzip/manifest.json");
+        let err_gzip = sync_with_prepare(
+            &data_dir,
+            Some(&gzip_url),
+            NetworkPolicy::Allowed,
+            None,
+            &policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(err_gzip.code, ErrorCode::TransferFailed);
+
+        let fast_policy = TransferPolicy {
+            connect_timeout: Duration::from_millis(200),
+            manifest_timeout: Duration::from_millis(150),
+            artifact_timeout: Duration::from_millis(150),
+            #[cfg(any(test, feature = "test-hooks"))]
+            extra_root_pem: None,
+        };
+        let slow_err = sync_with_prepare(
+            &data_dir,
+            Some(&format!("http://127.0.0.1:{port}/slow-headers?sig=secret")),
+            NetworkPolicy::Allowed,
+            None,
+            &fast_policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(slow_err.code, ErrorCode::TransferTimeout, "slow_err={slow_err:?}");
+        assert!(!slow_err.message.contains("sig=secret"));
+
+        let trickle_err = sync_with_prepare(
+            &data_dir,
+            Some(&format!("http://127.0.0.1:{port}/trickle-body")),
+            NetworkPolicy::Allowed,
+            None,
+            &fast_policy,
+            |d| Ok(d.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            trickle_err.code,
+            ErrorCode::TransferTimeout,
+            "trickle_err={trickle_err:?}"
+        );
+
+        let _ = reqwest::blocking::get(format!("http://127.0.0.1:{port}/shutdown"));
+        let _ = handle.join();
     }
 }

@@ -7,7 +7,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 
-use crate::distribution::NetworkPolicy;
+use crate::distribution::{NetworkPolicy, TransferPolicy};
 use crate::domain::{
     CORPUS_FORMAT, ClecError, DEFAULT_MAX_BYTES, DICTIONARY_REVISION, DateYmd,
     EQUIVALENCE_REVISION, ErrorCode, ErrorEnvelope, NORMALIZATION_REVISION, PassageId, ReleaseHash,
@@ -595,6 +595,7 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
                 args.manifest.as_deref(),
                 network_policy,
                 None,
+                &TransferPolicy::shipped(),
                 |data| serialize_fixed("sync", data, use_json, max_bytes, format_sync_text),
             )
         }

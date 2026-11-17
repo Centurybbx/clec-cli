@@ -744,12 +744,15 @@ pub enum ErrorCode {
     InvalidQuery,
     InvalidReference,
     UnsupportedFeature,
+    OfflineRequired,
     OutputBudgetTooSmall,
     NoData,
     VersionUnavailable,
     EvidenceNotFound,
     SyncLocked,
     InvalidDataDir,
+    TransferFailed,
+    TransferTimeout,
     IoError,
     InvalidPackage,
     IntegrityMismatch,
@@ -767,9 +770,15 @@ impl ErrorCode {
             | Self::InvalidQuery
             | Self::InvalidReference
             | Self::UnsupportedFeature
+            | Self::OfflineRequired
             | Self::OutputBudgetTooSmall => 2,
             Self::NoData | Self::VersionUnavailable | Self::EvidenceNotFound => 3,
-            Self::SyncLocked | Self::InvalidDataDir | Self::IoError | Self::OutputExists => 4,
+            Self::SyncLocked
+            | Self::InvalidDataDir
+            | Self::TransferFailed
+            | Self::TransferTimeout
+            | Self::IoError
+            | Self::OutputExists => 4,
             Self::InvalidPackage
             | Self::IntegrityMismatch
             | Self::InvalidManifest
@@ -791,12 +800,17 @@ impl ErrorCode {
                 "Pass a typed WorkId (w_...), SourceId (s_...), or PassageId (p_...) from search or sources."
             }
             Self::UnsupportedFeature => {
-                "Omit unsupported Phase 1 flags (such as --sag2); run `clec schema` to inspect supported options."
+                "Omit unsupported flags (such as --sag2); run `clec schema` to inspect supported options."
+            }
+            Self::OfflineRequired => {
+                "Remove --offline to allow HTTPS sync, or pass a local --manifest PATH."
             }
             Self::OutputBudgetTooSmall => {
                 "Increase --max-bytes so at least the response envelope and one whole result fit."
             }
-            Self::NoData => "Run `clec sync --manifest PATH` to install a local corpus snapshot.",
+            Self::NoData => {
+                "Run `clec sync --manifest PATH_OR_HTTPS_URL` to install a corpus snapshot."
+            }
             Self::VersionUnavailable => {
                 "Run `clec status` and repeat discovery against the active release."
             }
@@ -809,14 +823,20 @@ impl ErrorCode {
             Self::InvalidDataDir => {
                 "Provide a writable directory path via --data-dir or CLEC_DATA_DIR."
             }
+            Self::TransferFailed => {
+                "Verify network connectivity, TLS certificates, and the manifest or artifact URL, then retry."
+            }
+            Self::TransferTimeout => {
+                "Check network latency against transfer deadlines and retry `clec sync`."
+            }
             Self::IoError => {
                 "Check filesystem paths, permissions, and available disk space, then retry."
             }
             Self::InvalidPackage => {
-                "Provide a valid clec-native-v2 release package and re-run `clec sync --manifest PATH`."
+                "Provide a valid clec-native-v2 release package and re-run `clec sync --manifest PATH_OR_HTTPS_URL`."
             }
             Self::IntegrityMismatch => {
-                "Re-run `clec sync --manifest PATH` from an unmodified publisher release."
+                "Re-run `clec sync --manifest PATH_OR_HTTPS_URL` from an unmodified publisher release."
             }
             Self::InvalidManifest => {
                 "Fix the manifest or intake JSON fields and rebuild the release."
@@ -836,7 +856,8 @@ impl ErrorCode {
 
     pub fn next_action(self) -> &'static str {
         match self {
-            Self::NoData => "clec sync --manifest PATH",
+            Self::NoData => "clec sync --manifest PATH_OR_HTTPS_URL",
+            Self::OfflineRequired => "clec sync --manifest PATH",
             Self::VersionUnavailable => "clec status",
             Self::EvidenceNotFound => "clec sources",
             Self::OutputBudgetTooSmall => "clec search QUERY --max-bytes 65536",
