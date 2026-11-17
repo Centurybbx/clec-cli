@@ -9,8 +9,11 @@ use crate::domain::{
     Attribution, BoundaryKind, ByteSpan, CORPUS_FORMAT, ClecError, DateYmd, ErrorCode, PassageId,
     ReleaseHash, SEGMENTATION_REVISION, SourceId, SourceRole, WorkId, sha256_hex,
 };
-use crate::ingest::{SubtitleCue, reconstruct_passage_text};
-use crate::lexical::normalize_for_search;
+use crate::ingest::{
+    ExtractionResult, SubtitleCue, extract_source, is_subtitle_path, reconstruct_passage_text,
+    segment_source,
+};
+use crate::lexical::{index_tokens_string, normalize_for_search};
 
 pub(crate) const SCHEMA_SQL: &str = "
 PRAGMA journal_mode=DELETE;
@@ -482,8 +485,8 @@ impl CorpusStore {
         let blobs_map = self.validate_blobs()?;
         let work_ids = self.validate_works()?;
         let source_map = self.validate_sources(&work_ids, &blobs_map)?;
-        let cue_counts = self.validate_cues(&source_map, &blobs_map)?;
-        self.validate_passages_and_fts(&source_map, &blobs_map, &cue_counts)
+        let extractions = self.validate_cues_and_diagnostics(&source_map, &blobs_map)?;
+        self.validate_passages_and_fts(&source_map, &blobs_map, &extractions)
     }
 
     fn validate_blobs(&self) -> Result<HashMap<String, Vec<u8>>, ClecError> {
@@ -638,167 +641,339 @@ impl CorpusStore {
         Ok(source_map)
     }
 
-    fn validate_cues(
+    fn validate_cues_and_diagnostics(
         &self,
         source_map: &HashMap<String, SourceRecord>,
         blobs_map: &HashMap<String, Vec<u8>>,
-    ) -> Result<HashMap<String, usize>, ClecError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT source_id, ordinal, original_identifier, raw_start_byte, raw_end_byte, text_start_byte, text_end_byte, start_ms, end_ms FROM cues ORDER BY source_id, ordinal",
-            )
-            .map_err(map_sql_pkg)?;
-        let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
-        let mut count_by_source: HashMap<String, usize> = HashMap::new();
-        while let Some(row) = rows.next().map_err(map_sql_pkg)? {
-            let source_id: String = row.get(0).map_err(map_sql_pkg)?;
-            let ordinal: i64 = row.get(1).map_err(map_sql_pkg)?;
-            let _ident: Option<String> = row.get(2).map_err(map_sql_pkg)?;
-            let raw_start: i64 = row.get(3).map_err(map_sql_pkg)?;
-            let raw_end: i64 = row.get(4).map_err(map_sql_pkg)?;
-            let text_start: i64 = row.get(5).map_err(map_sql_pkg)?;
-            let text_end: i64 = row.get(6).map_err(map_sql_pkg)?;
-            let start_ms: i64 = row.get(7).map_err(map_sql_pkg)?;
-            let end_ms: i64 = row.get(8).map_err(map_sql_pkg)?;
-
-            let source = source_map.get(&source_id).ok_or_else(|| {
-                ClecError::new(ErrorCode::InvalidPackage, "Cue references unknown source.")
-            })?;
-            let raw_bytes = blobs_map.get(&source.content_hash).unwrap();
-            let next_ord = count_by_source.entry(source_id).or_insert(0);
-            if usize::try_from(ordinal).ok() != Some(*next_ord) {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Non-sequential cue ordinal.",
-                ));
-            }
-            *next_ord += 1;
-
-            let rs = usize::try_from(raw_start).map_err(|_| bad_cue())?;
-            let re = usize::try_from(raw_end).map_err(|_| bad_cue())?;
-            let ts = usize::try_from(text_start).map_err(|_| bad_cue())?;
-            let te = usize::try_from(text_end).map_err(|_| bad_cue())?;
-            if rs >= re || re > raw_bytes.len() || ts < rs || ts >= te || te > re {
-                return Err(bad_cue());
-            }
-            if std::str::from_utf8(&raw_bytes[ts..te]).is_err() {
-                return Err(bad_cue());
-            }
-            if start_ms < 0 || end_ms < start_ms {
-                return Err(bad_cue());
+    ) -> Result<HashMap<String, ExtractionResult>, ClecError> {
+        let mut actual_cues: HashMap<String, Vec<SubtitleCue>> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT source_id, ordinal, original_identifier, raw_start_byte, raw_end_byte, text_start_byte, text_end_byte, start_ms, end_ms FROM cues ORDER BY source_id, ordinal",
+                )
+                .map_err(map_sql_pkg)?;
+            let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
+            while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+                let source_id: String = row.get(0).map_err(map_sql_pkg)?;
+                if !source_map.contains_key(&source_id) {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Cue references unknown source.",
+                    ));
+                }
+                let cue = SubtitleCue {
+                    ordinal: usize::try_from(row.get::<_, i64>(1).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                    original_identifier: row.get(2).map_err(map_sql_pkg)?,
+                    raw_start_byte: usize::try_from(row.get::<_, i64>(3).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                    raw_end_byte: usize::try_from(row.get::<_, i64>(4).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                    text_start_byte: usize::try_from(row.get::<_, i64>(5).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                    text_end_byte: usize::try_from(row.get::<_, i64>(6).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                    start_ms: u64::try_from(row.get::<_, i64>(7).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                    end_ms: u64::try_from(row.get::<_, i64>(8).map_err(map_sql_pkg)?)
+                        .map_err(|_| bad_cue())?,
+                };
+                actual_cues.entry(source_id).or_default().push(cue);
             }
         }
-        Ok(count_by_source)
+
+        let mut actual_diags: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT source_id, ordinal, message FROM source_diagnostics ORDER BY source_id, ordinal")
+                .map_err(map_sql_pkg)?;
+            let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
+            while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+                let source_id: String = row.get(0).map_err(map_sql_pkg)?;
+                if !source_map.contains_key(&source_id) {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Diagnostic references unknown source.",
+                    ));
+                }
+                let ord =
+                    usize::try_from(row.get::<_, i64>(1).map_err(map_sql_pkg)?).map_err(|_| {
+                        ClecError::new(ErrorCode::InvalidPackage, "Negative diagnostic ordinal.")
+                    })?;
+                let list = actual_diags.entry(source_id).or_default();
+                if ord != list.len() {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Non-sequential source diagnostic ordinal.",
+                    ));
+                }
+                list.push(row.get(2).map_err(map_sql_pkg)?);
+            }
+        }
+
+        let mut extractions = HashMap::with_capacity(source_map.len());
+        for (source_id, source) in source_map {
+            let raw_bytes = blobs_map.get(&source.content_hash).unwrap();
+            let is_sub = is_subtitle_path(&source.path);
+            let expected_ext = extract_source(raw_bytes, is_sub)?;
+            let db_cues = actual_cues.get(source_id).map(Vec::as_slice).unwrap_or(&[]);
+            if is_sub && expected_ext.cues.is_empty() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Subtitle source has no usable cues.",
+                ));
+            }
+            if db_cues != expected_ext.cues.as_slice() {
+                return Err(bad_cue());
+            }
+            let db_diags = actual_diags
+                .get(source_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if db_diags != expected_ext.diagnostics.as_slice() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Source diagnostics do not match canonical cue extraction.",
+                ));
+            }
+            extractions.insert(source_id.clone(), expected_ext);
+        }
+
+        Ok(extractions)
     }
 
     fn validate_passages_and_fts(
         &self,
         source_map: &HashMap<String, SourceRecord>,
         blobs_map: &HashMap<String, Vec<u8>>,
-        cue_counts: &HashMap<String, usize>,
+        extractions: &HashMap<String, ExtractionResult>,
     ) -> Result<(), ClecError> {
+        struct StoredPassageRow {
+            id: PassageId,
+            boundary: BoundaryKind,
+            is_continuation: bool,
+            continued_from: Option<PassageId>,
+            continued_to: Option<PassageId>,
+            spans: Vec<ByteSpan>,
+            text: String,
+        }
+
+        let mut by_source: HashMap<String, Vec<StoredPassageRow>> = HashMap::new();
+        let mut expected_postings: BTreeMap<(i64, String, usize), String> = BTreeMap::new();
+        let mut expected_docsize: HashMap<i64, (usize, usize)> = HashMap::new();
         let mut fts_rows = 0usize;
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT rowid, id, source_id, work_id, ordinal, boundary, is_continuation, continued_from, continued_to, text FROM passages ORDER BY source_id, ordinal",
-            )
-            .map_err(map_sql_pkg)?;
-        let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
-        let mut ord_by_source: HashMap<String, usize> = HashMap::new();
-        while let Some(row) = rows.next().map_err(map_sql_pkg)? {
-            let rowid: i64 = row.get(0).map_err(map_sql_pkg)?;
-            let id_str: String = row.get(1).map_err(map_sql_pkg)?;
-            let source_id_str: String = row.get(2).map_err(map_sql_pkg)?;
-            let work_id_str: String = row.get(3).map_err(map_sql_pkg)?;
-            let ordinal_i64: i64 = row.get(4).map_err(map_sql_pkg)?;
-            let boundary_str: String = row.get(5).map_err(map_sql_pkg)?;
-            let _is_cont: i64 = row.get(6).map_err(map_sql_pkg)?;
-            let cont_from: Option<String> = row.get(7).map_err(map_sql_pkg)?;
-            let cont_to: Option<String> = row.get(8).map_err(map_sql_pkg)?;
-            let text: String = row.get(9).map_err(map_sql_pkg)?;
 
-            if let Some(cf) = cont_from.as_deref() {
-                PassageId::parse(cf)?;
-            }
-            if let Some(ct) = cont_to.as_deref() {
-                PassageId::parse(ct)?;
-            }
-
-            let source = source_map.get(&source_id_str).ok_or_else(|| {
-                ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Passage references unknown source.",
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT rowid, id, source_id, work_id, ordinal, boundary, is_continuation, continued_from, continued_to, text FROM passages ORDER BY source_id, ordinal",
                 )
-            })?;
-            if work_id_str != source.work_id.as_str() {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Passage work_id disagrees with source work_id.",
-                ));
-            }
-            let ordinal = usize::try_from(ordinal_i64).map_err(|_| {
-                ClecError::new(ErrorCode::InvalidPackage, "Negative passage ordinal.")
-            })?;
-            let expected = ord_by_source.entry(source_id_str.clone()).or_insert(0);
-            if ordinal != *expected {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Non-contiguous passage ordinals.",
-                ));
-            }
-            *expected += 1;
+                .map_err(map_sql_pkg)?;
+            let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
+            while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+                let rowid: i64 = row.get(0).map_err(map_sql_pkg)?;
+                let id_str: String = row.get(1).map_err(map_sql_pkg)?;
+                let source_id_str: String = row.get(2).map_err(map_sql_pkg)?;
+                let work_id_str: String = row.get(3).map_err(map_sql_pkg)?;
+                let ordinal_i64: i64 = row.get(4).map_err(map_sql_pkg)?;
+                let boundary_str: String = row.get(5).map_err(map_sql_pkg)?;
+                let is_cont_i64: i64 = row.get(6).map_err(map_sql_pkg)?;
+                let cont_from: Option<String> = row.get(7).map_err(map_sql_pkg)?;
+                let cont_to: Option<String> = row.get(8).map_err(map_sql_pkg)?;
+                let text: String = row.get(9).map_err(map_sql_pkg)?;
 
-            let _ = BoundaryKind::parse(&boundary_str)?;
-            let spans = self.load_spans(&id_str)?;
-            let cue_limit = cue_counts.get(&source_id_str).copied().unwrap_or(0);
-            for span in &spans {
-                if let Some(cue_ord) = span.cue_ordinal()
-                    && cue_ord >= cue_limit
+                let is_continuation = match is_cont_i64 {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Invalid is_continuation value in passages.",
+                        ));
+                    }
+                };
+                let continued_from = cont_from.as_deref().map(PassageId::parse).transpose()?;
+                let continued_to = cont_to.as_deref().map(PassageId::parse).transpose()?;
+
+                let source = source_map.get(&source_id_str).ok_or_else(|| {
+                    ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Passage references unknown source.",
+                    )
+                })?;
+                if work_id_str != source.work_id.as_str() {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Passage work_id disagrees with source work_id.",
+                    ));
+                }
+                let ordinal = usize::try_from(ordinal_i64).map_err(|_| {
+                    ClecError::new(ErrorCode::InvalidPackage, "Negative passage ordinal.")
+                })?;
+                let list = by_source.entry(source_id_str.clone()).or_default();
+                if ordinal != list.len() {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Non-contiguous passage ordinals.",
+                    ));
+                }
+
+                let boundary = BoundaryKind::parse(&boundary_str)?;
+                let spans = self.load_spans(&id_str)?;
+                let ext = extractions.get(&source_id_str).unwrap();
+                for span in &spans {
+                    if ext.is_subtitle {
+                        let Some(cue_ord) = span.cue_ordinal() else {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Subtitle passage span is missing cue_ordinal.",
+                            ));
+                        };
+                        let Some(cue) = ext.cues.get(cue_ord) else {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Passage span references non-existent cue ordinal.",
+                            ));
+                        };
+                        if span.start_byte() < cue.text_start_byte
+                            || span.end_byte() > cue.text_end_byte
+                        {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Passage span lies outside its referenced cue payload.",
+                            ));
+                        }
+                    } else if span.cue_ordinal().is_some() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Plain-text passage span must not carry cue_ordinal.",
+                        ));
+                    }
+                }
+
+                let raw_bytes = blobs_map.get(&source.content_hash).unwrap();
+                let reconstructed = reconstruct_passage_text(raw_bytes, &spans)?;
+                if reconstructed != text {
+                    return Err(ClecError::new(
+                        ErrorCode::IntegrityMismatch,
+                        "Passage text does not match source byte spans.",
+                    ));
+                }
+                if text.chars().count() > 2000 {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Passage exceeds 2000 Unicode scalar cap.",
+                    ));
+                }
+
+                let parsed_id = PassageId::parse(&id_str)?;
+                if parsed_id != PassageId::derive(&source.source_id, ordinal, &spans) {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "PassageId does not match derived provenance.",
+                    ));
+                }
+
+                let has_fts: Option<i64> = self
+                    .conn
+                    .query_row("SELECT rowid FROM search WHERE rowid=?", [rowid], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+                if has_fts.is_none() {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Passage is missing from FTS5 search table.",
+                    ));
+                }
+
+                let title_tokens = index_tokens_string(&source.title);
+                let body_tokens = index_tokens_string(&text);
+                let mut title_count = 0usize;
+                for (offset, tok) in title_tokens.split_ascii_whitespace().enumerate() {
+                    expected_postings
+                        .insert((rowid, "title_tokens".to_owned(), offset), tok.to_owned());
+                    title_count += 1;
+                }
+                let mut body_count = 0usize;
+                for (offset, tok) in body_tokens.split_ascii_whitespace().enumerate() {
+                    expected_postings
+                        .insert((rowid, "body_tokens".to_owned(), offset), tok.to_owned());
+                    body_count += 1;
+                }
+                expected_docsize.insert(rowid, (title_count, body_count));
+
+                fts_rows += 1;
+                list.push(StoredPassageRow {
+                    id: parsed_id,
+                    boundary,
+                    is_continuation,
+                    continued_from,
+                    continued_to,
+                    spans,
+                    text,
+                });
+            }
+        }
+
+        for (source_id, source) in source_map {
+            let actual = by_source.get(source_id).ok_or_else(|| {
+                ClecError::new(ErrorCode::InvalidPackage, "Source has zero passages.")
+            })?;
+            let ext = extractions.get(source_id).unwrap();
+            let expected_drafts = segment_source(ext, source.role)?;
+            if actual.len() != expected_drafts.len() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Passage count does not match canonical segmentation.",
+                ));
+            }
+            for (idx, (row, draft)) in actual.iter().zip(expected_drafts.iter()).enumerate() {
+                if row.boundary != draft.boundary
+                    || row.is_continuation != draft.is_continuation
+                    || row.spans != draft.spans
+                    || row.text != draft.text
                 {
                     return Err(ClecError::new(
                         ErrorCode::InvalidPackage,
-                        "Passage span references non-existent cue ordinal.",
+                        "Passage segmentation or spans do not match canonical ingest.",
+                    ));
+                }
+                if idx == 0 && (row.is_continuation || row.continued_from.is_some()) {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "First passage cannot be a continuation.",
+                    ));
+                }
+                if idx > 0 {
+                    let prev = &actual[idx - 1];
+                    if row.is_continuation {
+                        if row.continued_from.as_ref() != Some(&prev.id)
+                            || prev.continued_to.as_ref() != Some(&row.id)
+                        {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidPackage,
+                                "Continuation links do not match adjacent passage IDs.",
+                            ));
+                        }
+                    } else if row.continued_from.is_some() || prev.continued_to.is_some() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Unexpected continuation link on non-continuation boundary.",
+                        ));
+                    }
+                }
+                if idx + 1 == actual.len() && row.continued_to.is_some() {
+                    return Err(ClecError::new(
+                        ErrorCode::InvalidPackage,
+                        "Last passage cannot carry continued_to.",
                     ));
                 }
             }
-            let raw_bytes = blobs_map.get(&source.content_hash).unwrap();
-            let reconstructed = reconstruct_passage_text(raw_bytes, &spans)?;
-            if reconstructed != text {
-                return Err(ClecError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "Passage text does not match source byte spans.",
-                ));
-            }
-            if text.chars().count() > 2000 {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Passage exceeds 2000 Unicode scalar cap.",
-                ));
-            }
-
-            let parsed_id = PassageId::parse(&id_str)?;
-            if parsed_id != PassageId::derive(&source.source_id, ordinal, &spans) {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "PassageId does not match derived provenance.",
-                ));
-            }
-
-            let has_fts: Option<i64> = self
-                .conn
-                .query_row("SELECT rowid FROM search WHERE rowid=?", [rowid], |r| {
-                    r.get(0)
-                })
-                .ok();
-            if has_fts.is_none() {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    "Passage is missing from FTS5 search table.",
-                ));
-            }
-            fts_rows += 1;
         }
 
         let total_fts: i64 = self
@@ -812,7 +987,96 @@ impl CorpusStore {
             ));
         }
 
-        Ok(())
+        self.validate_fts_postings(&expected_postings, &expected_docsize)
+    }
+
+    fn validate_fts_postings(
+        &self,
+        expected_postings: &BTreeMap<(i64, String, usize), String>,
+        expected_docsize: &HashMap<i64, (usize, usize)>,
+    ) -> Result<(), ClecError> {
+        self.conn
+            .execute_batch(
+                "PRAGMA query_only=OFF;
+                 DROP TABLE IF EXISTS temp.__clec_fts_vocab;
+                 CREATE VIRTUAL TABLE temp.__clec_fts_vocab USING fts5vocab(main, search, instance);",
+            )
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    format!("Cannot inspect FTS5 postings: {e}"),
+                )
+            })?;
+
+        let inspect_res = (|| -> Result<(), ClecError> {
+            let mut actual_postings: BTreeMap<(i64, String, usize), String> = BTreeMap::new();
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT doc, col, offset, term FROM temp.__clec_fts_vocab")
+                    .map_err(map_sql_pkg)?;
+                let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
+                while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+                    let doc: i64 = row.get(0).map_err(map_sql_pkg)?;
+                    let col: String = row.get(1).map_err(map_sql_pkg)?;
+                    let offset_i64: i64 = row.get(2).map_err(map_sql_pkg)?;
+                    let term: String = row.get(3).map_err(map_sql_pkg)?;
+                    let offset = usize::try_from(offset_i64).map_err(|_| {
+                        ClecError::new(ErrorCode::InvalidPackage, "Negative FTS5 token offset.")
+                    })?;
+                    if actual_postings.insert((doc, col, offset), term).is_some() {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Duplicate FTS5 posting at same rowid, column, and offset.",
+                        ));
+                    }
+                }
+            }
+            if &actual_postings != expected_postings {
+                return Err(ClecError::new(
+                    ErrorCode::IntegrityMismatch,
+                    "FTS5 search postings do not match source-derived normalized title/body tokens.",
+                ));
+            }
+
+            let mut docsize_rows = 0usize;
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id, sz FROM search_docsize")
+                    .map_err(map_sql_pkg)?;
+                let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
+                while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+                    let doc: i64 = row.get(0).map_err(map_sql_pkg)?;
+                    let sz: Vec<u8> = row.get(1).map_err(map_sql_pkg)?;
+                    let (t_len, b_len) = decode_fts5_docsize(&sz).ok_or_else(|| {
+                        ClecError::new(
+                            ErrorCode::InvalidPackage,
+                            "Malformed FTS5 search_docsize record.",
+                        )
+                    })?;
+                    if expected_docsize.get(&doc) != Some(&(t_len, b_len)) {
+                        return Err(ClecError::new(
+                            ErrorCode::IntegrityMismatch,
+                            "FTS5 document token counts do not match source-derived tokens.",
+                        ));
+                    }
+                    docsize_rows += 1;
+                }
+            }
+            if docsize_rows != expected_docsize.len() {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "FTS5 search_docsize row count mismatch.",
+                ));
+            }
+            Ok(())
+        })();
+
+        let _ = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS temp.__clec_fts_vocab; PRAGMA query_only=ON;");
+        inspect_res
     }
 
     pub fn load_work(&self, work_id: &WorkId) -> Result<WorkRecord, ClecError> {
@@ -1427,11 +1691,42 @@ fn bad_cue() -> ClecError {
     )
 }
 
+fn read_sqlite_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val = 0u64;
+    for i in 0..9 {
+        let b = *bytes.get(*pos)?;
+        *pos += 1;
+        if i == 8 {
+            val = (val << 8) | u64::from(b);
+            return Some(val);
+        }
+        val = (val << 7) | u64::from(b & 0x7f);
+        if (b & 0x80) == 0 {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn decode_fts5_docsize(sz: &[u8]) -> Option<(usize, usize)> {
+    let mut pos = 0usize;
+    let t = read_sqlite_varint(sz, &mut pos)?;
+    let b = read_sqlite_varint(sz, &mut pos)?;
+    if pos != sz.len() {
+        return None;
+    }
+    Some((usize::try_from(t).ok()?, usize::try_from(b).ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::ByteSpan;
     use crate::lexical::index_tokens_string;
+    use crate::snapshot::publish_release;
+    use std::fs;
+    use std::io::Read;
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_legacy_format_revision_databases() {
@@ -1623,5 +1918,185 @@ mod tests {
             store2.read_passage(&p1, 0, None).unwrap_err().code,
             ErrorCode::IntegrityMismatch
         );
+    }
+
+    fn publish_and_extract_sqlite(
+        tmp: &Path,
+        files: &[(&str, &str, &str)],
+    ) -> (PathBuf, CorpusCounts) {
+        let ws = tmp.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let mut sources = Vec::new();
+        for (path, title, content) in files {
+            fs::write(ws.join(path), content).unwrap();
+            sources.push(serde_json::json!({
+                "work": "w1",
+                "path": path,
+                "title": title,
+                "role": "transcript",
+                "attribution": "authored_fixture",
+                "quality": "fixture",
+                "status": "ready"
+            }));
+        }
+        let intake = tmp.join("intake.json");
+        fs::write(
+            &intake,
+            serde_json::to_string(&serde_json::json!({
+                "schemaVersion": 1,
+                "works": [{ "key": "w1", "title": "Work One" }],
+                "sources": sources
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rel = tmp.join("release");
+        let manifest = publish_release(&ws, &intake, &rel).unwrap();
+        let db_path = tmp.join("corpus.sqlite");
+        let zst = fs::File::open(rel.join("corpus.sqlite.zst")).unwrap();
+        let mut dec = zstd::stream::Decoder::new(zst).unwrap();
+        let mut buf = Vec::new();
+        dec.read_to_end(&mut buf).unwrap();
+        fs::write(&db_path, &buf).unwrap();
+        (db_path, manifest.counts)
+    }
+
+    #[test]
+    fn rejects_empty_and_misplaced_fts_postings_with_same_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db_path, counts) = publish_and_extract_sqlite(
+            tmp.path(),
+            &[
+                ("a.txt", "Title Alpha", "alpha first body"),
+                ("b.txt", "Title Beta", "beta second body"),
+            ],
+        );
+
+        let empty_db = tmp.path().join("empty_fts.sqlite");
+        fs::copy(&db_path, &empty_db).unwrap();
+        {
+            let conn = Connection::open(&empty_db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO search(search) VALUES('delete-all');
+                 INSERT INTO search(rowid, title_tokens, body_tokens) SELECT rowid, '', '' FROM passages;",
+            )
+            .unwrap();
+        }
+        let release = ReleaseHash::parse(&"d".repeat(64)).unwrap();
+        let store_empty = CorpusStore::open_readonly(&empty_db, release.clone()).unwrap();
+        assert_eq!(
+            store_empty.validate_full(&counts).unwrap_err().code,
+            ErrorCode::IntegrityMismatch
+        );
+
+        let swap_col_db = tmp.path().join("swap_col_fts.sqlite");
+        fs::copy(&db_path, &swap_col_db).unwrap();
+        {
+            let conn = Connection::open(&swap_col_db).unwrap();
+            let t1 = index_tokens_string("alpha first body");
+            let b1 = index_tokens_string("Title Alpha");
+            let t2 = index_tokens_string("Title Beta");
+            let b2 = index_tokens_string("beta second body");
+            conn.execute_batch("INSERT INTO search(search) VALUES('delete-all');")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(1, ?, ?), (2, ?, ?)",
+                params![t1, b1, t2, b2],
+            )
+            .unwrap();
+        }
+        let store_swap_col = CorpusStore::open_readonly(&swap_col_db, release.clone()).unwrap();
+        assert_eq!(
+            store_swap_col.validate_full(&counts).unwrap_err().code,
+            ErrorCode::IntegrityMismatch
+        );
+
+        let swap_pos_db = tmp.path().join("swap_pos_fts.sqlite");
+        fs::copy(&db_path, &swap_pos_db).unwrap();
+        {
+            let conn = Connection::open(&swap_pos_db).unwrap();
+            let t1 = index_tokens_string("Title Alpha");
+            let b1 = index_tokens_string("body first alpha");
+            let t2 = index_tokens_string("Title Beta");
+            let b2 = index_tokens_string("beta second body");
+            conn.execute_batch("INSERT INTO search(search) VALUES('delete-all');")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(1, ?, ?), (2, ?, ?)",
+                params![t1, b1, t2, b2],
+            )
+            .unwrap();
+        }
+        let store_swap_pos = CorpusStore::open_readonly(&swap_pos_db, release).unwrap();
+        assert_eq!(
+            store_swap_pos.validate_full(&counts).unwrap_err().code,
+            ErrorCode::IntegrityMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_cues_spans_and_continuations_while_accepting_hard_cut_subspans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nalpha investment.\n\n2\n00:00:03,000 --> 00:00:04,000\nbeta savings.\n";
+        let (db_path, counts) = publish_and_extract_sqlite(tmp.path(), &[("a.srt", "Demo", srt)]);
+        let release = ReleaseHash::parse(&"e".repeat(64)).unwrap();
+
+        let cue_shift_db = tmp.path().join("cue_shift.sqlite");
+        fs::copy(&db_path, &cue_shift_db).unwrap();
+        {
+            let conn = Connection::open(&cue_shift_db).unwrap();
+            conn.execute(
+                "UPDATE cues SET start_ms = start_ms + 86400000, end_ms = end_ms + 86400000",
+                [],
+            )
+            .unwrap();
+        }
+        let store_shift = CorpusStore::open_readonly(&cue_shift_db, release.clone()).unwrap();
+        assert_eq!(
+            store_shift.validate_full(&counts).unwrap_err().code,
+            ErrorCode::InvalidPackage
+        );
+
+        let wrong_cue_db = tmp.path().join("wrong_cue.sqlite");
+        fs::copy(&db_path, &wrong_cue_db).unwrap();
+        {
+            let conn = Connection::open(&wrong_cue_db).unwrap();
+            conn.execute(
+                "UPDATE passage_spans SET cue_ordinal = 1 WHERE span_ordinal = 0",
+                [],
+            )
+            .unwrap();
+        }
+        let store_wrong_cue = CorpusStore::open_readonly(&wrong_cue_db, release.clone()).unwrap();
+        assert_eq!(
+            store_wrong_cue.validate_full(&counts).unwrap_err().code,
+            ErrorCode::InvalidPackage
+        );
+
+        let bad_cont_db = tmp.path().join("bad_cont.sqlite");
+        fs::copy(&db_path, &bad_cont_db).unwrap();
+        {
+            let conn = Connection::open(&bad_cont_db).unwrap();
+            conn.execute(
+                "UPDATE passages SET is_continuation = 1, continued_from = id",
+                [],
+            )
+            .unwrap();
+        }
+        let store_bad_cont = CorpusStore::open_readonly(&bad_cont_db, release.clone()).unwrap();
+        assert_eq!(
+            store_bad_cont.validate_full(&counts).unwrap_err().code,
+            ErrorCode::InvalidPackage
+        );
+
+        let tmp_hc = tempfile::tempdir().unwrap();
+        let long_cue_body = "甲".repeat(2500);
+        let hc_srt = format!("1\n00:00:01,000 --> 00:00:05,000\n{long_cue_body}\n");
+        let (hc_db, hc_counts) =
+            publish_and_extract_sqlite(tmp_hc.path(), &[("long.srt", "Long Cue", &hc_srt)]);
+        assert_eq!(hc_counts.cues, 1);
+        assert_eq!(hc_counts.passages, 2);
+        let store_hc = CorpusStore::open_readonly(&hc_db, release).unwrap();
+        store_hc.validate_full(&hc_counts).unwrap();
     }
 }
