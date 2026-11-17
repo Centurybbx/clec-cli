@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Behavior tests for capture_capacity.py."""
+"""Behavior tests for capture_capacity.py and semantic_compare.py."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import capture_capacity as cc
+import semantic_compare as sc
 
 
 class CaptureCapacityTests(unittest.TestCase):
@@ -27,6 +29,9 @@ class CaptureCapacityTests(unittest.TestCase):
         self.assertEqual(parsed["sysSeconds"], 11.00)
         self.assertEqual(parsed["maxRssBytes"], 478150656)
         self.assertEqual(parsed["peakFootprintBytes"], 529974280)
+
+    def test_posting_size_estimate_scope_is_explicit(self) -> None:
+        self.assertEqual(cc.estimate_posting_buckets_bytes(10, 40), 190)
 
     def test_end_to_end_capacity_capture_on_2001_passage_fixture(self) -> None:
         repo_root = Path(__file__).resolve().parents[3]
@@ -79,6 +84,7 @@ class CaptureCapacityTests(unittest.TestCase):
                     str(report_path),
                     "--sample-interval-ms",
                     "10",
+                    "--keep-artifacts",
                 ],
                 capture_output=True,
                 text=True,
@@ -89,12 +95,83 @@ class CaptureCapacityTests(unittest.TestCase):
             self.assertEqual(report["manifest"]["counts"]["passages"], 2001)
             self.assertGreater(report["publish"]["timeCommandMetrics"]["maxRssBytes"], 0)
             self.assertGreater(report["sync"]["timeCommandMetrics"]["maxRssBytes"], 0)
-            self.assertGreaterEqual(report["publish"]["diskSampling"]["maxObservedCombinedBytes"], report["manifest"]["compressedBytes"])
-            self.assertGreaterEqual(report["sync"]["diskSampling"]["maxObservedCombinedBytes"], report["manifest"]["bytes"])
-            self.assertEqual(report["publish"]["diskSampling"]["measurementBasis"], "polled_10ms_lower_bound")
-            self.assertGreater(report["conservativeStorageBounds"]["publishConservativePeakBoundBytes"], report["manifest"]["bytes"])
-            self.assertGreater(report["conservativeStorageBounds"]["syncConservativePeakBoundBytes"], report["manifest"]["bytes"])
+            for phase_key in ("publish", "sync"):
+                ds = report[phase_key]["diskSampling"]
+                self.assertEqual(ds["measurementBasis"], "polled_10ms_sampled_lower_bound")
+                self.assertEqual(set(ds["envTempVars"]), {"TMPDIR", "SQLITE_TMPDIR", "TEMP", "TMP"})
+                self.assertGreaterEqual(ds["maxObservedCombinedAllocatedBytes"], 0)
+            self.assertGreaterEqual(
+                report["publish"]["diskSampling"]["maxObservedCombinedLogicalBytes"],
+                report["manifest"]["compressedBytes"],
+            )
+            self.assertGreaterEqual(
+                report["sync"]["diskSampling"]["maxObservedCombinedLogicalBytes"],
+                report["manifest"]["bytes"],
+            )
+            est = report["scopedComponentStorageEstimate"]
+            self.assertEqual(est["scope"], "scoped_component_estimate_only_not_full_filesystem_bound")
+            self.assertIn("sqlite_wal_shm_and_rollback_journals", est["uncoveredOverheads"])
+            self.assertGreater(est["publishScopedComponentPeakBytes"], report["manifest"]["bytes"])
+            self.assertGreater(est["syncScopedComponentPeakBytes"], report["manifest"]["bytes"])
             self.assertTrue(report["workspaceBaselineUnchanged"])
+            self.assertTrue((out_dir / "publish-target" / "release" / "manifest.json").is_file())
+            self.assertTrue((out_dir / "sync-data" / f"{report['manifest']['sha256']}.sqlite").is_file())
+
+    def test_semantic_compare_ignores_row_insert_order_and_catches_posting_or_map_shift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="clec-sem-test-") as tmp_str:
+            tmp = Path(tmp_str)
+            db_a = tmp / "a.sqlite"
+            db_b = tmp / "b.sqlite"
+            db_bad = tmp / "bad.sqlite"
+
+            def make_db(path: Path, reverse_map: bool, alter_posting: bool) -> None:
+                with sqlite3.connect(path) as conn:
+                    conn.executescript(
+                        """
+                        CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                        CREATE TABLE blobs(content_hash TEXT PRIMARY KEY, raw_bytes BLOB NOT NULL, byte_len INTEGER NOT NULL);
+                        CREATE TABLE works(id TEXT PRIMARY KEY, work_key TEXT UNIQUE NOT NULL, title TEXT NOT NULL);
+                        CREATE TABLE sources(id TEXT PRIMARY KEY, work_id TEXT NOT NULL, path TEXT NOT NULL, title TEXT NOT NULL, role TEXT NOT NULL, attribution TEXT NOT NULL, quality TEXT NOT NULL, date TEXT, date_basis TEXT, origin TEXT, content_hash TEXT NOT NULL);
+                        CREATE TABLE source_canonical_map(source_id TEXT PRIMARY KEY, canonical_source_id TEXT NOT NULL, equivalence_hash TEXT NOT NULL, projection_kind TEXT NOT NULL, equivalence_basis TEXT NOT NULL);
+                        CREATE TABLE source_diagnostics(source_id TEXT NOT NULL, ordinal INTEGER NOT NULL, message TEXT NOT NULL);
+                        CREATE TABLE cues(source_id TEXT NOT NULL, ordinal INTEGER NOT NULL, original_identifier TEXT, raw_start_byte INTEGER NOT NULL, raw_end_byte INTEGER NOT NULL, text_start_byte INTEGER NOT NULL, text_end_byte INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL);
+                        CREATE TABLE inventory(path TEXT NOT NULL, work_key TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, content_hash TEXT);
+                        CREATE TABLE passages(id TEXT PRIMARY KEY, source_id TEXT NOT NULL, work_id TEXT NOT NULL, ordinal INTEGER NOT NULL, boundary TEXT NOT NULL, is_continuation INTEGER NOT NULL, continued_from TEXT, continued_to TEXT, text TEXT NOT NULL);
+                        CREATE TABLE passage_spans(passage_id TEXT NOT NULL, span_ordinal INTEGER NOT NULL, start_byte INTEGER NOT NULL, end_byte INTEGER NOT NULL, cue_ordinal INTEGER);
+                        CREATE VIRTUAL TABLE search USING fts5(title_tokens, body_tokens, content='', tokenize='ascii');
+                        """
+                    )
+                    conn.execute("INSERT INTO metadata VALUES('corpus_format','clec-native-v2')")
+                    conn.execute("INSERT INTO works VALUES('w_1','k1','Work 1')")
+                    conn.execute("INSERT INTO blobs VALUES('h1', X'616263', 3)")
+                    conn.execute(
+                        "INSERT INTO sources VALUES('s_1','w_1','a.txt','A','document','authored_fixture','fixture',NULL,NULL,NULL,'h1')"
+                    )
+                    conn.execute(
+                        "INSERT INTO sources VALUES('s_2','w_1','b.txt','B','document','authored_fixture','fixture',NULL,NULL,NULL,'h1')"
+                    )
+                    map_rows = [
+                        ("s_1", "s_1", "eq1", "plain_text", "canonical_by_timing_and_format"),
+                        ("s_2", "s_1", "eq1", "plain_text", "collapsed_to_canonical"),
+                    ]
+                    if reverse_map:
+                        map_rows.reverse()
+                    conn.executemany("INSERT INTO source_canonical_map VALUES(?,?,?,?,?)", map_rows)
+                    conn.execute("INSERT INTO passages VALUES('p_1','s_1','w_1',0,'whole',0,NULL,NULL,'abc')")
+                    conn.execute("INSERT INTO passage_spans VALUES('p_1',0,0,3,NULL)")
+                    body_tok = "t99" if alter_posting else "t616263"
+                    conn.execute("INSERT INTO search(rowid, title_tokens, body_tokens) VALUES(1, 't61', ?)", (body_tok,))
+
+            make_db(db_a, reverse_map=False, alter_posting=False)
+            make_db(db_b, reverse_map=True, alter_posting=False)
+            make_db(db_bad, reverse_map=False, alter_posting=True)
+
+            eq_res = sc.compare_databases(db_a, db_b)
+            self.assertTrue(eq_res["semanticallyEqual"], eq_res["mismatches"])
+
+            bad_res = sc.compare_databases(db_a, db_bad)
+            self.assertFalse(bad_res["semanticallyEqual"])
+            self.assertEqual([m["section"] for m in bad_res["mismatches"]], ["ftsPostings"])
 
 
 if __name__ == "__main__":

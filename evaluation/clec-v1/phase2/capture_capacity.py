@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rerunnable single-run capacity capture for clec-publish and clec sync."""
+"""Rerunnable single-run capacity feasibility capture for clec-publish and clec sync."""
 
 from __future__ import annotations
 
@@ -19,6 +19,16 @@ import threading
 import time
 from typing import Any
 
+
+POSTING_RECORD_HEADER_BYTES = 15
+FIXED_COMPONENT_ALLOWANCE_BYTES = 65536
+UNCOVERED_STORAGE_OVERHEADS = (
+    "sqlite_wal_shm_and_rollback_journals",
+    "sqlite_temp_btree_and_sort_spill_files",
+    "filesystem_block_allocation_slack",
+    "filesystem_inodes_and_directory_metadata",
+    "os_and_runtime_temp_buffers",
+)
 
 DEFAULT_BASELINE_FILES = (
     "collection/sources/drive/archive-transcripts-manifest.jsonl",
@@ -43,10 +53,15 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def dir_bytes_and_entries(root: Path) -> tuple[int, list[str]]:
+def estimate_posting_buckets_bytes(posting_count: int, total_term_bytes: int) -> int:
+    return int(posting_count) * POSTING_RECORD_HEADER_BYTES + int(total_term_bytes)
+
+
+def dir_usage_and_entries(root: Path) -> tuple[int, int, list[str]]:
     if not root.exists():
-        return 0, []
-    total = 0
+        return 0, 0, []
+    logical_total = 0
+    allocated_total = 0
     names: list[str] = []
     stack = [root]
     while stack:
@@ -62,18 +77,25 @@ def dir_bytes_and_entries(root: Path) -> tuple[int, list[str]]:
                         elif entry.is_file(follow_symlinks=False):
                             if current == root:
                                 names.append(entry.name)
-                            total += entry.stat(follow_symlinks=False).st_size
+                            st = entry.stat(follow_symlinks=False)
+                            logical_total += st.st_size
+                            blocks = getattr(st, "st_blocks", None)
+                            allocated_total += (blocks * 512) if blocks is not None else st.st_size
                     except OSError:
                         pass
         except OSError:
             pass
-    return total, sorted(names)
+    return logical_total, allocated_total, sorted(names)
 
 
 def parse_time_output(stderr_text: str, system_name: str) -> dict[str, Any]:
     parsed: dict[str, Any] = {}
     if system_name == "Darwin":
-        wall_m = re.search(r"^\s*([0-9]+(?:\.[0-9]+)?)\s+real\s+([0-9]+(?:\.[0-9]+)?)\s+user\s+([0-9]+(?:\.[0-9]+)?)\s+sys\b", stderr_text, re.M)
+        wall_m = re.search(
+            r"^\s*([0-9]+(?:\.[0-9]+)?)\s+real\s+([0-9]+(?:\.[0-9]+)?)\s+user\s+([0-9]+(?:\.[0-9]+)?)\s+sys\b",
+            stderr_text,
+            re.M,
+        )
         if wall_m:
             parsed["wallSeconds"] = float(wall_m.group(1))
             parsed["userSeconds"] = float(wall_m.group(2))
@@ -122,6 +144,18 @@ def host_resources(target_path: Path) -> dict[str, Any]:
     }
 
 
+def _classify_transient_entry(name: str) -> str | None:
+    if name.startswith(".clec-fts-"):
+        return name.split(".")[1]
+    if ".building." in name and name.startswith("."):
+        return ".building"
+    if name in (".incoming.sqlite.tmp", ".active.tmp"):
+        return name
+    if name.endswith(("-wal", "-shm", "-journal")) or name.startswith("etilqs_"):
+        return name
+    return None
+
+
 def run_measured(
     *,
     label: str,
@@ -134,9 +168,10 @@ def run_measured(
     target_dir.mkdir(parents=True, exist_ok=True)
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    baseline_target, _ = dir_bytes_and_entries(target_dir)
-    baseline_tmp, _ = dir_bytes_and_entries(tmpdir)
-    baseline_combined = baseline_target + baseline_tmp
+    baseline_target_log, baseline_target_alloc, _ = dir_usage_and_entries(target_dir)
+    baseline_tmp_log, baseline_tmp_alloc, _ = dir_usage_and_entries(tmpdir)
+    baseline_combined_log = baseline_target_log + baseline_tmp_log
+    baseline_combined_alloc = baseline_target_alloc + baseline_tmp_alloc
 
     system_name = platform.system()
     time_bin = Path("/usr/bin/time")
@@ -150,37 +185,54 @@ def run_measured(
         for k, v in os.environ.items()
         if not any(tok in k.upper() for tok in ("API_KEY", "TOKEN", "SECRET"))
     }
-    env["TMPDIR"] = str(tmpdir)
+    tmp_str = str(tmpdir)
+    env["TMPDIR"] = tmp_str
+    env["SQLITE_TMPDIR"] = tmp_str
+    env["TEMP"] = tmp_str
+    env["TMP"] = tmp_str
 
     stats: dict[str, Any] = {
         "sampleCount": 0,
-        "maxTargetBytes": baseline_target,
-        "maxTmpdirBytes": baseline_tmp,
-        "maxCombinedBytes": baseline_combined,
+        "maxTargetLogicalBytes": baseline_target_log,
+        "maxTargetAllocatedBytes": baseline_target_alloc,
+        "maxTmpdirLogicalBytes": baseline_tmp_log,
+        "maxTmpdirAllocatedBytes": baseline_tmp_alloc,
+        "maxCombinedLogicalBytes": baseline_combined_log,
+        "maxCombinedAllocatedBytes": baseline_combined_alloc,
         "maxSampleTargetEntries": [],
         "maxSampleTmpdirEntries": [],
-        "observedTempDirPrefixes": [],
     }
     observed_prefixes: set[str] = set()
     stop_event = threading.Event()
 
+    def record_sample(t_log: int, t_alloc: int, t_entries: list[str], tmp_log: int, tmp_alloc: int, tmp_entries: list[str]) -> None:
+        combined_log = t_log + tmp_log
+        combined_alloc = t_alloc + tmp_alloc
+        for name in t_entries + tmp_entries:
+            tag = _classify_transient_entry(name)
+            if tag:
+                observed_prefixes.add(tag)
+        if t_log > stats["maxTargetLogicalBytes"]:
+            stats["maxTargetLogicalBytes"] = t_log
+        if t_alloc > stats["maxTargetAllocatedBytes"]:
+            stats["maxTargetAllocatedBytes"] = t_alloc
+        if tmp_log > stats["maxTmpdirLogicalBytes"]:
+            stats["maxTmpdirLogicalBytes"] = tmp_log
+        if tmp_alloc > stats["maxTmpdirAllocatedBytes"]:
+            stats["maxTmpdirAllocatedBytes"] = tmp_alloc
+        if combined_log >= stats["maxCombinedLogicalBytes"]:
+            stats["maxCombinedLogicalBytes"] = combined_log
+            stats["maxSampleTargetEntries"] = t_entries
+            stats["maxSampleTmpdirEntries"] = tmp_entries
+        if combined_alloc > stats["maxCombinedAllocatedBytes"]:
+            stats["maxCombinedAllocatedBytes"] = combined_alloc
+
     def sampler() -> None:
         while True:
-            t_bytes, t_entries = dir_bytes_and_entries(target_dir)
-            tmp_bytes, tmp_entries = dir_bytes_and_entries(tmpdir)
-            combined = t_bytes + tmp_bytes
+            t_log, t_alloc, t_entries = dir_usage_and_entries(target_dir)
+            tmp_log, tmp_alloc, tmp_entries = dir_usage_and_entries(tmpdir)
             stats["sampleCount"] += 1
-            for name in t_entries + tmp_entries:
-                if name.startswith(".clec-fts-") or name.startswith(".") and ".building." in name or name in (".incoming.sqlite.tmp", ".active.tmp"):
-                    observed_prefixes.add(name.split(".")[1] if name.startswith(".clec-fts-") else name)
-            if t_bytes > stats["maxTargetBytes"]:
-                stats["maxTargetBytes"] = t_bytes
-            if tmp_bytes > stats["maxTmpdirBytes"]:
-                stats["maxTmpdirBytes"] = tmp_bytes
-            if combined >= stats["maxCombinedBytes"]:
-                stats["maxCombinedBytes"] = combined
-                stats["maxSampleTargetEntries"] = t_entries
-                stats["maxSampleTmpdirEntries"] = tmp_entries
+            record_sample(t_log, t_alloc, t_entries, tmp_log, tmp_alloc, tmp_entries)
             if stop_event.wait(sample_interval):
                 break
 
@@ -192,19 +244,9 @@ def run_measured(
     thread.join(timeout=5.0)
     elapsed_monotonic = time.monotonic() - t_start
 
-    t_bytes_after, t_entries_after = dir_bytes_and_entries(target_dir)
-    tmp_bytes_after, tmp_entries_after = dir_bytes_and_entries(tmpdir)
-    final_target = t_bytes_after
-    final_tmp = tmp_bytes_after
-    final_combined = final_target + final_tmp
-    if t_bytes_after > stats["maxTargetBytes"]:
-        stats["maxTargetBytes"] = t_bytes_after
-    if tmp_bytes_after > stats["maxTmpdirBytes"]:
-        stats["maxTmpdirBytes"] = tmp_bytes_after
-    if final_combined > stats["maxCombinedBytes"]:
-        stats["maxCombinedBytes"] = final_combined
-        stats["maxSampleTargetEntries"] = t_entries_after
-        stats["maxSampleTmpdirEntries"] = tmp_entries_after
+    final_t_log, final_t_alloc, final_t_entries = dir_usage_and_entries(target_dir)
+    final_tmp_log, final_tmp_alloc, final_tmp_entries = dir_usage_and_entries(tmpdir)
+    record_sample(final_t_log, final_t_alloc, final_t_entries, final_tmp_log, final_tmp_alloc, final_tmp_entries)
 
     time_log_path.parent.mkdir(parents=True, exist_ok=True)
     time_log_path.write_text(proc.stderr, encoding="utf-8")
@@ -219,23 +261,39 @@ def run_measured(
         "elapsedMonotonicSeconds": round(elapsed_monotonic, 3),
         "timeCommandMetrics": parsed_time,
         "diskSampling": {
-            "measurementBasis": f"polled_{int(round(sample_interval * 1000))}ms_lower_bound",
-            "caveat": "Polled directory walk captures a sampled maximum lower bound; transients shorter than the sample interval may exceed the observed peak.",
+            "measurementBasis": f"polled_{int(round(sample_interval * 1000))}ms_sampled_lower_bound",
+            "note": (
+                "Polled directory walk captures a sampled lower bound across owned target and temp roots "
+                "(including journals and temp files); transients shorter than the sample interval may exceed the observed peak."
+            ),
             "intervalSeconds": sample_interval,
             "sampleCount": stats["sampleCount"],
+            "watchedRoots": [str(target_dir), str(tmpdir)],
+            "envTempVars": {"TMPDIR": tmp_str, "SQLITE_TMPDIR": tmp_str, "TEMP": tmp_str, "TMP": tmp_str},
             "targetDir": str(target_dir),
             "tmpdir": str(tmpdir),
-            "baselineTargetBytes": baseline_target,
-            "baselineTmpdirBytes": baseline_tmp,
-            "baselineCombinedBytes": baseline_combined,
-            "finalTargetBytes": final_target,
-            "finalTmpdirBytes": final_tmp,
-            "finalCombinedBytes": final_combined,
-            "maxObservedTargetBytes": stats["maxTargetBytes"],
-            "maxObservedTmpdirBytes": stats["maxTmpdirBytes"],
-            "maxObservedCombinedBytes": stats["maxCombinedBytes"],
-            "maxObservedTransientOverBaselineBytes": max(0, stats["maxCombinedBytes"] - baseline_combined),
-            "maxObservedTransientOverFinalBytes": max(0, stats["maxCombinedBytes"] - final_combined),
+            "baselineTargetLogicalBytes": baseline_target_log,
+            "baselineTargetAllocatedBytes": baseline_target_alloc,
+            "baselineTmpdirLogicalBytes": baseline_tmp_log,
+            "baselineTmpdirAllocatedBytes": baseline_tmp_alloc,
+            "baselineCombinedLogicalBytes": baseline_combined_log,
+            "baselineCombinedAllocatedBytes": baseline_combined_alloc,
+            "finalTargetLogicalBytes": final_t_log,
+            "finalTargetAllocatedBytes": final_t_alloc,
+            "finalTmpdirLogicalBytes": final_tmp_log,
+            "finalTmpdirAllocatedBytes": final_tmp_alloc,
+            "finalCombinedLogicalBytes": final_t_log + final_tmp_log,
+            "finalCombinedAllocatedBytes": final_t_alloc + final_tmp_alloc,
+            "maxObservedTargetLogicalBytes": stats["maxTargetLogicalBytes"],
+            "maxObservedTargetAllocatedBytes": stats["maxTargetAllocatedBytes"],
+            "maxObservedTmpdirLogicalBytes": stats["maxTmpdirLogicalBytes"],
+            "maxObservedTmpdirAllocatedBytes": stats["maxTmpdirAllocatedBytes"],
+            "maxObservedCombinedLogicalBytes": stats["maxCombinedLogicalBytes"],
+            "maxObservedCombinedAllocatedBytes": stats["maxCombinedAllocatedBytes"],
+            "maxObservedTransientOverBaselineLogicalBytes": max(0, stats["maxCombinedLogicalBytes"] - baseline_combined_log),
+            "maxObservedTransientOverFinalLogicalBytes": max(
+                0, stats["maxCombinedLogicalBytes"] - (final_t_log + final_tmp_log)
+            ),
             "peakSampleTargetEntries": stats["maxSampleTargetEntries"],
             "peakSampleTmpdirEntries": stats["maxSampleTmpdirEntries"],
             "observedTransientNames": sorted(observed_prefixes),
@@ -243,7 +301,9 @@ def run_measured(
     }
 
 
-def compute_conservative_storage_bounds(db_path: Path, manifest: dict[str, Any], prior_sqlite_bytes: int = 0) -> dict[str, Any]:
+def compute_scoped_component_storage_estimate(
+    db_path: Path, manifest: dict[str, Any], prior_sqlite_bytes: int = 0
+) -> dict[str, Any]:
     sqlite_bytes = int(manifest["bytes"])
     zst_bytes = int(manifest["compressedBytes"])
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
@@ -251,23 +311,25 @@ def compute_conservative_storage_bounds(db_path: Path, manifest: dict[str, Any],
         posting_count, total_term_bytes = conn.execute(
             "SELECT count(*), coalesce(sum(length(term)), 0) FROM temp.__v_cap"
         ).fetchone()
-    # One PostingBuckets instance encodes (8-byte rowid + 1-byte col + 4-byte offset + 2-byte len + term_bytes).
-    single_posting_set_bytes = int(posting_count) * 15 + int(total_term_bytes)
+    single_posting_set_bytes = estimate_posting_buckets_bytes(int(posting_count), int(total_term_bytes))
     both_posting_sets_bytes = single_posting_set_bytes * 2
     publish_validate_phase = sqlite_bytes + both_posting_sets_bytes
     publish_compress_phase = sqlite_bytes + zst_bytes
-    publish_conservative_peak = max(publish_validate_phase, publish_compress_phase) + 65536
-    sync_conservative_peak = prior_sqlite_bytes + sqlite_bytes + both_posting_sets_bytes + 65536
+    publish_component_peak = max(publish_validate_phase, publish_compress_phase) + FIXED_COMPONENT_ALLOWANCE_BYTES
+    sync_component_peak = prior_sqlite_bytes + sqlite_bytes + both_posting_sets_bytes + FIXED_COMPONENT_ALLOWANCE_BYTES
     return {
+        "scope": "scoped_component_estimate_only_not_full_filesystem_bound",
+        "uncoveredOverheads": list(UNCOVERED_STORAGE_OVERHEADS),
+        "fixedAllowanceBytes": FIXED_COMPONENT_ALLOWANCE_BYTES,
         "sqliteBytes": sqlite_bytes,
         "compressedZstBytes": zst_bytes,
         "ftsPostingCount": int(posting_count),
         "singlePostingBucketSetBytes": single_posting_set_bytes,
         "bothPostingBucketSetsBytes": both_posting_sets_bytes,
-        "publishValidatePhaseBoundBytes": publish_validate_phase,
-        "publishCompressPhaseBoundBytes": publish_compress_phase,
-        "publishConservativePeakBoundBytes": publish_conservative_peak,
-        "syncConservativePeakBoundBytes": sync_conservative_peak,
+        "publishValidateComponentBytes": publish_validate_phase,
+        "publishCompressComponentBytes": publish_compress_phase,
+        "publishScopedComponentPeakBytes": publish_component_peak,
+        "syncScopedComponentPeakBytes": sync_component_peak,
     }
 
 
@@ -326,9 +388,7 @@ def main() -> int:
     pre_host = host_resources(out_dir)
     min_free_bytes = int(args.min_free_gib * (1024**3))
     if pre_host["diskFreeBytes"] < min_free_bytes:
-        raise SystemExit(
-            f"Insufficient free disk space: {pre_host['diskFreeBytes']} B < {min_free_bytes} B"
-        )
+        raise SystemExit(f"Insufficient free disk space: {pre_host['diskFreeBytes']} B < {min_free_bytes} B")
 
     pre_hashes, pre_ok = compute_workspace_hashes(workspace, args.baseline_json)
     if not pre_ok:
@@ -375,7 +435,7 @@ def main() -> int:
     (run_root / "sync-output.json").write_text(json.dumps(sync_payload, indent=2) + "\n", encoding="utf-8")
 
     db_path = data_dir / f"{manifest['sha256']}.sqlite"
-    conservative_bounds = compute_conservative_storage_bounds(db_path, manifest, prior_sqlite_bytes=0)
+    scoped_estimate = compute_scoped_component_storage_estimate(db_path, manifest, prior_sqlite_bytes=0)
 
     post_hashes, post_ok = compute_workspace_hashes(workspace, args.baseline_json)
     if args.baseline_json is None:
@@ -389,9 +449,10 @@ def main() -> int:
         shutil.rmtree(sync_tmp, ignore_errors=True)
 
     report = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "measurementNature": "single_run_capacity_feasibility_not_speed_benchmark",
+        "hostFitVerdict": "verified_for_measured_run_on_local_host_not_universal_bound",
         "binaries": {
             "clec": {"path": str(clec_bin), "sha256": sha256_file(clec_bin)},
             "clecPublish": {"path": str(pub_bin), "sha256": sha256_file(pub_bin)},
@@ -401,7 +462,7 @@ def main() -> int:
         "manifest": manifest,
         "publish": {k: v for k, v in pub_run.items() if k != "stdout"},
         "sync": {k: v for k, v in sync_run.items() if k != "stdout"},
-        "conservativeStorageBounds": conservative_bounds,
+        "scopedComponentStorageEstimate": scoped_estimate,
         "workspaceBaselineUnchanged": post_ok,
         "workspaceBaselineCheck": post_hashes,
         "artifactsKept": args.keep_artifacts,
@@ -414,11 +475,13 @@ def main() -> int:
                 "release": manifest["sha256"],
                 "counts": manifest["counts"],
                 "publishMaxRssBytes": pub_run["timeCommandMetrics"].get("maxRssBytes"),
-                "publishMaxObservedDiskBytes": pub_run["diskSampling"]["maxObservedCombinedBytes"],
-                "publishConservativeBoundBytes": conservative_bounds["publishConservativePeakBoundBytes"],
+                "publishSampledLowerBoundLogicalBytes": pub_run["diskSampling"]["maxObservedCombinedLogicalBytes"],
+                "publishSampledLowerBoundAllocatedBytes": pub_run["diskSampling"]["maxObservedCombinedAllocatedBytes"],
+                "publishScopedComponentEstimateBytes": scoped_estimate["publishScopedComponentPeakBytes"],
                 "syncMaxRssBytes": sync_run["timeCommandMetrics"].get("maxRssBytes"),
-                "syncMaxObservedDiskBytes": sync_run["diskSampling"]["maxObservedCombinedBytes"],
-                "syncConservativeBoundBytes": conservative_bounds["syncConservativePeakBoundBytes"],
+                "syncSampledLowerBoundLogicalBytes": sync_run["diskSampling"]["maxObservedCombinedLogicalBytes"],
+                "syncSampledLowerBoundAllocatedBytes": sync_run["diskSampling"]["maxObservedCombinedAllocatedBytes"],
+                "syncScopedComponentEstimateBytes": scoped_estimate["syncScopedComponentPeakBytes"],
                 "workspaceBaselineUnchanged": post_ok,
             },
             ensure_ascii=False,
