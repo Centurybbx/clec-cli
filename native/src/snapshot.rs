@@ -470,6 +470,18 @@ fn build_in_staging(
         }
 
         for cue in &extraction.cues {
+            let start_ms = i64::try_from(cue.start_ms).map_err(|_| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Cue start_ms exceeds SQLite integer range.",
+                )
+            })?;
+            let end_ms = i64::try_from(cue.end_ms).map_err(|_| {
+                ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Cue end_ms exceeds SQLite integer range.",
+                )
+            })?;
             tx.execute(
                 "INSERT INTO cues VALUES(?,?,?,?,?,?,?,?,?)",
                 params![
@@ -480,8 +492,8 @@ fn build_in_staging(
                     cue.raw_end_byte as i64,
                     cue.text_start_byte as i64,
                     cue.text_end_byte as i64,
-                    cue.start_ms as i64,
-                    cue.end_ms as i64
+                    start_ms,
+                    end_ms
                 ],
             )
             .map_err(|e| {

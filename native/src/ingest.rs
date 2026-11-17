@@ -120,6 +120,13 @@ fn split_lines_with_offsets(text: &str) -> Vec<LineSlice<'_>> {
     lines
 }
 
+fn parse_ascii_u64(part: &str) -> Option<u64> {
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse::<u64>().ok()
+}
+
 fn parse_timestamp_ms(token: &str) -> Option<u64> {
     let normalized = token.replace(',', ".");
     let (hms, ms_str) = normalized.split_once('.')?;
@@ -129,18 +136,26 @@ fn parse_timestamp_ms(token: &str) -> Option<u64> {
     let ms: u64 = ms_str.parse().ok()?;
     let parts: Vec<&str> = hms.split(':').collect();
     let (hours, minutes, seconds) = match parts.as_slice() {
-        [m, s] => (0u64, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [m, s] => (0u64, parse_ascii_u64(m)?, parse_ascii_u64(s)?),
         [h, m, s] => (
-            h.parse::<u64>().ok()?,
-            m.parse::<u64>().ok()?,
-            s.parse::<u64>().ok()?,
+            parse_ascii_u64(h)?,
+            parse_ascii_u64(m)?,
+            parse_ascii_u64(s)?,
         ),
         _ => return None,
     };
     if minutes >= 60 || seconds >= 60 {
         return None;
     }
-    Some(((hours * 3600) + (minutes * 60) + seconds) * 1000 + ms)
+    let total_secs = hours
+        .checked_mul(3600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    let total_ms = total_secs.checked_mul(1000)?.checked_add(ms)?;
+    if i64::try_from(total_ms).is_err() {
+        return None;
+    }
+    Some(total_ms)
 }
 
 fn parse_timing_line(trimmed: &str) -> Option<Result<(u64, u64), &'static str>> {
@@ -772,5 +787,47 @@ mod tests {
                 p.text
             );
         }
+    }
+
+    #[test]
+    fn cue_timestamps_enforce_checked_i64_bounds_without_wrapping_or_rejecting_longform() {
+        let srt = concat!(
+            "1\n00:00:01,000 --> 00:00:02,000\nnormal caption\n\n",
+            "2\n120:00:00,000 --> 120:00:01,500\nlongform hours\n\n",
+            "3\n2562047788015:12:55,806 --> 2562047788015:12:55,807\nmax representable\n\n",
+            "4\n2562047788015:12:55,807 --> 2562047788015:12:55,808\njust over i64 max\n\n",
+            "5\n5124095576031:00:00,000 --> 5124095576031:00:01,000\nu64 mul wrap\n\n",
+            "6\n99999999999999999999:00:00,000 --> 99999999999999999999:00:01,000\nhuge u64\n\n",
+            "7\n00:00:05,000 --> 00:00:04,000\nreversed time\n",
+        );
+        let ext = extract_source(srt.as_bytes(), true).unwrap();
+        assert_eq!(ext.cues.len(), 3);
+        assert_eq!(ext.cues[0].start_ms, 1000);
+        assert_eq!(ext.cues[0].end_ms, 2000);
+        assert_eq!(ext.cues[1].start_ms, 120 * 3_600_000);
+        assert_eq!(ext.cues[1].end_ms, 120 * 3_600_000 + 1500);
+        assert_eq!(ext.cues[2].start_ms, (i64::MAX - 1) as u64);
+        assert_eq!(ext.cues[2].end_ms, i64::MAX as u64);
+        assert_eq!(ext.diagnostics.len(), 4);
+        assert!(ext.diagnostics[0].contains("Invalid timestamp"));
+        assert!(ext.diagnostics[1].contains("Invalid timestamp"));
+        assert!(ext.diagnostics[2].contains("Invalid timestamp"));
+        assert!(ext.diagnostics[3].contains("Empty or reversed cue"));
+
+        let only_overflow = "1\n5124095576031:00:00,000 --> 5124095576031:00:01,000\nalpha.\n";
+        let ext_only = extract_source(only_overflow.as_bytes(), true).unwrap();
+        assert!(ext_only.cues.is_empty());
+        assert!(
+            ext_only
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("Invalid timestamp"))
+        );
+        assert!(
+            ext_only
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("No usable subtitle cues"))
+        );
     }
 }
