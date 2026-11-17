@@ -12,7 +12,7 @@ use crate::domain::{
 use crate::ingest::{SubtitleCue, reconstruct_passage_text};
 use crate::lexical::normalize_for_search;
 
-pub const SCHEMA_SQL: &str = "
+pub(crate) const SCHEMA_SQL: &str = "
 PRAGMA journal_mode=DELETE;
 PRAGMA foreign_keys=ON;
 CREATE TABLE metadata(
@@ -109,7 +109,7 @@ pub struct CorpusCounts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkRecord {
+pub(crate) struct WorkRecord {
     pub work_id: WorkId,
     pub work_key: String,
     pub title: String,
@@ -117,7 +117,7 @@ pub struct WorkRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SourceRecord {
+pub(crate) struct SourceRecord {
     pub source_id: SourceId,
     pub work_id: WorkId,
     pub path: String,
@@ -136,7 +136,7 @@ pub struct SourceRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PassageContext {
+pub(crate) struct PassageContext {
     pub passage_id: PassageId,
     pub ordinal: usize,
     pub boundary: BoundaryKind,
@@ -148,7 +148,7 @@ pub struct PassageContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct FindMatch {
+pub(crate) struct FindMatch {
     pub start_byte: usize,
     pub end_byte: usize,
     pub passage_ids: Vec<PassageId>,
@@ -156,7 +156,7 @@ pub struct FindMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PassageReadItem {
+pub(crate) struct PassageReadItem {
     pub passage_id: PassageId,
     pub work: WorkRecord,
     pub source: SourceRecord,
@@ -178,7 +178,7 @@ pub struct PassageReadItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SourceOriginalItem {
+pub(crate) struct SourceOriginalItem {
     pub work: WorkRecord,
     pub source: SourceRecord,
     pub diagnostics: Vec<String>,
@@ -191,7 +191,7 @@ pub struct SourceOriginalItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SourceOverviewItem {
+pub(crate) struct SourceOverviewItem {
     pub work: WorkRecord,
     pub source: SourceRecord,
     pub passage_count: usize,
@@ -202,7 +202,7 @@ pub struct SourceOverviewItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SourceListEntry {
+pub(crate) struct SourceListEntry {
     pub work_id: WorkId,
     pub work_key: String,
     pub work_title: String,
@@ -223,12 +223,12 @@ pub struct SourceListEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct DiagnosticsSummary {
+pub(crate) struct DiagnosticsSummary {
     pub sources_with_diagnostics: usize,
     pub total_diagnostics: usize,
 }
 
-pub struct VerifiedPassageCore {
+pub(crate) struct VerifiedPassageCore {
     pub context: PassageContext,
     pub source: SourceRecord,
     pub work: WorkRecord,
@@ -236,13 +236,26 @@ pub struct VerifiedPassageCore {
     pub continued_to: Option<PassageId>,
 }
 
-pub struct CorpusStore {
+pub(crate) struct Bm25Candidate {
+    pub passage_id: PassageId,
+    pub work_id: WorkId,
+}
+
+pub(crate) struct CandidateFilter<'a> {
+    pub work_filter: Option<&'a WorkId>,
+    pub source_filter: Option<&'a SourceId>,
+    pub role_filter: Option<SourceRole>,
+    pub date_from: Option<&'a DateYmd>,
+    pub date_to: Option<&'a DateYmd>,
+}
+
+pub(crate) struct CorpusStore {
     conn: Connection,
     pub release: ReleaseHash,
 }
 
 impl CorpusStore {
-    pub fn open_readonly(path: &Path, release: ReleaseHash) -> Result<Self, ClecError> {
+    pub(crate) fn open_readonly(path: &Path, release: ReleaseHash) -> Result<Self, ClecError> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -267,8 +280,74 @@ impl CorpusStore {
         Ok(store)
     }
 
-    pub fn connection(&self) -> &Connection {
-        &self.conn
+    pub(crate) fn query_bm25_candidates(
+        &self,
+        fts_query: &str,
+        filter: &CandidateFilter<'_>,
+        limit: usize,
+    ) -> Result<Vec<Bm25Candidate>, ClecError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT p.id, p.work_id, bm25(search, 4.0, 1.0) AS score
+                 FROM search
+                 JOIN passages p ON p.rowid = search.rowid
+                 JOIN sources s ON s.id = p.source_id
+                 WHERE search MATCH ?1
+                   AND (?2 IS NULL OR p.work_id = ?2)
+                   AND (?3 IS NULL OR p.source_id = ?3)
+                   AND (?4 IS NULL OR s.role = ?4)
+                   AND (?5 IS NULL OR s.date >= ?5)
+                   AND (?6 IS NULL OR s.date <= ?6)
+                 ORDER BY score ASC, p.id ASC
+                 LIMIT ?7",
+            )
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Search query failed: {e}"),
+                )
+            })?;
+
+        let work_arg = filter.work_filter.map(WorkId::as_str);
+        let source_arg = filter.source_filter.map(SourceId::as_str);
+        let role_arg = filter.role_filter.map(SourceRole::as_str);
+        let from_arg = filter.date_from.map(DateYmd::as_str);
+        let to_arg = filter.date_to.map(DateYmd::as_str);
+
+        let mut rows = stmt
+            .query(params![
+                fts_query,
+                work_arg,
+                source_arg,
+                role_arg,
+                from_arg,
+                to_arg,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ])
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Search execution failed: {e}"),
+                )
+            })?;
+
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| {
+            ClecError::new(ErrorCode::InternalError, format!("Search row error: {e}"))
+        })? {
+            let pid_str: String = row.get(0).map_err(|e| {
+                ClecError::new(ErrorCode::InvalidPackage, format!("Row error: {e}"))
+            })?;
+            let wid_str: String = row.get(1).map_err(|e| {
+                ClecError::new(ErrorCode::InvalidPackage, format!("Row error: {e}"))
+            })?;
+            candidates.push(Bm25Candidate {
+                passage_id: PassageId::parse(&pid_str)?,
+                work_id: WorkId::parse(&wid_str)?,
+            });
+        }
+        Ok(candidates)
     }
 
     fn verify_format_header(&self) -> Result<(), ClecError> {
@@ -675,7 +754,7 @@ impl CorpusStore {
             let spans = self.load_spans(&id_str)?;
             let cue_limit = cue_counts.get(&source_id_str).copied().unwrap_or(0);
             for span in &spans {
-                if let Some(cue_ord) = span.cue_ordinal
+                if let Some(cue_ord) = span.cue_ordinal()
                     && cue_ord >= cue_limit
                 {
                     return Err(ClecError::new(
@@ -878,7 +957,7 @@ impl CorpusStore {
         source_id: &SourceId,
         spans: &[ByteSpan],
     ) -> Result<Vec<SubtitleCue>, ClecError> {
-        let cue_ordinals: Vec<usize> = spans.iter().filter_map(|s| s.cue_ordinal).collect();
+        let cue_ordinals: Vec<usize> = spans.iter().filter_map(ByteSpan::cue_ordinal).collect();
         if cue_ordinals.is_empty() {
             return Ok(Vec::new());
         }

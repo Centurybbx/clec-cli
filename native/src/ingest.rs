@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{BoundaryKind, ByteSpan, ClecError, ErrorCode, SourceRole};
 
-pub const TARGET_MIN_SCALARS: usize = 1000;
-pub const TARGET_MAX_SCALARS: usize = 1200;
-pub const HARD_MAX_SCALARS: usize = 2000;
+pub(crate) const TARGET_MIN_SCALARS: usize = 1000;
+pub(crate) const TARGET_MAX_SCALARS: usize = 1200;
+pub(crate) const HARD_MAX_SCALARS: usize = 2000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SubtitleCue {
+pub(crate) struct SubtitleCue {
     pub ordinal: usize,
     pub original_identifier: Option<String>,
     pub raw_start_byte: usize,
@@ -23,7 +23,7 @@ pub struct SubtitleCue {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExtractionResult {
+pub(crate) struct ExtractionResult {
     pub text: String,
     pub is_subtitle: bool,
     pub cues: Vec<SubtitleCue>,
@@ -31,7 +31,7 @@ pub struct ExtractionResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct DraftPassage {
+pub(crate) struct DraftPassage {
     pub ordinal: usize,
     pub boundary: BoundaryKind,
     pub is_continuation: bool,
@@ -39,14 +39,14 @@ pub struct DraftPassage {
     pub text: String,
 }
 
-pub fn is_subtitle_path(path: &str) -> bool {
+pub(crate) fn is_subtitle_path(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "srt" | "str" | "vtt"))
 }
 
-pub fn is_supported_text_path(path: &str) -> bool {
+pub(crate) fn is_supported_text_path(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -58,7 +58,10 @@ pub fn is_supported_text_path(path: &str) -> bool {
         })
 }
 
-pub fn extract_source(raw_bytes: &[u8], is_subtitle: bool) -> Result<ExtractionResult, ClecError> {
+pub(crate) fn extract_source(
+    raw_bytes: &[u8],
+    is_subtitle: bool,
+) -> Result<ExtractionResult, ClecError> {
     let text = std::str::from_utf8(raw_bytes)
         .map_err(|_| ClecError::new(ErrorCode::InvalidPackage, "Source is not valid UTF-8."))?
         .to_owned();
@@ -297,7 +300,10 @@ fn parse_subtitle_cues(text: &str) -> (Vec<SubtitleCue>, Vec<String>) {
     (cues, diagnostics)
 }
 
-pub fn reconstruct_passage_text(raw_bytes: &[u8], spans: &[ByteSpan]) -> Result<String, ClecError> {
+pub(crate) fn reconstruct_passage_text(
+    raw_bytes: &[u8],
+    spans: &[ByteSpan],
+) -> Result<String, ClecError> {
     if spans.is_empty() {
         return Err(ClecError::new(
             ErrorCode::InvalidPackage,
@@ -306,14 +312,14 @@ pub fn reconstruct_passage_text(raw_bytes: &[u8], spans: &[ByteSpan]) -> Result<
     }
     let mut parts = Vec::with_capacity(spans.len());
     for span in spans {
-        if span.end_byte > raw_bytes.len() || span.start_byte >= span.end_byte {
+        if span.end_byte() > raw_bytes.len() || span.start_byte() >= span.end_byte() {
             return Err(ClecError::new(
                 ErrorCode::IntegrityMismatch,
                 "Passage byte span is out of bounds for source bytes.",
             ));
         }
         let slice =
-            std::str::from_utf8(&raw_bytes[span.start_byte..span.end_byte]).map_err(|_| {
+            std::str::from_utf8(&raw_bytes[span.start_byte()..span.end_byte()]).map_err(|_| {
                 ClecError::new(
                     ErrorCode::IntegrityMismatch,
                     "Passage byte span does not align on UTF-8 boundaries.",
@@ -324,7 +330,7 @@ pub fn reconstruct_passage_text(raw_bytes: &[u8], spans: &[ByteSpan]) -> Result<
     Ok(parts.join("\n"))
 }
 
-pub fn segment_source(
+pub(crate) fn segment_source(
     extraction: &ExtractionResult,
     role: SourceRole,
 ) -> Result<Vec<DraftPassage>, ClecError> {

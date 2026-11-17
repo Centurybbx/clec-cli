@@ -1,23 +1,23 @@
 use std::fmt;
 use std::str::FromStr;
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CORPUS_FORMAT: &str = "clec-native-v1";
 pub const SEGMENTATION_REVISION: &str = "utf8-scalar-1000-2000-v1";
 pub const SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_MAX_BYTES: usize = 65_536;
+pub(crate) const DEFAULT_MAX_BYTES: usize = 65_536;
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
     hex_encode(&digest)
 }
 
-pub fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -27,7 +27,8 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-pub fn hex_decode(input: &str) -> Option<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn hex_decode(input: &str) -> Option<Vec<u8>> {
     if !input.len().is_multiple_of(2) {
         return None;
     }
@@ -41,6 +42,7 @@ pub fn hex_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[cfg(test)]
 fn from_hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -55,11 +57,47 @@ fn is_lower_hex(s: &str, min_len: usize, max_len: usize) -> bool {
         && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+fn deserialize_validated<'de, D, T>(
+    deserializer: D,
+    parse: fn(&str) -> Result<T, ClecError>,
+) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    parse(&raw).map_err(serde::de::Error::custom)
+}
+
+fn string_pattern_schema(pattern: &str, description: &str) -> Schema {
+    json_schema!({
+        "type": "string",
+        "pattern": pattern,
+        "description": description
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct WorkId(String);
+
+impl<'de> Deserialize<'de> for WorkId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_validated(deserializer, Self::parse)
+    }
+}
+
+impl JsonSchema for WorkId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkId".into()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_pattern_schema(
+            "^w_[0-9a-f]{16,64}$",
+            "Typed WorkId with 'w_' prefix and 16..64 lowercase hex characters",
+        )
+    }
+}
 
 impl WorkId {
     pub fn from_work_key(work_key: &str) -> Result<Self, ClecError> {
@@ -108,11 +146,28 @@ impl FromStr for WorkId {
     }
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SourceId(String);
+
+impl<'de> Deserialize<'de> for SourceId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_validated(deserializer, Self::parse)
+    }
+}
+
+impl JsonSchema for SourceId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SourceId".into()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_pattern_schema(
+            "^s_[0-9a-f]{16,64}$",
+            "Typed SourceId with 's_' prefix and 16..64 lowercase hex characters",
+        )
+    }
+}
 
 impl SourceId {
     pub fn derive(
@@ -174,11 +229,28 @@ impl FromStr for SourceId {
     }
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PassageId(String);
+
+impl<'de> Deserialize<'de> for PassageId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_validated(deserializer, Self::parse)
+    }
+}
+
+impl JsonSchema for PassageId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PassageId".into()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_pattern_schema(
+            "^p_[0-9a-f]{16,64}$",
+            "Typed PassageId with 'p_' prefix and 16..64 lowercase hex characters",
+        )
+    }
+}
 
 impl PassageId {
     pub fn derive(source_id: &SourceId, ordinal: usize, spans: &[ByteSpan]) -> Self {
@@ -229,9 +301,28 @@ impl FromStr for PassageId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseHash(String);
+
+impl<'de> Deserialize<'de> for ReleaseHash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_validated(deserializer, Self::parse)
+    }
+}
+
+impl JsonSchema for ReleaseHash {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ReleaseHash".into()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_pattern_schema(
+            "^[0-9a-f]{64}$",
+            "64-character lowercase SHA-256 hex digest",
+        )
+    }
+}
 
 impl ReleaseHash {
     pub fn parse(raw: &str) -> Result<Self, ClecError> {
@@ -381,13 +472,32 @@ impl BoundaryKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(
+    description = "Half-open UTF-8 byte span into raw source bytes with startByte < endByte"
+)]
 pub struct ByteSpan {
-    pub start_byte: usize,
-    pub end_byte: usize,
+    start_byte: usize,
+    #[schemars(range(min = 1))]
+    end_byte: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cue_ordinal: Option<usize>,
+    cue_ordinal: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawByteSpan {
+    start_byte: usize,
+    end_byte: usize,
+    cue_ordinal: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for ByteSpan {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawByteSpan::deserialize(deserializer)?;
+        Self::new(raw.start_byte, raw.end_byte, raw.cue_ordinal).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ByteSpan {
@@ -408,13 +518,42 @@ impl ByteSpan {
             cue_ordinal,
         })
     }
+
+    pub fn start_byte(&self) -> usize {
+        self.start_byte
+    }
+
+    pub fn end_byte(&self) -> usize {
+        self.end_byte
+    }
+
+    pub fn cue_ordinal(&self) -> Option<usize> {
+        self.cue_ordinal
+    }
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct DateYmd(String);
+
+impl<'de> Deserialize<'de> for DateYmd {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_validated(deserializer, Self::parse)
+    }
+}
+
+impl JsonSchema for DateYmd {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DateYmd".into()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        string_pattern_schema(
+            "^\\d{4}-\\d{2}-\\d{2}$",
+            "Calendar date in YYYY-MM-DD format",
+        )
+    }
+}
 
 impl DateYmd {
     pub fn parse(raw: &str) -> Result<Self, ClecError> {
@@ -681,5 +820,22 @@ mod tests {
         assert!(DateYmd::parse("2025-02-29").is_err());
         assert!(DateYmd::parse("2026-13-01").is_err());
         assert!(DateYmd::parse("2026-04-31").is_err());
+    }
+
+    #[test]
+    fn serde_deserialization_validates_domain_invariants() {
+        assert!(serde_json::from_str::<WorkId>("\"bad\"").is_err());
+        assert!(serde_json::from_str::<SourceId>("\"w_0123456789abcdef\"").is_err());
+        assert!(serde_json::from_str::<PassageId>("\"p_ZZZZ0123456789abcdef\"").is_err());
+        assert!(serde_json::from_str::<ReleaseHash>("\"short\"").is_err());
+        assert!(serde_json::from_str::<DateYmd>("\"2025-02-29\"").is_err());
+        assert!(serde_json::from_str::<ByteSpan>(r#"{"startByte":5,"endByte":5}"#).is_err());
+        assert!(serde_json::from_str::<ByteSpan>(r#"{"startByte":6,"endByte":2}"#).is_err());
+
+        let valid_span: ByteSpan =
+            serde_json::from_str(r#"{"startByte":2,"endByte":8,"cueOrdinal":0}"#).unwrap();
+        assert_eq!(valid_span.start_byte(), 2);
+        assert_eq!(valid_span.end_byte(), 8);
+        assert_eq!(valid_span.cue_ordinal(), Some(0));
     }
 }

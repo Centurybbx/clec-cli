@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 
-use rusqlite::params;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -10,24 +9,24 @@ use crate::domain::{
 };
 use crate::ingest::SubtitleCue;
 use crate::lexical::{encode_fts_token, query_terms};
-use crate::store::{CorpusStore, SourceRecord, WorkRecord};
+use crate::store::{CandidateFilter, CorpusStore, SourceRecord, WorkRecord};
 
-pub const MAX_QUERIES: usize = 4;
-pub const TOP_PER_QUERY: usize = 100;
-pub const DEFAULT_SEARCH_LIMIT: usize = 5;
-pub const MAX_SEARCH_LIMIT: usize = 5;
-pub const DEFAULT_PER_WORK: usize = 2;
-pub const RRF_K: f64 = 60.0;
+pub(crate) const MAX_QUERIES: usize = 4;
+pub(crate) const TOP_PER_QUERY: usize = 100;
+pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 5;
+pub(crate) const MAX_SEARCH_LIMIT: usize = 5;
+pub(crate) const DEFAULT_PER_WORK: usize = 2;
+pub(crate) const RRF_K: f64 = 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum MatchMode {
+pub(crate) enum MatchMode {
     Any,
     All,
 }
 
 #[derive(Debug, Clone)]
-pub struct SearchRequest {
+pub(crate) struct SearchRequest {
     pub queries: Vec<String>,
     pub match_mode: MatchMode,
     pub limit: usize,
@@ -42,7 +41,7 @@ pub struct SearchRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchHit {
+pub(crate) struct SearchHit {
     pub passage_id: PassageId,
     pub work: WorkRecord,
     pub source: SourceRecord,
@@ -61,7 +60,7 @@ pub struct SearchHit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct BudgetReport {
+pub(crate) struct BudgetReport {
     pub max_bytes: usize,
     pub used_bytes: usize,
     pub omitted_count: usize,
@@ -70,14 +69,14 @@ pub struct BudgetReport {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchQueryTerms {
+pub(crate) struct SearchQueryTerms {
     pub query: String,
     pub terms: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchData {
+pub(crate) struct SearchData {
     pub release: ReleaseHash,
     pub match_mode: MatchMode,
     pub queries: Vec<SearchQueryTerms>,
@@ -94,7 +93,10 @@ struct RankedCandidate {
     matched_queries: Vec<String>,
 }
 
-pub fn execute_search(store: &CorpusStore, req: &SearchRequest) -> Result<SearchData, ClecError> {
+pub(crate) fn execute_search(
+    store: &CorpusStore,
+    req: &SearchRequest,
+) -> Result<SearchData, ClecError> {
     if req.queries.is_empty() || req.queries.len() > MAX_QUERIES {
         return Err(ClecError::new(
             ErrorCode::InvalidQuery,
@@ -144,7 +146,15 @@ pub fn execute_search(store: &CorpusStore, req: &SearchRequest) -> Result<Search
         MatchMode::All => " AND ",
     };
 
-    let mut fused: BTreeMap<String, RankedCandidate> = BTreeMap::new();
+    let filter = CandidateFilter {
+        work_filter: req.work_filter.as_ref(),
+        source_filter: req.source_filter.as_ref(),
+        role_filter: req.role_filter,
+        date_from: req.date_from.as_ref(),
+        date_to: req.date_to.as_ref(),
+    };
+
+    let mut fused: BTreeMap<PassageId, RankedCandidate> = BTreeMap::new();
 
     for pq in &parsed_queries {
         let fts_query = pq
@@ -154,73 +164,18 @@ pub fn execute_search(store: &CorpusStore, req: &SearchRequest) -> Result<Search
             .collect::<Vec<_>>()
             .join(join_op);
 
-        let mut stmt = store
-            .connection()
-            .prepare(
-                "SELECT p.id, p.work_id, bm25(search, 4.0, 1.0) AS score
-                 FROM search
-                 JOIN passages p ON p.rowid = search.rowid
-                 JOIN sources s ON s.id = p.source_id
-                 WHERE search MATCH ?1
-                   AND (?2 IS NULL OR p.work_id = ?2)
-                   AND (?3 IS NULL OR p.source_id = ?3)
-                   AND (?4 IS NULL OR s.role = ?4)
-                   AND (?5 IS NULL OR s.date >= ?5)
-                   AND (?6 IS NULL OR s.date <= ?6)
-                 ORDER BY score ASC, p.id ASC
-                 LIMIT ?7",
-            )
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InternalError,
-                    format!("Search query failed: {e}"),
-                )
-            })?;
-
-        let work_arg = req.work_filter.as_ref().map(WorkId::as_str);
-        let source_arg = req.source_filter.as_ref().map(SourceId::as_str);
-        let role_arg = req.role_filter.map(SourceRole::as_str);
-        let from_arg = req.date_from.as_ref().map(DateYmd::as_str);
-        let to_arg = req.date_to.as_ref().map(DateYmd::as_str);
-
-        let mut rows = stmt
-            .query(params![
-                fts_query,
-                work_arg,
-                source_arg,
-                role_arg,
-                from_arg,
-                to_arg,
-                TOP_PER_QUERY as i64
-            ])
-            .map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InternalError,
-                    format!("Search execution failed: {e}"),
-                )
-            })?;
-
-        let mut rank = 0usize;
-        while let Some(row) = rows.next().map_err(|e| {
-            ClecError::new(ErrorCode::InternalError, format!("Search row error: {e}"))
-        })? {
-            let pid_str: String = row.get(0).map_err(|e| {
-                ClecError::new(ErrorCode::InvalidPackage, format!("Row error: {e}"))
-            })?;
-            let wid_str: String = row.get(1).map_err(|e| {
-                ClecError::new(ErrorCode::InvalidPackage, format!("Row error: {e}"))
-            })?;
-            let pid = PassageId::parse(&pid_str)?;
-            let wid = WorkId::parse(&wid_str)?;
+        let candidates = store.query_bm25_candidates(&fts_query, &filter, TOP_PER_QUERY)?;
+        for (rank, cand) in candidates.into_iter().enumerate() {
             let contribution = 1.0 / (RRF_K + (rank as f64 + 1.0));
-
-            let entry = fused.entry(pid_str).or_insert_with(|| RankedCandidate {
-                passage_id: pid,
-                work_id: wid,
-                rrf_score: 0.0,
-                best_rank: rank,
-                matched_queries: Vec::new(),
-            });
+            let entry = fused
+                .entry(cand.passage_id.clone())
+                .or_insert_with(|| RankedCandidate {
+                    passage_id: cand.passage_id,
+                    work_id: cand.work_id,
+                    rrf_score: 0.0,
+                    best_rank: rank,
+                    matched_queries: Vec::new(),
+                });
             entry.rrf_score += contribution;
             if rank < entry.best_rank {
                 entry.best_rank = rank;
@@ -228,7 +183,6 @@ pub fn execute_search(store: &CorpusStore, req: &SearchRequest) -> Result<Search
             if !entry.matched_queries.contains(&pq.query) {
                 entry.matched_queries.push(pq.query.clone());
             }
-            rank += 1;
         }
     }
 
@@ -320,7 +274,7 @@ mod tests {
     use crate::domain::{Attribution, ByteSpan, CORPUS_FORMAT, SEGMENTATION_REVISION, sha256_hex};
     use crate::lexical::index_tokens_string;
     use crate::store::{CorpusCounts, SCHEMA_SQL};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
     fn build_test_store(
         docs: &[(&str, &str, &str, &str, Option<&str>)],

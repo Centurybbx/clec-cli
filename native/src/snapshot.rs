@@ -16,19 +16,19 @@ use crate::ingest::{extract_source, is_subtitle_path, is_supported_text_path, se
 use crate::lexical::index_tokens_string;
 use crate::store::{CorpusCounts, CorpusStore, DiagnosticsSummary, SCHEMA_SQL};
 
-pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-pub const MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntakeWork {
+struct IntakeWork {
     pub key: String,
     pub title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntakeSource {
+struct IntakeSource {
     pub work: String,
     pub path: String,
     pub title: String,
@@ -43,7 +43,7 @@ pub struct IntakeSource {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IntakeDocument {
+struct IntakeDocument {
     pub schema_version: u32,
     pub works: Vec<IntakeWork>,
     pub sources: Vec<IntakeSource>,
@@ -65,7 +65,7 @@ pub struct ReleaseManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SyncData {
+pub(crate) struct SyncData {
     pub release: ReleaseHash,
     pub corpus_format: String,
     pub manifest_path: String,
@@ -76,7 +76,7 @@ pub struct SyncData {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct StatusData {
+pub(crate) struct StatusData {
     pub ready: bool,
     pub offline: bool,
     pub data_dir: String,
@@ -537,9 +537,9 @@ fn build_in_staging(
                     params![
                         pid.as_str(),
                         span_ord as i64,
-                        span_val.start_byte as i64,
-                        span_val.end_byte as i64,
-                        span_val.cue_ordinal.map(|v| v as i64)
+                        span_val.start_byte() as i64,
+                        span_val.end_byte() as i64,
+                        span_val.cue_ordinal().map(|v| v as i64)
                     ],
                 )
                 .map_err(|e| {
@@ -645,7 +645,7 @@ fn file_size_and_sha256(path: &Path) -> Result<(u64, String), ClecError> {
     Ok((total, crate::domain::hex_encode(&hasher.finalize())))
 }
 
-pub fn open_current_store(
+pub(crate) fn open_current_store(
     data_dir: &Path,
     release_pin: Option<&ReleaseHash>,
 ) -> Result<CorpusStore, ClecError> {
@@ -681,7 +681,7 @@ pub fn open_current_store(
     CorpusStore::open_readonly(&db_path, active)
 }
 
-pub fn data_dir_status(data_dir: &Path) -> Result<StatusData, ClecError> {
+pub(crate) fn data_dir_status(data_dir: &Path) -> Result<StatusData, ClecError> {
     let manifest_path = read_configured_manifest(data_dir)?;
     let storage_bytes = compute_managed_bytes(data_dir)?;
     let data_dir_str = data_dir.display().to_string();
@@ -717,7 +717,10 @@ pub fn data_dir_status(data_dir: &Path) -> Result<StatusData, ClecError> {
     }
 }
 
-pub fn sync_local(data_dir: &Path, manifest_arg: Option<&str>) -> Result<SyncData, ClecError> {
+pub(crate) fn sync_local(
+    data_dir: &Path,
+    manifest_arg: Option<&str>,
+) -> Result<SyncData, ClecError> {
     if data_dir.exists() && !data_dir.is_dir() {
         return Err(ClecError::new(
             ErrorCode::InvalidDataDir,

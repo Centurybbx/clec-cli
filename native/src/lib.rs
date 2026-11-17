@@ -1,7 +1,7 @@
 pub mod cli;
 pub mod domain;
-pub mod ingest;
-pub mod lexical;
-pub mod retrieval;
+pub(crate) mod ingest;
+pub(crate) mod lexical;
+pub(crate) mod retrieval;
 pub mod snapshot;
-pub mod store;
+pub(crate) mod store;

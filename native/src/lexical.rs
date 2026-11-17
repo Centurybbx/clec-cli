@@ -5,10 +5,12 @@ use ferrous_opencc::{OpenCC, config::BuiltinConfig};
 use jieba_rs::Jieba;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::domain::{ClecError, ErrorCode, hex_decode, hex_encode};
+#[cfg(test)]
+use crate::domain::hex_decode;
+use crate::domain::{ClecError, ErrorCode, hex_encode};
 
-pub const MAX_QUERY_BYTES: usize = 512;
-pub const MAX_QUERY_TERMS: usize = 64;
+pub(crate) const MAX_QUERY_BYTES: usize = 512;
+pub(crate) const MAX_QUERY_TERMS: usize = 64;
 
 struct LexicalEngine {
     opencc: OpenCC,
@@ -25,17 +27,18 @@ fn engine() -> &'static LexicalEngine {
     })
 }
 
-pub fn normalize_for_search(text: &str) -> String {
+pub(crate) fn normalize_for_search(text: &str) -> String {
     let simplified = engine().opencc.convert(text);
     let nfkc: String = simplified.nfkc().collect();
     nfkc.to_lowercase()
 }
 
-pub fn encode_fts_token(token: &str) -> String {
+pub(crate) fn encode_fts_token(token: &str) -> String {
     format!("t{}", hex_encode(token.as_bytes()))
 }
 
-pub fn decode_fts_token(encoded: &str) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn decode_fts_token(encoded: &str) -> Option<String> {
     let hex = encoded.strip_prefix('t')?;
     let bytes = hex_decode(hex)?;
     String::from_utf8(bytes).ok()
@@ -125,7 +128,7 @@ fn segment_normalized(normalized: &str, for_index: bool) -> Vec<String> {
     tokens
 }
 
-pub fn index_tokens_string(text: &str) -> String {
+pub(crate) fn index_tokens_string(text: &str) -> String {
     let normalized = normalize_for_search(text);
     segment_normalized(&normalized, true)
         .into_iter()
@@ -134,7 +137,7 @@ pub fn index_tokens_string(text: &str) -> String {
         .join(" ")
 }
 
-pub fn query_terms(query: &str) -> Result<Vec<String>, ClecError> {
+pub(crate) fn query_terms(query: &str) -> Result<Vec<String>, ClecError> {
     let trimmed = query.trim();
     if trimmed.is_empty() || query.len() > MAX_QUERY_BYTES || query.contains('\0') {
         return Err(ClecError::new(

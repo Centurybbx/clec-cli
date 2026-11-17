@@ -25,7 +25,7 @@ use crate::store::{PassageReadItem, SourceListEntry, SourceOriginalItem, SourceO
     about = "Offline CLEC evidence search, exact byte-span reads, and local snapshot sync",
     disable_help_subcommand = false
 )]
-pub struct Cli {
+struct Cli {
     /// Corpus data directory (defaults to CLEC_DATA_DIR or ~/.local/share/clec)
     #[arg(long, global = true, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
@@ -51,7 +51,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum MatchArg {
+enum MatchArg {
     Any,
     All,
 }
@@ -66,7 +66,7 @@ impl From<MatchArg> for MatchMode {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum RoleArg {
+enum RoleArg {
     Transcript,
     Qa,
     Summary,
@@ -85,7 +85,7 @@ impl From<RoleArg> for SourceRole {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Commands {
+enum Commands {
     /// Verify and atomically activate a local release manifest
     Sync(SyncArgs),
     /// Search passages using 1 to 4 queries with BM25 + RRF and work-aware diversity
@@ -101,14 +101,14 @@ pub enum Commands {
 }
 
 #[derive(Debug, Args)]
-pub struct SyncArgs {
+struct SyncArgs {
     /// Path to publisher manifest.json
     #[arg(long, value_name = "FILE")]
     pub manifest: Option<String>,
 }
 
 #[derive(Debug, Args)]
-pub struct SearchArgs {
+struct SearchArgs {
     /// 1 to 4 lexical queries
     #[arg(required = true, num_args = 1..=4, value_name = "QUERY")]
     pub queries: Vec<String>,
@@ -151,7 +151,7 @@ pub struct SearchArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ReadArgs {
+struct ReadArgs {
     /// Typed PassageId (p_...) or SourceId (s_...) references
     #[arg(required = true, num_args = 1..=50, value_name = "ID")]
     pub ids: Vec<String>,
@@ -170,7 +170,7 @@ pub struct ReadArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct SourcesArgs {
+struct SourcesArgs {
     /// Optional normalized filter terms across work/source title and path
     #[arg(value_name = "QUERY")]
     pub query: Option<String>,
@@ -194,7 +194,7 @@ pub struct SourcesArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SuccessEnvelope<T> {
+struct SuccessEnvelope<T> {
     pub schema_version: u32,
     pub ok: bool,
     pub command: String,
@@ -204,7 +204,7 @@ pub struct SuccessEnvelope<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "kind")]
-pub enum ReadItem {
+enum ReadItem {
     Passage(Box<PassageReadItem>),
     SourceOriginal(SourceOriginalItem),
     SourceOverview(SourceOverviewItem),
@@ -212,7 +212,7 @@ pub enum ReadItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ReadData {
+struct ReadData {
     pub release: ReleaseHash,
     pub items: Vec<ReadItem>,
     pub budget: ReadBudgetReport,
@@ -220,7 +220,7 @@ pub struct ReadData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ReadBudgetReport {
+struct ReadBudgetReport {
     pub max_bytes: usize,
     pub used_bytes: usize,
     pub omitted_count: usize,
@@ -228,7 +228,7 @@ pub struct ReadBudgetReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SourcesData {
+struct SourcesData {
     pub release: ReleaseHash,
     pub total_matched: usize,
     pub offset: usize,
@@ -239,7 +239,7 @@ pub struct SourcesData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SchemaArgSpec {
+struct SchemaArgSpec {
     pub id: String,
     pub long: Option<String>,
     pub short: Option<String>,
@@ -253,7 +253,7 @@ pub struct SchemaArgSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SchemaCommandSpec {
+struct SchemaCommandSpec {
     pub name: String,
     pub about: Option<String>,
     pub supported: bool,
@@ -263,7 +263,7 @@ pub struct SchemaCommandSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct UnsupportedFeatureSpec {
+struct UnsupportedFeatureSpec {
     pub name: String,
     pub supported: bool,
     pub reason: String,
@@ -271,7 +271,7 @@ pub struct UnsupportedFeatureSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SchemaData {
+struct SchemaData {
     pub phase: String,
     pub binary: String,
     pub version: String,
@@ -288,7 +288,7 @@ pub fn run_cli() -> i32 {
     run_cli_with_args(&args)
 }
 
-pub fn run_cli_with_args(args: &[String]) -> i32 {
+pub(crate) fn run_cli_with_args(args: &[String]) -> i32 {
     let parsed = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(err) => match err.kind() {
@@ -653,7 +653,7 @@ fn write_stdout_safe(text: &str) -> std::io::Result<()> {
     }
 }
 
-pub fn build_schema_data() -> SchemaData {
+fn build_schema_data() -> SchemaData {
     let cmd = Cli::command();
     let global_options: Vec<SchemaArgSpec> = cmd
         .get_arguments()
@@ -866,6 +866,13 @@ mod tests {
             .find(|o| o.id == "sag2")
             .unwrap();
         assert!(!sag2.supported);
+
+        let env_json = serde_json::to_string(&schema.envelopes).unwrap();
+        assert!(env_json.contains("^w_[0-9a-f]{16,64}$"));
+        assert!(env_json.contains("^s_[0-9a-f]{16,64}$"));
+        assert!(env_json.contains("^p_[0-9a-f]{16,64}$"));
+        assert!(env_json.contains("^[0-9a-f]{64}$"));
+        assert!(env_json.contains("^\\\\d{4}-\\\\d{2}-\\\\d{2}$"));
     }
 
     #[test]
