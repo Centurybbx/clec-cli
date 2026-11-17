@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(test, feature = "test-hooks"))]
 use std::cell::RefCell;
-#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use reqwest::blocking::{Client, ClientBuilder, Response};
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, LOCATION};
@@ -424,51 +426,7 @@ pub(crate) fn read_bounded_bytes<R: Read>(
     Ok(out)
 }
 
-fn read_bounded_remote_manifest(
-    mut resp: Response,
-    max_bytes: usize,
-    deadline: Instant,
-    safe_url: &str,
-) -> Result<Vec<u8>, ClecError> {
-    if let Some(len) = resp.content_length()
-        && len > max_bytes as u64
-    {
-        return Err(ClecError::new(
-            ErrorCode::InvalidManifest,
-            "Manifest exceeds 1 MiB limit.",
-        ));
-    }
-    let mut out = Vec::new();
-    let mut buf = [0u8; 16_384];
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ClecError::new(
-                ErrorCode::TransferTimeout,
-                format!("Manifest transfer timed out for {safe_url}."),
-            ));
-        }
-        let remaining = max_bytes.saturating_sub(out.len()) + 1;
-        let to_read = remaining.min(buf.len());
-        let n = match resp.read(&mut buf[..to_read]) {
-            Ok(n) => n,
-            Err(e) => {
-                return Err(classify_io_transfer_err(&e, deadline, "manifest", safe_url));
-            }
-        };
-        if n == 0 {
-            break;
-        }
-        if out.len() + n > max_bytes {
-            return Err(ClecError::new(
-                ErrorCode::InvalidManifest,
-                "Manifest exceeds 1 MiB limit.",
-            ));
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    Ok(out)
-}
-
+#[cfg(test)]
 fn ensure_localhost_loopback_with<F>(
     url: &Url,
     resolver: F,
@@ -503,11 +461,23 @@ fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok((host, port).to_socket_addrs()?.collect())
 }
 
+#[derive(Debug)]
+struct ImmediateFailResolver;
+
+impl reqwest::dns::Resolve for ImmediateFailResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(std::future::ready(Err(Box::new(io::Error::other(format!(
+            "Unpinned DNS resolution refused for '{host}'"
+        )))
+            as Box<dyn std::error::Error + Send + Sync>)))
+    }
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) type ResolveHookFn = Arc<dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct TestTransferHooks {
     pub resolve_hook: Option<ResolveHookFn>,
@@ -641,34 +611,323 @@ pub(crate) fn install_fixture_hooks_guard(
     })
 }
 
-fn resolve_host_with_active_hooks(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+fn resolve_host_for_worker(
+    host: &str,
+    port: u16,
+    #[cfg(any(test, feature = "test-hooks"))] hooks: &TestTransferHooks,
+) -> io::Result<Vec<SocketAddr>> {
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(hook) = current_test_hooks().resolve_hook {
+    if let Some(hook) = hooks.resolve_hook.as_ref() {
         return hook(host, port);
     }
     system_resolve(host, port)
 }
 
-fn build_http_client(
-    policy: &TransferPolicy,
-    localhost_addrs: Option<&[SocketAddr]>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferPhase {
+    Manifest,
+    Artifact,
+}
+
+impl TransferPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Artifact => "artifact",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Manifest => "Manifest",
+            Self::Artifact => "Artifact",
+        }
+    }
+}
+
+struct TransferRequest {
+    initial_url: Url,
+    policy: TransferPolicy,
+    phase: TransferPhase,
+    deadline: Instant,
+    max_body_bytes: u64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    hooks: TestTransferHooks,
+}
+
+enum TransferEvent {
+    Head {
+        final_url: Url,
+        content_length: Option<u64>,
+    },
+    Chunk(Vec<u8>),
+    Finished(Result<(), ClecError>),
+}
+
+struct RemoteTransfer {
+    rx: Option<mpsc::Receiver<TransferEvent>>,
+    cancel: Arc<AtomicBool>,
+    deadline: Instant,
+    phase: TransferPhase,
+    safe_url: String,
+    finished: bool,
+}
+
+impl Drop for RemoteTransfer {
+    fn drop(&mut self) {
+        self.cancel_and_disconnect();
+    }
+}
+
+impl RemoteTransfer {
+    fn start(request: TransferRequest) -> Result<Self, ClecError> {
+        let safe_url = redact_url_for_error(&request.initial_url);
+        let phase = request.phase;
+        let deadline = request.deadline;
+        if Instant::now() >= deadline {
+            return Err(ClecError::new(
+                ErrorCode::TransferTimeout,
+                format!("{} transfer timed out for {safe_url}.", phase.title()),
+            ));
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<TransferEvent>(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = request.hooks.worker_spawn_hook.as_ref() {
+            hook();
+        }
+
+        let handle = thread::Builder::new()
+            .name(format!("clec-transfer-{}", phase.label()))
+            .spawn(move || run_transfer_worker(request, worker_cancel, tx))
+            .map_err(|e| {
+                ClecError::new(
+                    ErrorCode::TransferFailed,
+                    format!(
+                        "Failed to start {} transfer worker for {safe_url}: {e}",
+                        phase.label()
+                    ),
+                )
+            })?;
+        drop(handle);
+
+        Ok(Self {
+            rx: Some(rx),
+            cancel,
+            deadline,
+            phase,
+            safe_url,
+            finished: false,
+        })
+    }
+
+    fn timeout_err(&self) -> ClecError {
+        ClecError::new(
+            ErrorCode::TransferTimeout,
+            format!(
+                "{} transfer timed out for {}.",
+                self.phase.title(),
+                self.safe_url
+            ),
+        )
+    }
+
+    fn cancel_and_disconnect(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.rx.take();
+    }
+
+    fn recv_event(&mut self) -> Result<TransferEvent, ClecError> {
+        if self.finished {
+            return Err(ClecError::new(
+                ErrorCode::TransferFailed,
+                format!(
+                    "{} transfer stream already finished for {}.",
+                    self.phase.label(),
+                    self.safe_url
+                ),
+            ));
+        }
+        let now = Instant::now();
+        let Some(remaining) = self.deadline.checked_duration_since(now) else {
+            self.cancel_and_disconnect();
+            return Err(self.timeout_err());
+        };
+        if remaining.is_zero() {
+            self.cancel_and_disconnect();
+            return Err(self.timeout_err());
+        }
+        let Some(rx) = self.rx.as_ref() else {
+            self.cancel_and_disconnect();
+            return Err(self.timeout_err());
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(event) => {
+                if Instant::now() >= self.deadline {
+                    self.cancel_and_disconnect();
+                    return Err(self.timeout_err());
+                }
+                match &event {
+                    TransferEvent::Head { final_url, .. } => {
+                        self.safe_url = redact_url_for_error(final_url);
+                    }
+                    TransferEvent::Finished(_) => {
+                        self.finished = true;
+                    }
+                    TransferEvent::Chunk(_) => {}
+                }
+                Ok(event)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.cancel_and_disconnect();
+                Err(self.timeout_err())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.cancel_and_disconnect();
+                if Instant::now() >= self.deadline {
+                    Err(self.timeout_err())
+                } else {
+                    Err(ClecError::new(
+                        ErrorCode::TransferFailed,
+                        format!(
+                            "{} transfer worker disconnected unexpectedly for {}.",
+                            self.phase.label(),
+                            self.safe_url
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn recv_head(&mut self) -> Result<(Url, Option<u64>), ClecError> {
+        match self.recv_event()? {
+            TransferEvent::Head {
+                final_url,
+                content_length,
+            } => Ok((final_url, content_length)),
+            TransferEvent::Finished(Err(err)) => Err(err),
+            TransferEvent::Finished(Ok(())) | TransferEvent::Chunk(_) => Err(ClecError::new(
+                ErrorCode::TransferFailed,
+                format!(
+                    "{} transfer ended before response headers for {}.",
+                    self.phase.label(),
+                    self.safe_url
+                ),
+            )),
+        }
+    }
+}
+
+fn check_worker_active(
+    cancel: &AtomicBool,
+    deadline: Instant,
+    phase: TransferPhase,
+    safe_url: &str,
+) -> Result<Duration, ClecError> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(ClecError::new(
+            ErrorCode::TransferTimeout,
+            format!("{} transfer timed out for {safe_url}.", phase.title()),
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ClecError::new(
+            ErrorCode::TransferTimeout,
+            format!("{} transfer timed out for {safe_url}.", phase.title()),
+        ));
+    }
+    Ok(remaining)
+}
+
+fn is_literal_ip_host(host: &str) -> bool {
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return inner.parse::<Ipv6Addr>().is_ok();
+    }
+    false
+}
+
+fn resolve_and_pin_hop(
+    url: &Url,
+    safe_url: &str,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    phase: TransferPhase,
+    #[cfg(any(test, feature = "test-hooks"))] hooks: &TestTransferHooks,
+) -> Result<Option<(String, Vec<SocketAddr>)>, ClecError> {
+    let Some(host) = url.host_str().filter(|h| !h.is_empty()) else {
+        return Err(ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("URL missing host for {safe_url}."),
+        ));
+    };
+    if is_literal_ip_host(host) {
+        return Ok(None);
+    }
+
+    let default_port = if url.scheme() == "https" { 443 } else { 80 };
+    let port = url.port_or_known_default().unwrap_or(default_port);
+    let res = resolve_host_for_worker(
+        host,
+        port,
+        #[cfg(any(test, feature = "test-hooks"))]
+        hooks,
+    );
+    check_worker_active(cancel, deadline, phase, safe_url)?;
+    let addrs = res.map_err(|e| {
+        ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("Failed to resolve {host} for {safe_url}: {e}"),
+        )
+    })?;
+    if addrs.is_empty() {
+        return Err(ClecError::new(
+            ErrorCode::TransferFailed,
+            format!("DNS resolution returned no addresses for {safe_url}."),
+        ));
+    }
+    if url.scheme() == "http" && !addrs.iter().all(|addr| addr.ip().is_loopback()) {
+        return Err(ClecError::new(
+            ErrorCode::TransferFailed,
+            format!(
+                "Refusing plain HTTP for {safe_url}: localhost resolved to non-loopback address."
+            ),
+        ));
+    }
+    Ok(Some((host.to_owned(), addrs)))
+}
+
+fn build_hop_client(
+    connect_timeout: Duration,
+    pinned: Option<&(String, Vec<SocketAddr>)>,
+    #[cfg(any(test, feature = "test-hooks"))] extra_root_pem: Option<&[u8]>,
+    #[cfg(any(test, feature = "test-hooks"))] hooks: &TestTransferHooks,
 ) -> Result<Client, ClecError> {
     let mut builder = ClientBuilder::new()
+        .no_proxy()
+        .dns_resolver(Arc::new(ImmediateFailResolver))
         .redirect(redirect::Policy::none())
         .retry(retry::never())
         .no_gzip()
         .no_brotli()
         .no_deflate()
         .no_zstd()
-        .connect_timeout(policy.connect_timeout)
+        .connect_timeout(connect_timeout)
         .user_agent(concat!("clec/", env!("CARGO_PKG_VERSION")));
 
-    if let Some(addrs) = localhost_addrs {
-        builder = builder.resolve_to_addrs("localhost", addrs);
+    if let Some((domain, addrs)) = pinned {
+        builder = builder.resolve_to_addrs(domain, addrs);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(pem) = policy.extra_root_pem.as_deref() {
+    if let Some(pem) = extra_root_pem {
         let certs = reqwest::Certificate::from_pem_bundle(pem).map_err(|e| {
             ClecError::new(
                 ErrorCode::InternalError,
@@ -679,7 +938,7 @@ fn build_http_client(
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(hook) = current_test_hooks().client_setup_hook {
+    if let Some(hook) = hooks.client_setup_hook.as_ref() {
         hook();
     }
 
@@ -809,46 +1068,108 @@ fn validate_response_encoding(
     Ok(())
 }
 
-fn fetch_with_manual_redirects(
-    initial_url: &Url,
-    policy: &TransferPolicy,
-    total_timeout: Duration,
-    phase: &str,
-) -> Result<(Response, Url, Instant), ClecError> {
-    let deadline = Instant::now() + total_timeout;
-    let mut current_url = initial_url.clone();
-    let mut localhost_addrs =
-        ensure_localhost_loopback_with(&current_url, resolve_host_with_active_hooks)?;
-    let mut client = build_http_client(policy, localhost_addrs.as_deref())?;
+struct WorkerExitNotifier {
+    #[cfg(any(test, feature = "test-hooks"))]
+    hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Drop for WorkerExitNotifier {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = self.hook.take() {
+            hook();
+        }
+    }
+}
+
+fn run_transfer_worker(
+    request: TransferRequest,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::SyncSender<TransferEvent>,
+) {
+    let _exit_guard = WorkerExitNotifier {
+        #[cfg(any(test, feature = "test-hooks"))]
+        hook: request.hooks.worker_exit_hook.clone(),
+    };
+
+    let result = run_transfer_session(&request, &cancel, &tx);
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    if request.hooks.drop_before_finished {
+        return;
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !cancel.load(Ordering::SeqCst)
+        && let Some(hook) = request.hooks.pre_completion_cleanup_hook.as_ref()
+    {
+        hook();
+    }
+
+    let _ = tx.send(TransferEvent::Finished(result));
+}
+
+fn run_transfer_session(
+    request: &TransferRequest,
+    cancel: &AtomicBool,
+    tx: &mpsc::SyncSender<TransferEvent>,
+) -> Result<(), ClecError> {
+    let mut current_url = request.initial_url.clone();
+    let phase = request.phase;
+    let phase_label = phase.label();
 
     for hop in 0..=MAX_REDIRECTS {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ClecError::new(
-                ErrorCode::TransferTimeout,
-                format!(
-                    "{phase} transfer timed out for {}.",
-                    redact_url_for_error(&current_url)
-                ),
-            ));
-        }
-
         let safe_url = redact_url_for_error(&current_url);
+        check_worker_active(cancel, request.deadline, phase, &safe_url)?;
+        check_remote_url_policy(&current_url, ErrorCode::TransferFailed)?;
+
+        let pinned = resolve_and_pin_hop(
+            &current_url,
+            &safe_url,
+            cancel,
+            request.deadline,
+            phase,
+            #[cfg(any(test, feature = "test-hooks"))]
+            &request.hooks,
+        )?;
+        let remaining = check_worker_active(cancel, request.deadline, phase, &safe_url)?;
+        let connect_timeout = request.policy.connect_timeout.min(remaining);
+
+        let client = build_hop_client(
+            connect_timeout,
+            pinned.as_ref(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            request.policy.extra_root_pem.as_deref(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            &request.hooks,
+        )?;
+        let remaining = check_worker_active(cancel, request.deadline, phase, &safe_url)?;
+
         let resp = client
             .get(current_url.clone())
             .header(ACCEPT_ENCODING, "identity")
             .timeout(remaining)
             .send()
-            .map_err(|e| classify_reqwest_err(e, deadline, phase, &safe_url))?;
+            .map_err(|e| classify_reqwest_err(e, request.deadline, phase_label, &safe_url))?;
+        check_worker_active(cancel, request.deadline, phase, &safe_url)?;
 
-        if current_url.scheme() == "http"
-            && let Some(remote_addr) = resp.remote_addr()
-            && !remote_addr.ip().is_loopback()
-        {
-            return Err(ClecError::new(
-                ErrorCode::TransferFailed,
-                format!("Plain HTTP connected to non-loopback address for {safe_url}."),
-            ));
+        if let Some(remote_addr) = resp.remote_addr() {
+            if current_url.scheme() == "http" && !remote_addr.ip().is_loopback() {
+                return Err(ClecError::new(
+                    ErrorCode::TransferFailed,
+                    format!("Plain HTTP connected to non-loopback address for {safe_url}."),
+                ));
+            }
+            if let Some((_, addrs)) = pinned.as_ref()
+                && !addrs.iter().any(|a| a.ip() == remote_addr.ip())
+            {
+                return Err(ClecError::new(
+                    ErrorCode::TransferFailed,
+                    format!(
+                        "Connected address did not match resolved host addresses for {safe_url}."
+                    ),
+                ));
+            }
         }
 
         let status = resp.status();
@@ -857,7 +1178,7 @@ fn fetch_with_manual_redirects(
                 return Err(ClecError::new(
                     ErrorCode::TransferFailed,
                     format!(
-                        "Exceeded maximum of {MAX_REDIRECTS} HTTP redirects during {phase} fetch from {safe_url}."
+                        "Exceeded maximum of {MAX_REDIRECTS} HTTP redirects during {phase_label} fetch from {safe_url}."
                     ),
                 ));
             }
@@ -892,17 +1213,14 @@ fn fetch_with_manual_redirects(
                     format!("Refusing HTTPS-to-HTTP redirect downgrade from {safe_url}."),
                 ));
             }
-            if next_url.scheme() == "http"
-                && next_url
-                    .host_str()
-                    .is_some_and(|h| h.eq_ignore_ascii_case("localhost"))
-                && localhost_addrs.is_none()
-            {
-                localhost_addrs =
-                    ensure_localhost_loopback_with(&next_url, resolve_host_with_active_hooks)?;
-                client = build_http_client(policy, localhost_addrs.as_deref())?;
-            }
             drop(resp);
+            drop(client);
+            check_worker_active(
+                cancel,
+                request.deadline,
+                phase,
+                &redact_url_for_error(&next_url),
+            )?;
             current_url = next_url;
             continue;
         }
@@ -911,20 +1229,86 @@ fn fetch_with_manual_redirects(
             return Err(ClecError::new(
                 ErrorCode::TransferFailed,
                 format!(
-                    "HTTP {} during {phase} fetch from {safe_url}.",
+                    "HTTP {} during {phase_label} fetch from {safe_url}.",
                     status.as_u16()
                 ),
             ));
         }
 
-        validate_response_encoding(&resp, phase, &safe_url)?;
-        return Ok((resp, current_url, deadline));
+        validate_response_encoding(&resp, phase_label, &safe_url)?;
+        check_worker_active(cancel, request.deadline, phase, &safe_url)?;
+
+        let content_length = resp.content_length();
+        if tx
+            .send(TransferEvent::Head {
+                final_url: current_url.clone(),
+                content_length,
+            })
+            .is_err()
+        {
+            return Err(ClecError::new(
+                ErrorCode::TransferFailed,
+                format!("{phase_label} transfer cancelled by caller for {safe_url}."),
+            ));
+        }
+
+        return stream_response_body(resp, request, cancel, tx, &safe_url);
     }
 
     Err(ClecError::new(
         ErrorCode::TransferFailed,
-        format!("Redirect loop exceeded during {phase} fetch."),
+        format!("Redirect loop exceeded during {phase_label} fetch."),
     ))
+}
+
+fn stream_response_body(
+    mut resp: Response,
+    request: &TransferRequest,
+    cancel: &AtomicBool,
+    tx: &mpsc::SyncSender<TransferEvent>,
+    safe_url: &str,
+) -> Result<(), ClecError> {
+    let phase = request.phase;
+    let phase_label = phase.label();
+    let mut buf = vec![0u8; 65_536];
+    let mut sent_bytes = 0u64;
+
+    loop {
+        check_worker_active(cancel, request.deadline, phase, safe_url)?;
+        let remaining_limit = request.max_body_bytes.saturating_sub(sent_bytes);
+        if remaining_limit == 0 {
+            break;
+        }
+        let to_read = (remaining_limit.min(buf.len() as u64)) as usize;
+        let n = match resp.read(&mut buf[..to_read]) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(classify_io_transfer_err(
+                    &e,
+                    request.deadline,
+                    phase_label,
+                    safe_url,
+                ));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        check_worker_active(cancel, request.deadline, phase, safe_url)?;
+        sent_bytes = sent_bytes.saturating_add(n as u64);
+        if tx.send(TransferEvent::Chunk(buf[..n].to_vec())).is_err() {
+            return Err(ClecError::new(
+                ErrorCode::TransferFailed,
+                format!("{phase_label} transfer cancelled by caller for {safe_url}."),
+            ));
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(counter) = request.hooks.chunks_sent_count.as_ref() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_remote_artifact_url(
@@ -1007,15 +1391,58 @@ pub(crate) fn load_manifest(
                 ));
             }
             let persistent_origin = url.as_str().to_owned();
-            let (resp, final_url, deadline) = fetch_with_manual_redirects(
-                url,
-                transfer_policy,
-                transfer_policy.manifest_timeout,
-                "manifest",
-            )?;
-            let safe_final = redact_url_for_error(&final_url);
-            let manifest_raw =
-                read_bounded_remote_manifest(resp, MAX_MANIFEST_BYTES, deadline, &safe_final)?;
+            let deadline = Instant::now() + transfer_policy.manifest_timeout;
+            #[cfg(any(test, feature = "test-hooks"))]
+            let hooks = current_test_hooks();
+
+            let mut transfer = RemoteTransfer::start(TransferRequest {
+                initial_url: url.clone(),
+                policy: transfer_policy.clone(),
+                phase: TransferPhase::Manifest,
+                deadline,
+                max_body_bytes: (MAX_MANIFEST_BYTES as u64) + 1,
+                #[cfg(any(test, feature = "test-hooks"))]
+                hooks: hooks.clone(),
+            })?;
+
+            let (final_url, content_length) = transfer.recv_head()?;
+            if let Some(len) = content_length
+                && len > MAX_MANIFEST_BYTES as u64
+            {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidManifest,
+                    "Manifest exceeds 1 MiB limit.",
+                ));
+            }
+
+            let mut manifest_raw = Vec::new();
+            loop {
+                match transfer.recv_event()? {
+                    TransferEvent::Chunk(chunk) => {
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        if let Some(cb) = hooks.on_chunk_consumed.as_ref() {
+                            cb(chunk.len());
+                        }
+                        if manifest_raw.len() + chunk.len() > MAX_MANIFEST_BYTES {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidManifest,
+                                "Manifest exceeds 1 MiB limit.",
+                            ));
+                        }
+                        manifest_raw.extend_from_slice(&chunk);
+                    }
+                    TransferEvent::Finished(Ok(())) => break,
+                    TransferEvent::Finished(Err(err)) => return Err(err),
+                    TransferEvent::Head { .. } => {
+                        return Err(ClecError::new(
+                            ErrorCode::TransferFailed,
+                            "Unexpected duplicate response header during manifest transfer.",
+                        ));
+                    }
+                }
+            }
+            drop(transfer);
+
             let manifest: ReleaseManifest = serde_json::from_slice(&manifest_raw).map_err(|e| {
                 ClecError::new(
                     ErrorCode::InvalidPackage,
@@ -1069,15 +1496,23 @@ pub(crate) fn acquire_artifact(
                 ));
             }
 
-            let (mut resp, final_url, deadline) = fetch_with_manual_redirects(
-                url,
-                transfer_policy,
-                transfer_policy.artifact_timeout,
-                "artifact",
-            )?;
-            let safe_final = redact_url_for_error(&final_url);
             let expected_bytes = loaded.manifest.compressed_bytes;
-            if let Some(declared_len) = resp.content_length()
+            let deadline = Instant::now() + transfer_policy.artifact_timeout;
+            #[cfg(any(test, feature = "test-hooks"))]
+            let hooks = current_test_hooks();
+
+            let mut transfer = RemoteTransfer::start(TransferRequest {
+                initial_url: url.clone(),
+                policy: transfer_policy.clone(),
+                phase: TransferPhase::Artifact,
+                deadline,
+                max_body_bytes: expected_bytes.saturating_add(1),
+                #[cfg(any(test, feature = "test-hooks"))]
+                hooks: hooks.clone(),
+            })?;
+
+            let (_, content_length) = transfer.recv_head()?;
+            if let Some(declared_len) = content_length
                 && declared_len != expected_bytes
             {
                 return Err(ClecError::new(
@@ -1100,45 +1535,41 @@ pub(crate) fn acquire_artifact(
             };
 
             let mut hasher = Sha256::new();
-            let mut buf = [0u8; 65_536];
             let mut total = 0u64;
             loop {
-                if Instant::now() >= deadline {
-                    return Err(ClecError::new(
-                        ErrorCode::TransferTimeout,
-                        format!("Artifact transfer timed out for {safe_final}."),
-                    ));
-                }
-                let n = match resp.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        return Err(classify_io_transfer_err(
-                            &e,
-                            deadline,
-                            "artifact",
-                            &safe_final,
+                match transfer.recv_event()? {
+                    TransferEvent::Chunk(chunk) => {
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        if let Some(cb) = hooks.on_chunk_consumed.as_ref() {
+                            cb(chunk.len());
+                        }
+                        let Some(next_total) = total.checked_add(chunk.len() as u64) else {
+                            return Err(ClecError::new(
+                                ErrorCode::IntegrityMismatch,
+                                "Remote compressed artifact exceeds manifest compressedBytes.",
+                            ));
+                        };
+                        if next_total > expected_bytes {
+                            return Err(ClecError::new(
+                                ErrorCode::IntegrityMismatch,
+                                "Remote compressed artifact exceeds manifest compressedBytes.",
+                            ));
+                        }
+                        total = next_total;
+                        hasher.update(&chunk);
+                        dst.write_all(&chunk).map_err(map_io)?;
+                    }
+                    TransferEvent::Finished(Ok(())) => break,
+                    TransferEvent::Finished(Err(err)) => return Err(err),
+                    TransferEvent::Head { .. } => {
+                        return Err(ClecError::new(
+                            ErrorCode::TransferFailed,
+                            "Unexpected duplicate response header during artifact transfer.",
                         ));
                     }
-                };
-                if n == 0 {
-                    break;
                 }
-                let Some(next_total) = total.checked_add(n as u64) else {
-                    return Err(ClecError::new(
-                        ErrorCode::IntegrityMismatch,
-                        "Remote compressed artifact exceeds manifest compressedBytes.",
-                    ));
-                };
-                if next_total > expected_bytes {
-                    return Err(ClecError::new(
-                        ErrorCode::IntegrityMismatch,
-                        "Remote compressed artifact exceeds manifest compressedBytes.",
-                    ));
-                }
-                total = next_total;
-                hasher.update(&buf[..n]);
-                dst.write_all(&buf[..n]).map_err(map_io)?;
             }
+            drop(transfer);
 
             if total != expected_bytes {
                 return Err(ClecError::new(
@@ -1802,6 +2233,16 @@ srv.serve_forever()
         let (_, _, m_b_bytes, z_b_bytes) =
             publish_fixture_release(&tmp.path().join("pkg_b"), "beta release B");
 
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reserved_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut m_b_split: serde_json::Value = serde_json::from_slice(&m_b_bytes).unwrap();
+        m_b_split["artifactUrl"] = serde_json::Value::String(format!(
+            "http://localhost:{reserved_port}/b/corpus.sqlite.zst"
+        ));
+        let split_manifest_bytes = serde_json::to_vec(&m_b_split).unwrap();
+
         let mut routes = HashMap::new();
         routes.insert(
             "/a/manifest.json".to_owned(),
@@ -1821,17 +2262,21 @@ srv.serve_forever()
                 delay: Duration::ZERO,
             },
         );
-        let mut m_b_split: serde_json::Value = serde_json::from_slice(&m_b_bytes).unwrap();
-        let srv = LocalHttpServer::start("127.0.0.1:0", HashMap::new());
-        let split_art_url = format!("http://localhost:{}/b/corpus.sqlite.zst", srv.port());
-        drop(srv);
-
         routes.insert(
             "/b/manifest.json".to_owned(),
             MockRoute::Bytes {
                 status: 200,
                 headers: Vec::new(),
-                body: m_b_bytes.clone(),
+                body: m_b_bytes,
+                delay: Duration::ZERO,
+            },
+        );
+        routes.insert(
+            "/b/split-manifest.json".to_owned(),
+            MockRoute::Bytes {
+                status: 200,
+                headers: Vec::new(),
+                body: split_manifest_bytes,
                 delay: Duration::ZERO,
             },
         );
@@ -1844,61 +2289,7 @@ srv.serve_forever()
                 delay: Duration::ZERO,
             },
         );
-        let srv = LocalHttpServer::start("127.0.0.1:0", routes);
-        m_b_split["artifactUrl"] = serde_json::Value::String(format!(
-            "http://localhost:{}/b/corpus.sqlite.zst",
-            srv.port()
-        ));
-        let split_manifest_bytes = serde_json::to_vec(&m_b_split).unwrap();
-
-        let mut routes2 = HashMap::new();
-        routes2.insert(
-            "/a/manifest.json".to_owned(),
-            MockRoute::Bytes {
-                status: 200,
-                headers: Vec::new(),
-                body: fs::read(tmp.path().join("pkg_a/rel/manifest.json")).unwrap(),
-                delay: Duration::ZERO,
-            },
-        );
-        routes2.insert(
-            "/a/corpus.sqlite.zst".to_owned(),
-            MockRoute::Bytes {
-                status: 200,
-                headers: Vec::new(),
-                body: fs::read(tmp.path().join("pkg_a/rel/corpus.sqlite.zst")).unwrap(),
-                delay: Duration::ZERO,
-            },
-        );
-        routes2.insert(
-            "/b/manifest.json".to_owned(),
-            MockRoute::Bytes {
-                status: 200,
-                headers: Vec::new(),
-                body: m_b_bytes,
-                delay: Duration::ZERO,
-            },
-        );
-        routes2.insert(
-            "/b/split-manifest.json".to_owned(),
-            MockRoute::Bytes {
-                status: 200,
-                headers: Vec::new(),
-                body: split_manifest_bytes,
-                delay: Duration::ZERO,
-            },
-        );
-        routes2.insert(
-            "/b/corpus.sqlite.zst".to_owned(),
-            MockRoute::Bytes {
-                status: 200,
-                headers: Vec::new(),
-                body: fs::read(tmp.path().join("pkg_b/rel/corpus.sqlite.zst")).unwrap(),
-                delay: Duration::ZERO,
-            },
-        );
-        drop(srv);
-        let srv = LocalHttpServer::start("127.0.0.1:0", routes2);
+        let srv = LocalHttpServer::start(&format!("127.0.0.1:{reserved_port}"), routes);
         let port = srv.port();
 
         let data_dir = tmp.path().join("data");
@@ -1915,21 +2306,9 @@ srv.serve_forever()
         let active_before = fs::read(data_dir.join("active.json")).unwrap();
         let db_before = fs::read(data_dir.join(format!("{}.sqlite", man_a.sha256))).unwrap();
 
-        let latch = TestLatch::new();
-        let exit_sig = ExitSignal::new();
-        let latch_cb = Arc::clone(&latch);
-        let exit_cb = Arc::clone(&exit_sig);
-        let b_split_url = format!("http://127.0.0.1:{port}/b/split-manifest.json");
-        let mut split_m: serde_json::Value =
-            serde_json::from_slice(&fs::read(tmp.path().join("pkg_b/rel/manifest.json")).unwrap())
-                .unwrap();
-        split_m["artifactUrl"] =
-            serde_json::Value::String(format!("http://localhost:{port}/b/corpus.sqlite.zst"));
-        let _ = split_art_url;
-
         let blocked_urls = [
             format!("http://localhost:{port}/b/manifest.json"),
-            b_split_url,
+            format!("http://127.0.0.1:{port}/b/split-manifest.json"),
         ];
         for (idx, blocked_url) in blocked_urls.iter().enumerate() {
             let l_iter = TestLatch::new();
@@ -1999,7 +2378,6 @@ srv.serve_forever()
             assert!(!data_dir.join(STAGING_ARTIFACT_TEMP_NAME).exists());
         }
 
-        let _ = (latch_cb, exit_cb);
         let reqs = srv.requests();
         assert!(
             !reqs

@@ -209,6 +209,11 @@ def main() -> int:
                     text=True,
                 )
                 if cc_proc.returncode == 0 and dylib_out.is_file():
+                    subprocess.run(
+                        [str(fix_bin), "--version"],
+                        capture_output=True,
+                        env=clean_env | {"DYLD_INSERT_LIBRARIES": str(dylib_out)},
+                    )
                     delay_dylib = dylib_out
 
             def test_macos_real_getaddrinfo_interpose() -> str:
