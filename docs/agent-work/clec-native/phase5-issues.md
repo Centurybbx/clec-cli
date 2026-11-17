@@ -2,6 +2,15 @@
 
 This ledger tracks the six confirmed P2 blockers reported at `3abfad1a63f0a72aacfeb9a8c98542aae8046e98` by independent Astra retrieval/CLI review `94059344` and independent Astra Jev wire/config review `faad9103`. Independent transport review `e68e0731` accepted `3abfad1` without transport changes.
 
+## Focused coverage follow-up
+
+At `8ca49bb`, review `60c3f7fe` accepted the three Jev fixes. Review `a78085d5` accepted deterministic ranking and pre-I/O budget admission but retained two evidence gaps in `P2-PROTOCOL-COVERAGE-GAPS`. No new production defect was demonstrated.
+
+- The expansion fixture lacked an otherwise-eligible source dated before `--date-from`. The follow-up adds `exp_too_early.txt` with a `2025-04-30` date and checks its marker is absent from Round 1 submitted candidates while an allowed expansion candidate is present.
+- The 4 MiB total-response ceiling was incorrectly classified as unreachable. The existing 64-candidate, 32-request test now pads every valid response to 131,072 bytes and asserts the exact 4,194,304-byte total, 32 successful batches, and two questions in each actual request. The protocol distinguishes reachable equality from a successful one-over total, which the per-response and attempt caps prevent.
+
+These small test and documentation corrections are authored by the coordinator. Production sources are unchanged. Focused independent acceptance remains pending.
+
 ## Confirmed blockers and verified fixes
 
 1. **`P2-DPP-DETERMINISM` (review `94059344` finding 1). Nondeterministic DPP passage ordering across processes on varied-frequency symmetric vectors.**

@@ -2363,6 +2363,14 @@ fn group7_filters_seen_id_round_robin_term_ties_and_four_query_fusion() {
         ),
         (
             "w_keep".to_owned(),
+            "exp_too_early.txt".to_owned(),
+            "Keep Expansion Too Early".to_owned(),
+            "document".to_owned(),
+            "bridgeterm excluded_before_datefrom".to_owned(),
+            Some("2025-04-30".to_owned()),
+        ),
+        (
+            "w_keep".to_owned(),
             "exp_too_late.txt".to_owned(),
             "Keep Expansion Too Late".to_owned(),
             "document".to_owned(),
@@ -2511,6 +2519,7 @@ fn group7_filters_seen_id_round_robin_term_ties_and_four_query_fusion() {
         "matching expansion candidate must be submitted in Round 1"
     );
     for forbidden in [
+        "excluded_before_datefrom",
         "excluded_after_dateto",
         "excluded_null_date",
         "excluded_wrong_role",
@@ -2518,7 +2527,7 @@ fn group7_filters_seen_id_round_robin_term_ties_and_four_query_fusion() {
     ] {
         assert!(
             r1_passages.iter().all(|p| !p.contains(forbidden)),
-            "Round 1 request log must not submit candidate failing work/role/date-to filter: {forbidden}"
+            "Round 1 request log must not submit candidate failing work/role/date filter: {forbidden}"
         );
     }
 
@@ -3650,7 +3659,20 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
         })
         .collect();
     let att32_corpus = publish_and_sync_corpus(&att32_works, &att32_srcs);
-    srv.clear_logs();
+    let srv_response_cap = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| {
+            let mut body = serde_json::to_vec(&score_all_answers(req, 0.8, "m")).unwrap();
+            assert!(body.len() <= 131_072);
+            body.resize(131_072, b' ');
+            MockReply::Raw {
+                status: 200,
+                extra_headers: Vec::new(),
+                body,
+                delay: Duration::ZERO,
+            }
+        }),
+    );
     let att32_ok = assert_ok_json(&run_clec(
         &[
             "--data-dir",
@@ -3659,10 +3681,21 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
             "att32anchor",
             "--sag2",
         ],
-        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        &[
+            ("JEV_BASE_URL", &srv_response_cap.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
     ));
     assert_eq!(att32_ok["data"]["calls"]["httpAttempts"], 32);
-    assert_eq!(srv.logs().len(), 32);
+    assert_eq!(att32_ok["data"]["calls"]["successfulBatches"], 32);
+    assert_eq!(att32_ok["data"]["consumption"]["responseBytes"], 4_194_304);
+    let response_cap_logs = srv_response_cap.logs();
+    assert_eq!(response_cap_logs.len(), 32);
+    assert!(
+        response_cap_logs
+            .iter()
+            .all(|request| request.question_keys.len() == 2)
+    );
 
     let make_3letter_token = |idx: usize| -> String {
         const PREFIXES: &[u8] = b"bcgjkmpqvxz";
