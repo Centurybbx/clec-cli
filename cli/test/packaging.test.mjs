@@ -57,7 +57,7 @@ function makeContainerHeader(tuple, options = {}) {
     return hdr;
   }
   if (tuple === 'linux-x64' || tuple === 'linux-arm64') {
-    const interpBuf = options.interp ? Buffer.from(`${options.interp}\0`, 'utf8') : null;
+    const interpBuf = options.interp !== undefined ? Buffer.from(`${options.interp}\0`, 'utf8') : null;
     const hdrSize = 64 + (interpBuf ? 56 + interpBuf.length : 0);
     const hdr = Buffer.alloc(hdrSize, 0);
     hdr.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1], 0);
@@ -246,7 +246,7 @@ test('deterministic archive writers produce byte-identical output independent of
   assert.equal(zip1.subarray(0, 4).toString('hex'), '504b0304');
 });
 
-test('executable container validation accepts all five target formats and rejects wrong format, arch, dylib/DLL, fat Mach-O, and glibc ELF', () => {
+test('executable container validation accepts all five target formats and rejects wrong format, arch, dylib/DLL, fat Mach-O, and interpreted ELF', () => {
   for (const meta of TARGET_MATRIX) {
     const buf = makeSyntheticBinary({ tuple: meta.tuple });
     const parsed = assertExecutableMatchesTarget(buf, meta);
@@ -275,11 +275,22 @@ test('executable container validation accepts all five target formats and reject
     );
   }
 
-  const glibcElf = makeContainerHeader('linux-x64', { interp: '/lib64/ld-linux-x86-64.so.2' });
-  assert.throws(
-    () => assertExecutableMatchesTarget(glibcElf, findTargetByTuple('linux-x64')),
-    /requires musl-static linkage/,
-  );
+  for (const tuple of ['linux-x64', 'linux-arm64']) {
+    for (const interp of ['/lib64/ld-linux-x86-64.so.2', '/lib/ld-musl-x86_64.so.1', '/custom/loader', '']) {
+      const elf = makeContainerHeader(tuple, { interp });
+      assert.throws(
+        () => assertExecutableMatchesTarget(elf, findTargetByTuple(tuple)),
+        /requires musl-static linkage/,
+        `${tuple} must reject PT_INTERP ${JSON.stringify(interp)}`,
+      );
+    }
+    const emptySegment = makeContainerHeader(tuple, { interp: '' });
+    emptySegment.writeBigUInt64LE(0n, 96);
+    assert.throws(
+      () => assertExecutableMatchesTarget(emptySegment, findTargetByTuple(tuple)),
+      /requires musl-static linkage/,
+    );
+  }
 });
 
 test('installer validates full target schema, executable format, non-test-hooks identity, checksums, and placeholder restoration', () => {

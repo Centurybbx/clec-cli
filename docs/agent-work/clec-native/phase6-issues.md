@@ -4,6 +4,12 @@ This ledger tracks Stage 6A implementation work stacked on accepted Stage 5 head
 
 ## Independent review follow-up at `b45bdcc`
 
+### Residual admission findings at `505e21d`
+
+Review `59acf672` reproduced two remaining P2 gaps. Receipt capture promoted current-checkout observations and a caller-supplied, unexecuted command into build provenance for an unrelated prebuilt binary. Artifact admission also allowed musl and custom `PT_INTERP` loaders under a `musl-static` tuple. No actual current Linux artifact was demonstrated broken; this is structural admission evidence.
+
+The coordinator corrected the small ELF predicate to reject every present `PT_INTERP` segment, including empty strings and zero-length segments. Added x64 and arm64 fixtures failed before the correction with the predicted missing exception for the musl interpreter; afterward five packaging tests pass, with the optional real-binary test skipped in the root checkout because its build cache is absent. This does not claim Linux execution. Independent review and restaging are pending. Source/build-command provenance classification still requires a coherent receipt-model correction.
+
 Review `ff034441` accepted native cache safety and MSRV lifecycle. Review `2d508eb7` requested three packaging corrections. Its executable probes established wrong-target, empty, and renamed test-hook payload admission, unsupported CI lint-toolchain selection, and an invalid Skill context example. No public artifacts were released.
 
 The coordinator corrected the two small configuration/documentation findings. CI lint commands explicitly select `+stable`, whose rustfmt and Clippy components the workflow installs; MSRV build/test commands still select `+1.89.0`. The Skill now gives `--context 1` and separately explains `--context 2`. Local stable component checks and formatting pass; the actual native parser accepts context `1` and reaches `NO_DATA` on an empty offline fixture. This is no claim of a dispatched CI run. The original npm size was corrected to the measured 7,904,121 bytes. Two narration comments were removed without behavior changes.

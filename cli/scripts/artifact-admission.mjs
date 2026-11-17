@@ -243,12 +243,10 @@ export function assertExecutableMatchesTarget(bytes, targetMeta) {
       `Executable format/architecture mismatch for '${targetMeta.tuple}': expected ${targetMeta.executableFormat}/${targetMeta.arch}, got ${container.containerFormat}/${container.arch}.`,
     );
   }
-  if (targetMeta.libc === 'musl-static' && container.dynamicLinker) {
-    if (container.dynamicLinker.includes('ld-linux')) {
-      throw new Error(
-        `Target '${targetMeta.tuple}' requires musl-static linkage, but ELF PT_INTERP specifies glibc '${container.dynamicLinker}'.`,
-      );
-    }
+  if (targetMeta.libc === 'musl-static' && container.dynamicLinker !== null) {
+    throw new Error(
+      `Target '${targetMeta.tuple}' requires musl-static linkage without an ELF PT_INTERP segment.`,
+    );
   }
   return container;
 }
