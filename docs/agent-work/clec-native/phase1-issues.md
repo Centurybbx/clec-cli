@@ -41,3 +41,23 @@ This ledger tracks every defect, structural gap, and verification gap found duri
 
 9. **`EVIDENCE-AUDIT-LOG`: Synthetic future timestamps and unverifiable step history in original `.audit/clec-native-phase1.tsv`.**
    **Resolution (local `.audit/clec-native-phase1.tsv`).** Original rows were preserved append-only. A new `start` row opened the Hydrogen run with real UTC timestamps (`date -u`), superseding the prior chronology and per-step sequencing as `UNVERIFIED` and marking the unavailable prior author transcript audit as `INCONCLUSIVE`.
+
+## Round 2 defects found at `509ad27`
+
+This section tracks the four defects confirmed during independent Astra review at `509ad27`.
+
+10. **`P1-FTS-ENGINE-STATE`: Corrupt FTS5 engine state (`search_data` averages/totals) passes postings checks and crashes at search time.**
+    At `509ad27`, repacking a valid corpus after `UPDATE search_data SET block=x'000000' WHERE id=1` and updating manifest hashes/lengths allows `clec sync` to exit 0, then `clec search alpha` exits 1 with `INTERNAL_ERROR` (`database disk image malformed`). `store.rs` verifies `fts5vocab` postings and `search_docsize` but misses FTS5 global statistics and engine state.
+    **Status:** Open at `509ad27` (pending fix).
+
+11. **`P2-REUSE-INCOMING-VALIDATION`: Invalid incoming package accepted on cached release reuse.**
+    At `509ad27`, after installing valid release A, syncing a second manifest with A's decompressed `sha256` and `counts`, an artifact containing `b"not a zstd stream"`, and matching `compressedBytes`/`compressedSha256` exits 0 with `reused: true` and overwrites `active.json.manifestPath` (while a fresh `--data-dir` rejects with exit 5 `INVALID_PACKAGE`). `snapshot.rs` returns on the reuse check before streaming zstd decompression and decompressed hash validation.
+    **Status:** Open at `509ad27` (pending fix).
+
+12. **`DATA-CUE-TIMESTAMP-OVERFLOW`: Unchecked subtitle cue timestamp arithmetic wraps `u64` in release builds.**
+    At `509ad27`, parsing `5124095576031:00:00,000 --> 5124095576031:00:01,000` wraps `u64` arithmetic in `ingest::parse_timestamp_ms`, publishing and importing `startMs: 2048384` and `endMs: 2049384` with empty `diagnostics`.
+    **Status:** Open at `509ad27` (pending fix).
+
+13. **`BUG-BUDGET-USED-BYTES-FIXEDPOINT`: Two-pass budget estimation misses decimal-digit boundary shifts.**
+    At `509ad27`, padding a source title with 417 periods in `sources --limit 1` yields 1001 stdout UTF-8 bytes while reporting `budget.usedBytes: 1000`. `cli::fit_list_budget` runs two fixed estimation passes before final render instead of converging to a fixed point.
+    **Status:** Open at `509ad27` (pending fix).
