@@ -848,58 +848,50 @@ where
     let prev_state = prev_state_res.ok().flatten();
     let prev_release = prev_state.as_ref().map(|s| s.release.clone());
 
-    if let Some(ref state) = prev_state
-        && state.release == manifest.sha256
+    let existing_path = data_dir.join(format!("{}.sqlite", manifest.sha256.as_str()));
+    let existing_bytes_opt = if prev_state
+        .as_ref()
+        .is_some_and(|state| state.release == manifest.sha256)
+        && existing_path.is_file()
+        && CorpusStore::open_readonly(&existing_path, manifest.sha256.clone())
+            .is_ok_and(|existing| existing.counts().ok().as_ref() == Some(&manifest.counts))
     {
-        let existing_path = data_dir.join(format!("{}.sqlite", manifest.sha256.as_str()));
-        if existing_path.is_file()
-            && let Ok(existing) = CorpusStore::open_readonly(&existing_path, state.release.clone())
-            && let Ok((existing_bytes, existing_sha)) = file_size_and_sha256(&existing_path)
-            && existing_bytes == manifest.bytes
-            && existing_sha == manifest.sha256.as_str()
-            && existing.counts().ok().as_ref() == Some(&manifest.counts)
-        {
-            if state.manifest_path == manifest_path_str {
-                let storage_bytes = compute_managed_bytes(data_dir)?;
-                let sync_data = SyncData {
-                    release: manifest.sha256,
-                    corpus_format: manifest.corpus_format,
-                    manifest_path: manifest_path_str,
-                    counts: manifest.counts,
-                    reused: true,
-                    storage_bytes,
-                };
-                return prepare_output(&sync_data);
-            }
+        file_size_and_sha256(&existing_path)
+            .ok()
+            .filter(|(bytes, sha)| *bytes == manifest.bytes && sha == manifest.sha256.as_str())
+            .map(|(bytes, _)| bytes)
+    } else {
+        None
+    };
 
-            let (active_tmp, active_tmp_len) =
-                write_active_state_tmp(data_dir, &manifest.sha256, &manifest_path_str)?;
-            let commit_res = (|| -> Result<T, ClecError> {
-                let storage_bytes = compute_projected_managed_bytes(
-                    data_dir,
-                    &existing_path,
-                    existing_bytes,
-                    active_tmp_len,
-                )?;
-                let sync_data = SyncData {
-                    release: manifest.sha256.clone(),
-                    corpus_format: manifest.corpus_format.clone(),
-                    manifest_path: manifest_path_str.clone(),
-                    counts: manifest.counts.clone(),
-                    reused: true,
-                    storage_bytes,
-                };
-                let prepared = prepare_output(&sync_data)?;
-                fs::rename(&active_tmp, active_state_path(data_dir)).map_err(map_io)?;
-                Ok(prepared)
-            })();
-            if commit_res.is_err() {
-                let _ = fs::remove_file(&active_tmp);
-            } else {
-                sync_dir_best_effort(data_dir);
-            }
-            return commit_res;
+    if let Some(existing_bytes) = existing_bytes_opt {
+        stream_verify_zstd_artifact(&artifact_path, &manifest, None)?;
+
+        if prev_state
+            .as_ref()
+            .is_some_and(|state| state.manifest_path == manifest_path_str)
+        {
+            let storage_bytes = compute_managed_bytes(data_dir)?;
+            let sync_data = SyncData {
+                release: manifest.sha256,
+                corpus_format: manifest.corpus_format,
+                manifest_path: manifest_path_str,
+                counts: manifest.counts,
+                reused: true,
+                storage_bytes,
+            };
+            return prepare_output(&sync_data);
         }
+
+        return commit_active_state(
+            data_dir,
+            &existing_path,
+            existing_bytes,
+            &manifest,
+            manifest_path_str,
+            true,
+            prepare_output,
+        );
     }
 
     let staging_db = data_dir.join(".incoming.sqlite.tmp");
@@ -910,72 +902,27 @@ where
     let remove_final_on_err = prev_release.as_ref() != Some(&manifest.sha256);
 
     let install_res = (|| -> Result<T, ClecError> {
-        let src_file = File::open(&artifact_path).map_err(map_io)?;
-        let mut decoder = zstd::stream::Decoder::new(BufReader::new(src_file)).map_err(|e| {
-            ClecError::new(
-                ErrorCode::InvalidPackage,
-                format!("Invalid zstd stream: {e}"),
-            )
-        })?;
         let mut dst_file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&staging_db)
             .map_err(map_io)?;
-        let mut hasher = Sha256::new();
-        let mut buf = [0u8; 65_536];
-        let mut total = 0u64;
-        loop {
-            let n = decoder.read(&mut buf).map_err(|e| {
-                ClecError::new(
-                    ErrorCode::InvalidPackage,
-                    format!("Zstd decompression failed: {e}"),
-                )
-            })?;
-            if n == 0 {
-                break;
-            }
-            total += n as u64;
-            if total > manifest.bytes {
-                return Err(ClecError::new(
-                    ErrorCode::IntegrityMismatch,
-                    "Decompressed artifact exceeds declared manifest bytes.",
-                ));
-            }
-            hasher.update(&buf[..n]);
-            dst_file.write_all(&buf[..n]).map_err(map_io)?;
-        }
-        dst_file.sync_all().map_err(map_io)?;
+        let total = stream_verify_zstd_artifact(&artifact_path, &manifest, Some(&mut dst_file))?;
         drop(dst_file);
-
-        let decomp_sha = crate::domain::hex_encode(&hasher.finalize());
-        if total != manifest.bytes || decomp_sha != manifest.sha256.as_str() {
-            return Err(ClecError::new(
-                ErrorCode::IntegrityMismatch,
-                "Decompressed SQLite size or SHA-256 does not match manifest.",
-            ));
-        }
 
         CorpusStore::validate_staging_db(&staging_db, manifest.sha256.clone(), &manifest.counts)?;
 
         fs::rename(&staging_db, &final_db).map_err(map_io)?;
 
-        let (_, active_tmp_len) =
-            write_active_state_tmp(data_dir, &manifest.sha256, &manifest_path_str)?;
-        let storage_bytes =
-            compute_projected_managed_bytes(data_dir, &final_db, total, active_tmp_len)?;
-        let sync_data = SyncData {
-            release: manifest.sha256.clone(),
-            corpus_format: manifest.corpus_format.clone(),
-            manifest_path: manifest_path_str.clone(),
-            counts: manifest.counts.clone(),
-            reused: false,
-            storage_bytes,
-        };
-        let prepared = prepare_output(&sync_data)?;
-
-        fs::rename(&active_tmp_path, active_state_path(data_dir)).map_err(map_io)?;
-        Ok(prepared)
+        commit_active_state(
+            data_dir,
+            &final_db,
+            total,
+            &manifest,
+            manifest_path_str,
+            false,
+            prepare_output,
+        )
     })();
 
     if install_res.is_err() {
@@ -987,9 +934,96 @@ where
         return install_res;
     }
 
-    sync_dir_best_effort(data_dir);
     cleanup_old_releases(data_dir, manifest.sha256.as_str());
     install_res
+}
+
+fn stream_verify_zstd_artifact(
+    artifact_path: &Path,
+    manifest: &ReleaseManifest,
+    mut out_file: Option<&mut File>,
+) -> Result<u64, ClecError> {
+    let src_file = File::open(artifact_path).map_err(map_io)?;
+    let mut decoder = zstd::stream::Decoder::new(BufReader::new(src_file)).map_err(|e| {
+        ClecError::new(
+            ErrorCode::InvalidPackage,
+            format!("Invalid zstd stream: {e}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65_536];
+    let mut total = 0u64;
+    loop {
+        let n = decoder.read(&mut buf).map_err(|e| {
+            ClecError::new(
+                ErrorCode::InvalidPackage,
+                format!("Zstd decompression failed: {e}"),
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > manifest.bytes {
+            return Err(ClecError::new(
+                ErrorCode::IntegrityMismatch,
+                "Decompressed artifact exceeds declared manifest bytes.",
+            ));
+        }
+        hasher.update(&buf[..n]);
+        if let Some(dst) = out_file.as_deref_mut() {
+            dst.write_all(&buf[..n]).map_err(map_io)?;
+        }
+    }
+    if let Some(dst) = out_file {
+        dst.sync_all().map_err(map_io)?;
+    }
+
+    let decomp_sha = crate::domain::hex_encode(&hasher.finalize());
+    if total != manifest.bytes || decomp_sha != manifest.sha256.as_str() {
+        return Err(ClecError::new(
+            ErrorCode::IntegrityMismatch,
+            "Decompressed SQLite size or SHA-256 does not match manifest.",
+        ));
+    }
+    Ok(total)
+}
+
+fn commit_active_state<T, F>(
+    data_dir: &Path,
+    final_db: &Path,
+    final_db_len: u64,
+    manifest: &ReleaseManifest,
+    manifest_path_str: String,
+    reused: bool,
+    prepare_output: F,
+) -> Result<T, ClecError>
+where
+    F: FnOnce(&SyncData) -> Result<T, ClecError>,
+{
+    let (active_tmp, active_tmp_len) =
+        write_active_state_tmp(data_dir, &manifest.sha256, &manifest_path_str)?;
+    let commit_res = (|| -> Result<T, ClecError> {
+        let storage_bytes =
+            compute_projected_managed_bytes(data_dir, final_db, final_db_len, active_tmp_len)?;
+        let sync_data = SyncData {
+            release: manifest.sha256.clone(),
+            corpus_format: manifest.corpus_format.clone(),
+            manifest_path: manifest_path_str,
+            counts: manifest.counts.clone(),
+            reused,
+            storage_bytes,
+        };
+        let prepared = prepare_output(&sync_data)?;
+        fs::rename(&active_tmp, active_state_path(data_dir)).map_err(map_io)?;
+        Ok(prepared)
+    })();
+    if commit_res.is_err() {
+        let _ = fs::remove_file(&active_tmp);
+    } else {
+        sync_dir_best_effort(data_dir);
+    }
+    commit_res
 }
 
 fn validate_manifest_fields(m: &ReleaseManifest) -> Result<(), ClecError> {
@@ -1327,5 +1361,120 @@ mod tests {
         assert_eq!(obs_err.code, ErrorCode::IoError);
         assert!(obs_dir.join(format!("{}.sqlite", m_a.sha256)).is_file());
         assert!(!obs_dir.join(format!("{}.sqlite", m_b.sha256)).exists());
+    }
+
+    #[test]
+    fn reuse_validates_incoming_zstd_stream_and_decompressed_hash_before_mutating_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "alpha reuse validation content").unwrap();
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            r#"{"schemaVersion":1,"works":[{"key":"wa","title":"A"}],"sources":[{"work":"wa","path":"a.txt","title":"A","role":"document","attribution":"authored_fixture","quality":"fixture","status":"ready"}]}"#,
+        )
+        .unwrap();
+
+        let rel_a = tmp.path().join("rel_a");
+        let m_a = publish_release(&ws, &intake, &rel_a).unwrap();
+        let rel_a_manifest = fs::canonicalize(rel_a.join("manifest.json"))
+            .unwrap()
+            .display()
+            .to_string();
+
+        let data_dir = tmp.path().join("data");
+        let first = sync_local(&data_dir, Some(&rel_a_manifest)).unwrap();
+        assert!(!first.reused);
+
+        let bad_zstd_dir = tmp.path().join("bad_zstd_rel");
+        fs::create_dir_all(&bad_zstd_dir).unwrap();
+        let bad_bytes = b"not a zstd stream";
+        let bad_zstd_path = bad_zstd_dir.join("corpus.sqlite.zst");
+        fs::write(&bad_zstd_path, bad_bytes).unwrap();
+        let mut m_bad_zstd = m_a.clone();
+        m_bad_zstd.compressed_bytes = bad_bytes.len() as u64;
+        m_bad_zstd.compressed_sha256 = sha256_hex(bad_bytes);
+        let bad_zstd_manifest = bad_zstd_dir.join("manifest.json");
+        fs::write(
+            &bad_zstd_manifest,
+            serde_json::to_vec_pretty(&m_bad_zstd).unwrap(),
+        )
+        .unwrap();
+
+        let err_cached =
+            sync_local(&data_dir, Some(&bad_zstd_manifest.display().to_string())).unwrap_err();
+        assert_eq!(err_cached.code, ErrorCode::InvalidPackage);
+        let st_after_bad = data_dir_status(&data_dir).unwrap();
+        assert_eq!(st_after_bad.active_release.as_ref(), Some(&m_a.sha256));
+        assert_eq!(
+            st_after_bad.manifest_path.as_deref(),
+            Some(rel_a_manifest.as_str())
+        );
+
+        let fresh_dir = tmp.path().join("fresh_data");
+        let err_fresh =
+            sync_local(&fresh_dir, Some(&bad_zstd_manifest.display().to_string())).unwrap_err();
+        assert_eq!(err_fresh.code, ErrorCode::InvalidPackage);
+        assert!(!fresh_dir.join("active.json").exists());
+
+        let wrong_payload_dir = tmp.path().join("wrong_payload_rel");
+        fs::create_dir_all(&wrong_payload_dir).unwrap();
+        let wrong_zst = zstd::stream::encode_all(&b"valid zstd wrong sqlite"[..], 3).unwrap();
+        fs::write(wrong_payload_dir.join("corpus.sqlite.zst"), &wrong_zst).unwrap();
+        let mut m_wrong_payload = m_a.clone();
+        m_wrong_payload.compressed_bytes = wrong_zst.len() as u64;
+        m_wrong_payload.compressed_sha256 = sha256_hex(&wrong_zst);
+        let wrong_payload_manifest = wrong_payload_dir.join("manifest.json");
+        fs::write(
+            &wrong_payload_manifest,
+            serde_json::to_vec_pretty(&m_wrong_payload).unwrap(),
+        )
+        .unwrap();
+
+        let err_wrong = sync_local(
+            &data_dir,
+            Some(&wrong_payload_manifest.display().to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err_wrong.code, ErrorCode::IntegrityMismatch);
+        let st_after_wrong = data_dir_status(&data_dir).unwrap();
+        assert_eq!(
+            st_after_wrong.manifest_path.as_deref(),
+            Some(rel_a_manifest.as_str())
+        );
+
+        let valid_copy_dir = tmp.path().join("valid_copy_rel");
+        fs::create_dir_all(&valid_copy_dir).unwrap();
+        fs::copy(
+            rel_a.join("corpus.sqlite.zst"),
+            valid_copy_dir.join("corpus.sqlite.zst"),
+        )
+        .unwrap();
+        fs::copy(
+            rel_a.join("manifest.json"),
+            valid_copy_dir.join("manifest.json"),
+        )
+        .unwrap();
+        let valid_copy_manifest = fs::canonicalize(valid_copy_dir.join("manifest.json"))
+            .unwrap()
+            .display()
+            .to_string();
+        let reused_copy = sync_local(&data_dir, Some(&valid_copy_manifest)).unwrap();
+        assert!(reused_copy.reused);
+        let st_after_valid_copy = data_dir_status(&data_dir).unwrap();
+        assert_eq!(
+            st_after_valid_copy.manifest_path.as_deref(),
+            Some(valid_copy_manifest.as_str())
+        );
+
+        fs::write(valid_copy_dir.join("corpus.sqlite.zst"), bad_bytes).unwrap();
+        fs::write(
+            valid_copy_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&m_bad_zstd).unwrap(),
+        )
+        .unwrap();
+        let err_same_path = sync_local(&data_dir, Some(&valid_copy_manifest)).unwrap_err();
+        assert_eq!(err_same_path.code, ErrorCode::InvalidPackage);
     }
 }
