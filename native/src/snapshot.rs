@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, params};
@@ -9,6 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::distribution::{
+    MAX_ARTIFACT_BYTES, ManifestLocation, NetworkPolicy, acquire_artifact, cleanup_stale_staging,
+    is_staging_temp_name, load_manifest, validate_relative_path, validate_remote_url_syntax,
+};
 use crate::domain::{
     Attribution, ByteSpan, CORPUS_FORMAT, CanonicalCandidate, ClecError, DICTIONARY_REVISION,
     DateYmd, EQUIVALENCE_REVISION, EquivalenceBasis, ErrorCode, NORMALIZATION_REVISION, PassageId,
@@ -22,7 +26,6 @@ use crate::ingest::{
 use crate::lexical::index_tokens_string;
 use crate::store::{CorpusCounts, CorpusStore, DiagnosticsSummary, SCHEMA_SQL};
 
-pub(crate) const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +70,8 @@ pub struct ReleaseManifest {
     pub dictionary_revision: String,
     pub equivalence_revision: String,
     pub artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_url: Option<String>,
     pub bytes: u64,
     pub sha256: ReleaseHash,
     pub compressed_bytes: u64,
@@ -134,6 +139,24 @@ pub fn publish_release(
     intake_path: &Path,
     output_dir: &Path,
 ) -> Result<ReleaseManifest, ClecError> {
+    publish_release_with_artifact_url(workspace, intake_path, output_dir, None)
+}
+
+pub fn publish_release_with_artifact_url(
+    workspace: &Path,
+    intake_path: &Path,
+    output_dir: &Path,
+    artifact_url: Option<&str>,
+) -> Result<ReleaseManifest, ClecError> {
+    let validated_artifact_url = match artifact_url {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            validate_remote_url_syntax(trimmed, ErrorCode::InvalidArgument)?;
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+
     let canonical_workspace = fs::canonicalize(workspace).map_err(|e| {
         ClecError::new(
             ErrorCode::IoError,
@@ -211,7 +234,13 @@ pub fn publish_release(
     }
     fs::create_dir_all(&staging).map_err(map_io)?;
 
-    let build_res = build_in_staging(&canonical_workspace, &intake, &work_map, &staging);
+    let build_res = build_in_staging(
+        &canonical_workspace,
+        &intake,
+        &work_map,
+        &staging,
+        validated_artifact_url,
+    );
     match build_res {
         Ok(manifest) => {
             if let Err(e) = fs::rename(&staging, output_dir) {
@@ -227,39 +256,12 @@ pub fn publish_release(
     }
 }
 
-fn validate_relative_path(raw: &str) -> Result<PathBuf, ClecError> {
-    if raw.is_empty() || raw.contains('\0') || raw.contains('\\') {
-        return Err(ClecError::new(
-            ErrorCode::UnsafePath,
-            format!("Invalid workspace-relative path '{raw}'."),
-        ));
-    }
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        return Err(ClecError::new(
-            ErrorCode::UnsafePath,
-            format!("Source path '{raw}' must be relative to workspace."),
-        ));
-    }
-    for comp in path.components() {
-        match comp {
-            Component::Normal(_) => {}
-            _ => {
-                return Err(ClecError::new(
-                    ErrorCode::UnsafePath,
-                    format!("Source path '{raw}' contains disallowed path components."),
-                ));
-            }
-        }
-    }
-    Ok(path.to_path_buf())
-}
-
 fn build_in_staging(
     canonical_workspace: &Path,
     intake: &IntakeDocument,
     work_map: &HashMap<String, (WorkId, String)>,
     staging: &Path,
+    artifact_url: Option<String>,
 ) -> Result<ReleaseManifest, ClecError> {
     let sqlite_path = staging.join("corpus.sqlite");
     let zst_path = staging.join("corpus.sqlite.zst");
@@ -839,6 +841,7 @@ fn build_in_staging(
         dictionary_revision: DICTIONARY_REVISION.to_owned(),
         equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
         artifact: "corpus.sqlite.zst".to_owned(),
+        artifact_url,
         bytes,
         sha256: release,
         compressed_bytes,
@@ -1067,12 +1070,20 @@ pub(crate) fn sync_local(
     data_dir: &Path,
     manifest_arg: Option<&str>,
 ) -> Result<SyncData, ClecError> {
-    sync_local_with_prepare(data_dir, manifest_arg, |data| Ok(data.clone()))
+    sync_with_prepare(
+        data_dir,
+        manifest_arg,
+        NetworkPolicy::Allowed,
+        None,
+        |data| Ok(data.clone()),
+    )
 }
 
-pub(crate) fn sync_local_with_prepare<T, F>(
+pub(crate) fn sync_with_prepare<T, F>(
     data_dir: &Path,
     manifest_arg: Option<&str>,
+    network_policy: NetworkPolicy,
+    default_origin: Option<&str>,
     prepare_output: F,
 ) -> Result<T, ClecError>
 where
@@ -1106,85 +1117,59 @@ where
         )
     })?;
 
-    let result = sync_locked(data_dir, manifest_arg, prepare_output);
+    let result = sync_locked(
+        data_dir,
+        manifest_arg,
+        network_policy,
+        default_origin,
+        prepare_output,
+    );
     let _ = lock_file.unlock();
     result
+}
+
+fn resolve_sync_location(
+    manifest_arg: Option<&str>,
+    prev_state_res: &Result<Option<ActiveState>, ClecError>,
+    default_origin: Option<&str>,
+) -> Result<ManifestLocation, ClecError> {
+    let raw = match manifest_arg {
+        Some(raw) => raw.to_owned(),
+        None => {
+            let prev = prev_state_res.as_ref().map_err(Clone::clone)?;
+            if let Some(state) = prev {
+                state.manifest_path.clone()
+            } else if let Some(default_url) = default_origin {
+                default_url.to_owned()
+            } else {
+                return Err(ClecError::new(
+                    ErrorCode::NoData,
+                    "No manifest origin is configured. Pass --manifest PATH_OR_HTTPS_URL.",
+                ));
+            }
+        }
+    };
+    ManifestLocation::parse(&raw)
 }
 
 fn sync_locked<T, F>(
     data_dir: &Path,
     manifest_arg: Option<&str>,
+    network_policy: NetworkPolicy,
+    default_origin: Option<&str>,
     prepare_output: F,
 ) -> Result<T, ClecError>
 where
     F: FnOnce(&SyncData) -> Result<T, ClecError>,
 {
+    cleanup_stale_staging(data_dir);
     let prev_state_res = read_active_state(data_dir);
-    let manifest_str = match manifest_arg {
-        Some(raw) => {
-            if raw.starts_with("http://") || raw.starts_with("https://") {
-                return Err(ClecError::new(
-                    ErrorCode::UnsupportedFeature,
-                    "Remote HTTP sync is unsupported in Phase 1; pass a local manifest file path.",
-                ));
-            }
-            raw.to_owned()
-        }
-        None => prev_state_res
-            .as_ref()
-            .map_err(|e| e.clone())?
-            .as_ref()
-            .map(|s| s.manifest_path.clone())
-            .ok_or_else(|| {
-                ClecError::new(
-                    ErrorCode::NoData,
-                    "No manifest path configured. Pass --manifest FILE.",
-                )
-            })?,
-    };
+    let location = resolve_sync_location(manifest_arg, &prev_state_res, default_origin)?;
+    let loaded = load_manifest(&location, network_policy)?;
+    let acquired = acquire_artifact(&loaded, data_dir, network_policy)?;
 
-    let manifest_path = fs::canonicalize(&manifest_str).map_err(|e| {
-        ClecError::new(
-            ErrorCode::IoError,
-            format!("Cannot read manifest {}: {e}", manifest_str),
-        )
-    })?;
-    let manifest_path_str = manifest_path.display().to_string();
-    let manifest_raw = fs::read(&manifest_path).map_err(map_io)?;
-    if manifest_raw.len() > 1024 * 1024 {
-        return Err(ClecError::new(
-            ErrorCode::InvalidManifest,
-            "Manifest exceeds 1 MiB limit.",
-        ));
-    }
-
-    let manifest: ReleaseManifest = serde_json::from_slice(&manifest_raw).map_err(|e| {
-        ClecError::new(
-            ErrorCode::InvalidPackage,
-            format!("Invalid manifest JSON: {e}"),
-        )
-    })?;
-    validate_manifest_fields(&manifest)?;
-
-    let rel_artifact = validate_relative_path(&manifest.artifact)?;
-    let artifact_path = manifest_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(rel_artifact);
-    if !artifact_path.is_file() {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            format!("Artifact {} is missing.", artifact_path.display()),
-        ));
-    }
-
-    let (comp_bytes, comp_sha) = file_size_and_sha256(&artifact_path)?;
-    if comp_bytes != manifest.compressed_bytes || comp_sha != manifest.compressed_sha256 {
-        return Err(ClecError::new(
-            ErrorCode::IntegrityMismatch,
-            "Compressed artifact size or SHA-256 does not match manifest.",
-        ));
-    }
+    let manifest = loaded.manifest;
+    let manifest_path_str = loaded.persistent_origin;
 
     let prev_state = prev_state_res.ok().flatten();
     let prev_release = prev_state.as_ref().map(|s| s.release.clone());
@@ -1206,7 +1191,8 @@ where
     };
 
     if let Some(existing_bytes) = existing_bytes_opt {
-        stream_verify_zstd_artifact(&artifact_path, &manifest, None)?;
+        stream_verify_zstd_artifact(acquired.path(), &manifest, None)?;
+        drop(acquired);
 
         if prev_state
             .as_ref()
@@ -1248,8 +1234,9 @@ where
             .write(true)
             .open(&staging_db)
             .map_err(map_io)?;
-        let total = stream_verify_zstd_artifact(&artifact_path, &manifest, Some(&mut dst_file))?;
+        let total = stream_verify_zstd_artifact(acquired.path(), &manifest, Some(&mut dst_file))?;
         drop(dst_file);
+        drop(acquired);
 
         CorpusStore::validate_staging_db(&staging_db, manifest.sha256.clone(), &manifest.counts)?;
 
@@ -1367,79 +1354,6 @@ where
     commit_res
 }
 
-fn validate_manifest_fields(m: &ReleaseManifest) -> Result<(), ClecError> {
-    if m.schema_version != SCHEMA_VERSION {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            format!(
-                "Unsupported manifest schemaVersion {}; expected {SCHEMA_VERSION}.",
-                m.schema_version
-            ),
-        ));
-    }
-    if m.corpus_format != CORPUS_FORMAT {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            format!(
-                "Unsupported corpusFormat '{}'; expected {CORPUS_FORMAT}.",
-                m.corpus_format
-            ),
-        ));
-    }
-    if m.segmentation_revision != SEGMENTATION_REVISION {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Unsupported segmentationRevision in manifest.",
-        ));
-    }
-    if m.tokenization_revision != TOKENIZATION_REVISION {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Unsupported tokenizationRevision in manifest.",
-        ));
-    }
-    if m.normalization_revision != NORMALIZATION_REVISION {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Unsupported normalizationRevision in manifest.",
-        ));
-    }
-    if m.dictionary_revision != DICTIONARY_REVISION {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Unsupported dictionaryRevision in manifest.",
-        ));
-    }
-    if m.equivalence_revision != EQUIVALENCE_REVISION {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Unsupported equivalenceRevision in manifest.",
-        ));
-    }
-    if m.bytes == 0
-        || m.bytes > MAX_ARTIFACT_BYTES
-        || m.compressed_bytes == 0
-        || m.compressed_bytes > MAX_ARTIFACT_BYTES
-    {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Manifest artifact byte sizes are out of bounds.",
-        ));
-    }
-    if m.compressed_sha256.len() != 64
-        || !m
-            .compressed_sha256
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(ClecError::new(
-            ErrorCode::InvalidPackage,
-            "Manifest compressedSha256 must be a 64-character lowercase hex digest.",
-        ));
-    }
-    Ok(())
-}
-
 fn active_state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("active.json")
 }
@@ -1542,6 +1456,7 @@ fn compute_projected_managed_bytes(
         if s == "active.json"
             || s == ".active.tmp"
             || s == ".incoming.sqlite.tmp"
+            || is_staging_temp_name(&s)
             || s == final_db_name
             || is_superseded_db
         {
@@ -1556,7 +1471,7 @@ fn compute_projected_managed_bytes(
     Ok(total)
 }
 
-fn map_io(err: std::io::Error) -> ClecError {
+pub(crate) fn map_io(err: std::io::Error) -> ClecError {
     ClecError::new(ErrorCode::IoError, format!("Filesystem error: {err}"))
 }
 
@@ -1695,12 +1610,18 @@ mod tests {
         let st_initial = data_dir_status(&data_dir).unwrap();
         assert_eq!(first.storage_bytes, st_initial.storage_bytes);
 
-        let budget_err = sync_local_with_prepare(&data_dir, Some(&m_b_path), |_| {
-            Err::<(), ClecError>(ClecError::new(
-                ErrorCode::OutputBudgetTooSmall,
-                "simulated budget failure before commit",
-            ))
-        })
+        let budget_err = sync_with_prepare(
+            &data_dir,
+            Some(&m_b_path),
+            NetworkPolicy::Allowed,
+            None,
+            |_| {
+                Err::<(), ClecError>(ClecError::new(
+                    ErrorCode::OutputBudgetTooSmall,
+                    "simulated budget failure before commit",
+                ))
+            },
+        )
         .unwrap_err();
         assert_eq!(budget_err.code, ErrorCode::OutputBudgetTooSmall);
         assert!(data_dir.join(format!("{}.sqlite", m_a.sha256)).is_file());
@@ -2068,5 +1989,62 @@ mod tests {
             Some(ErrorCode::IntegrityMismatch)
         );
         assert_eq!(fs::read(&bad_docsize_db).unwrap(), bad_docsize_bytes);
+    }
+
+    #[test]
+    fn publish_optional_artifact_url_preserves_db_bytes_and_local_sync_uses_sibling_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "optional artifactUrl local sync test").unwrap();
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            r#"{"schemaVersion":1,"works":[{"key":"w1","title":"W1"}],"sources":[{"work":"w1","path":"a.txt","title":"A","role":"document","attribution":"authored_fixture","quality":"fixture","status":"ready"}]}"#,
+        )
+        .unwrap();
+
+        let rel_plain = tmp.path().join("rel-plain");
+        let rel_url = tmp.path().join("rel-url");
+        let m_plain = publish_release(&ws, &intake, &rel_plain).unwrap();
+        let m_url = publish_release_with_artifact_url(
+            &ws,
+            &intake,
+            &rel_url,
+            Some("https://cdn.example.invalid/releases/corpus.sqlite.zst"),
+        )
+        .unwrap();
+
+        assert!(m_plain.artifact_url.is_none());
+        let raw_plain = fs::read_to_string(rel_plain.join("manifest.json")).unwrap();
+        assert!(!raw_plain.contains("artifactUrl"));
+
+        assert_eq!(
+            m_url.artifact_url.as_deref(),
+            Some("https://cdn.example.invalid/releases/corpus.sqlite.zst")
+        );
+        assert_eq!(m_plain.sha256, m_url.sha256);
+        assert_eq!(m_plain.compressed_sha256, m_url.compressed_sha256);
+        assert_eq!(
+            fs::read(rel_plain.join("corpus.sqlite.zst")).unwrap(),
+            fs::read(rel_url.join("corpus.sqlite.zst")).unwrap()
+        );
+
+        let data_dir = tmp.path().join("data");
+        let synced = sync_with_prepare(
+            &data_dir,
+            Some(&rel_url.join("manifest.json").display().to_string()),
+            NetworkPolicy::Offline,
+            None,
+            |d| Ok(d.clone()),
+        )
+        .unwrap();
+        assert_eq!(synced.release, m_url.sha256);
+
+        let oversized_manifest = tmp.path().join("oversized-manifest.json");
+        fs::write(&oversized_manifest, vec![b' '; (1024 * 1024) + 1]).unwrap();
+        let err =
+            sync_local(&data_dir, Some(&oversized_manifest.display().to_string())).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidManifest);
     }
 }

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use clec_core::domain::{CORPUS_FORMAT, ClecError, ErrorCode, ErrorEnvelope};
-use clec_core::snapshot::publish_release;
+use clec_core::snapshot::publish_release_with_artifact_url;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,6 +23,10 @@ struct PublishCli {
     /// New output directory for manifest.json and corpus.sqlite.zst
     #[arg(long, value_name = "DIR")]
     output: PathBuf,
+
+    /// Optional public artifact download URL recorded in manifest.json
+    #[arg(long, value_name = "URL")]
+    artifact_url: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -43,7 +47,12 @@ fn main() -> ExitCode {
         }
     };
 
-    match publish_release(&cli.workspace, &cli.intake, &cli.output) {
+    match publish_release_with_artifact_url(
+        &cli.workspace,
+        &cli.intake,
+        &cli.output,
+        cli.artifact_url.as_deref(),
+    ) {
         Ok(manifest) => {
             println!("{}", serde_json::to_string(&manifest).unwrap());
             ExitCode::SUCCESS

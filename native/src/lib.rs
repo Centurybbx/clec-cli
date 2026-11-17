@@ -1,4 +1,5 @@
 pub mod cli;
+pub(crate) mod distribution;
 pub mod domain;
 pub(crate) mod ingest;
 pub(crate) mod lexical;

@@ -7,6 +7,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 
+use crate::distribution::NetworkPolicy;
 use crate::domain::{
     CORPUS_FORMAT, ClecError, DEFAULT_MAX_BYTES, DICTIONARY_REVISION, DateYmd,
     EQUIVALENCE_REVISION, ErrorCode, ErrorEnvelope, NORMALIZATION_REVISION, PassageId, ReleaseHash,
@@ -18,7 +19,7 @@ use crate::retrieval::{
     SearchRequest, execute_search,
 };
 use crate::snapshot::{
-    StatusData, SyncData, data_dir_status, open_current_store, sync_local_with_prepare,
+    StatusData, SyncData, data_dir_status, open_current_store, sync_with_prepare,
 };
 use crate::store::{PassageReadItem, SourceListEntry, SourceOriginalItem, SourceOverviewItem};
 
@@ -584,9 +585,18 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
             serialize_fixed("status", &data, use_json, max_bytes, format_status_text)
         }
         Commands::Sync(args) => {
-            sync_local_with_prepare(&data_dir, args.manifest.as_deref(), |data| {
-                serialize_fixed("sync", data, use_json, max_bytes, format_sync_text)
-            })
+            let network_policy = if cli.offline {
+                NetworkPolicy::Offline
+            } else {
+                NetworkPolicy::Allowed
+            };
+            sync_with_prepare(
+                &data_dir,
+                args.manifest.as_deref(),
+                network_policy,
+                None,
+                |data| serialize_fixed("sync", data, use_json, max_bytes, format_sync_text),
+            )
         }
         Commands::Search(args) => {
             let prepared = prepare_search_request(args)?;
