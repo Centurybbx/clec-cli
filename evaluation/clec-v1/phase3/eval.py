@@ -127,11 +127,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 1
 
+        runtime_questions = adapter.extract_runtime_questions(dataset["questions"])
         outcomes, raw_logs = adapter.execute_dataset_queries(
             clec_bin=clec_bin,
             data_dir=data_dir,
             corpus_sha256=args.corpus_sha256,
-            questions=dataset["questions"],
+            questions=runtime_questions,
             mode=args.mode,
             query_angle=args.query_angle,
             blind_queries_path=args.blind_queries.resolve() if args.blind_queries else None,

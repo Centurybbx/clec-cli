@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -22,6 +24,36 @@ VALID_QUERY_ANGLES = score.VALID_QUERY_ANGLES
 FORBIDDEN_QUERY_FIELDS = frozenset({"evidence", "quote", "quotes", "workKeys", "notes", "spans"})
 OUTCOME_SCHEMA_VERSION = score.OUTCOME_SCHEMA_VERSION
 _MAX_UNDECODABLE_BASE64_BYTES = 65536
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeQuestion:
+    id: str
+    question: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str):
+            raise TypeError(f"RuntimeQuestion.id must be str, got {type(self.id).__name__}")
+        if not self.id:
+            raise ValueError("RuntimeQuestion.id must be a non-empty string")
+        if not isinstance(self.question, str):
+            raise TypeError(f"RuntimeQuestion.question must be str, got {type(self.question).__name__}")
+
+
+def parse_runtime_question(record: Mapping[str, Any]) -> RuntimeQuestion:
+    if not isinstance(record, Mapping):
+        raise TypeError(f"Question record must be a mapping, got {type(record).__name__}")
+    if "id" not in record or "question" not in record:
+        raise ValueError("Question record must contain 'id' and 'question'")
+    return RuntimeQuestion(id=record["id"], question=record["question"])
+
+
+def extract_runtime_questions(records: Sequence[Mapping[str, Any]]) -> tuple[RuntimeQuestion, ...]:
+    if isinstance(records, (str, bytes, Mapping)) or not isinstance(records, Sequence):
+        raise TypeError(
+            f"Question records must be a sequence of mappings, got {type(records).__name__}"
+        )
+    return tuple(parse_runtime_question(record) for record in records)
 
 
 def _decode_stream_strict(raw: bytes, stream_name: str) -> dict[str, Any]:
@@ -83,28 +115,30 @@ def load_blind_queries(path: Path) -> dict[str, list[str]]:
 
 
 def build_runtime_queries(
-    question: dict[str, Any],
+    question: RuntimeQuestion,
     *,
     mode: str,
     query_angle: str,
     blind_map: dict[str, list[str]] | None,
 ) -> list[str]:
+    if not isinstance(question, RuntimeQuestion):
+        raise TypeError(f"question must be RuntimeQuestion, got {type(question).__name__}")
     if mode not in VALID_MODES:
         raise ValueError(f"Unsupported mode {mode!r}; expected one of {sorted(VALID_MODES)}")
     if query_angle not in VALID_QUERY_ANGLES:
         raise ValueError(f"Unsupported query_angle {query_angle!r}")
 
     if query_angle == "question":
-        q_text = str(question["question"]).strip()
+        q_text = question.question.strip()
         if not q_text:
-            raise ValueError(f"Empty question text for {question['id']}")
+            raise ValueError(f"Empty question text for {question.id}")
         return [q_text]
 
-    if blind_map is None or question["id"] not in blind_map:
-        raise ValueError(f"Missing blind rewrite queries for question {question['id']!r}")
-    queries = [q.strip() for q in blind_map[question["id"]] if q.strip()]
+    if blind_map is None or question.id not in blind_map:
+        raise ValueError(f"Missing blind rewrite queries for question {question.id!r}")
+    queries = [q.strip() for q in blind_map[question.id] if q.strip()]
     if not queries:
-        raise ValueError(f"Empty blind rewrite queries for question {question['id']!r}")
+        raise ValueError(f"Empty blind rewrite queries for question {question.id!r}")
     if mode == "single_query_product_baseline":
         return [queries[0]]
     return queries[:4]
@@ -249,7 +283,7 @@ def execute_dataset_queries(
     clec_bin: Path,
     data_dir: Path,
     corpus_sha256: str,
-    questions: list[dict[str, Any]],
+    questions: Sequence[RuntimeQuestion],
     mode: str = "single_query_product_baseline",
     query_angle: str = "question",
     blind_queries_path: Path | None = None,
@@ -261,16 +295,25 @@ def execute_dataset_queries(
     read_top_n: int = 0,
     timeout_sec: float = 30.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    blind_map = load_blind_queries(blind_queries_path) if blind_queries_path is not None else None
-    outcomes: list[dict[str, Any]] = []
-    raw_logs: list[dict[str, Any]] = []
+    if isinstance(questions, (str, bytes, Mapping)) or not isinstance(questions, Sequence):
+        raise TypeError(
+            f"questions must be a sequence of RuntimeQuestion, got {type(questions).__name__}"
+        )
+    validated_questions: list[RuntimeQuestion] = []
+    for idx, q in enumerate(questions):
+        if not isinstance(q, RuntimeQuestion):
+            raise TypeError(f"questions[{idx}] must be RuntimeQuestion, got {type(q).__name__}")
+        validated_questions.append(q)
 
     if match_mode not in score.VALID_MATCH_MODES:
         raise ValueError(f"Unsupported match_mode {match_mode!r}; expected one of {sorted(score.VALID_MATCH_MODES)}")
     typed_match_mode: Literal["any", "all"] = "any" if match_mode == "any" else "all"
+    blind_map = load_blind_queries(blind_queries_path) if blind_queries_path is not None else None
+    outcomes: list[dict[str, Any]] = []
+    raw_logs: list[dict[str, Any]] = []
 
-    for q in questions:
-        qid = q["id"]
+    for q in validated_questions:
+        qid = q.id
         queries = build_runtime_queries(q, mode=mode, query_angle=query_angle, blind_map=blind_map)
         search_plan = score.SearchCommandPlan(
             queries=tuple(queries),

@@ -97,13 +97,14 @@ def main() -> int:
 
     dataset = json.loads(args.dataset.read_bytes().decode("utf-8", errors="strict"))
     blind_map = adapter.load_blind_queries(args.blind_queries.resolve()) if args.blind_queries else None
-    questions = dataset["questions"]
+    questions = adapter.extract_runtime_questions(dataset["questions"])
+    del dataset
 
     effective_angle = args.query_angle if blind_map is not None else "question"
     plan_by_qid: dict[str, dict[str, list[str]]] = {}
     has_distinct_plans = True
     for q in questions:
-        qid = q["id"]
+        qid = q.id
         q_base = adapter.build_runtime_queries(
             q, mode="single_query_product_baseline", query_angle=effective_angle, blind_map=blind_map
         )
@@ -123,7 +124,7 @@ def main() -> int:
     effective_plan_details: dict[str, dict[str, Any]] = {}
     warmup_error_count = 0
     for q in questions:
-        qid = q["id"]
+        qid = q.id
         modes_to_warm = (
             ("single_query_product_baseline", "rrf_multiquery")
             if has_distinct_plans
@@ -216,7 +217,7 @@ def main() -> int:
             order = ["single_query_product_baseline"]
 
         for q in questions:
-            qid = q["id"]
+            qid = q.id
             for mode in order:
                 queries = plan_by_qid[qid][mode]
                 rec = adapter.run_clec_command(
@@ -271,7 +272,7 @@ def main() -> int:
 
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
             for q in questions:
-                qid = q["id"]
+                qid = q.id
                 fts_q = question_fts_queries.get(qid, "")
                 t0 = time.monotonic()
                 if fts_q:

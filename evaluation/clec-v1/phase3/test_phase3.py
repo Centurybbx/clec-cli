@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 import contextlib
 import copy
+import dataclasses
 import hashlib
+import inspect
 import io
 import json
 from pathlib import Path
@@ -16,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any, TypedDict, cast
 import unittest
 from unittest import mock
@@ -2162,7 +2165,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=crlf_cli,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=ds["questions"],
+            questions=adapter.extract_runtime_questions(ds["questions"]),
             max_bytes=len(raw_crlf),
             timeout_sec=5.0,
         )
@@ -2215,7 +2218,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=cum_crlf_cli,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=ds["questions"],
+            questions=adapter.extract_runtime_questions(ds["questions"]),
             read_top_n=1,
             timeout_sec=5.0,
         )
@@ -2253,7 +2256,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=bad_utf8_cli,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=ds["questions"],
+            questions=adapter.extract_runtime_questions(ds["questions"]),
             timeout_sec=5.0,
         )
         self.assertEqual(bad_outcomes[0]["status"], "error")
@@ -2408,7 +2411,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=self.clec_bin,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=[q_base],
+            questions=adapter.extract_runtime_questions([q_base]),
             read_top_n=0,
         )
         rc_so, rep_so = _run_score_outcomes(ds_single, search_only_out, "pos-search-only")
@@ -2422,7 +2425,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=self.clec_bin,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=[q_base],
+            questions=adapter.extract_runtime_questions([q_base]),
             read_top_n=1,
         )
         rc_sr, rep_sr = _run_score_outcomes(ds_single, search_read_out, "pos-search-read")
@@ -2440,7 +2443,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=self.clec_bin,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=[q_kw],
+            questions=adapter.extract_runtime_questions([q_kw]),
             read_top_n=1,
         )
         rc_kw, rep_kw = _run_score_outcomes(ds_kw, kw_out, "pos-keywords-in-query")
@@ -2470,7 +2473,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=self.clec_bin,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=[q_trim],
+            questions=adapter.extract_runtime_questions([q_trim]),
             limit=2,
             per_work=2,
             read_top_n=2,
@@ -2491,7 +2494,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=self.clec_bin,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=[q_trim],
+            questions=adapter.extract_runtime_questions([q_trim]),
             limit=2,
             per_work=2,
             read_max_bytes=first_read_len + 40,
@@ -2514,7 +2517,7 @@ class Phase3HarnessTests(unittest.TestCase):
             clec_bin=self.clec_bin,
             data_dir=self.data_dir,
             corpus_sha256=self.corpus_sha,
-            questions=[q_base],
+            questions=adapter.extract_runtime_questions([q_base]),
             mode="rrf_multiquery",
             query_angle="blind_rewrite",
             blind_queries_path=blind_q_path,
@@ -2848,8 +2851,14 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertEqual(len(observed_builder_items), 1)
         for item in observed_exec_items:
             self._assert_narrow_runtime_input(item, "eval.execute_dataset_queries")
+            self.assertIsInstance(item, adapter.RuntimeQuestion)
         for item in observed_builder_items:
             self._assert_narrow_runtime_input(item, "eval.build_runtime_queries")
+            self.assertIsInstance(item, adapter.RuntimeQuestion)
+        eval_report = json.loads(eval_out.read_text(encoding="utf-8"))
+        self.assertEqual(eval_report["verdict"], "complete")
+        self.assertTrue(all(eval_report["gates"].values()))
+        self.assertEqual(eval_report["counts"]["completeChains"], 1)
 
     def test_bench_warmup_passes_only_narrow_runtime_questions_without_gold_fields(self) -> None:
         _, ds_path, blind_path = self._make_poison_gold_dataset_files("bench-spy")
@@ -2894,6 +2903,12 @@ class Phase3HarnessTests(unittest.TestCase):
         self.assertEqual(len(bench_observed_items), 2)
         for item in bench_observed_items:
             self._assert_narrow_runtime_input(item, "bench.build_runtime_queries")
+            self.assertIsInstance(item, adapter.RuntimeQuestion)
+        bench_text = bench_out.read_text(encoding="utf-8")
+        self.assertNotIn("POISON_GOLD_NOTES_DO_NOT_LEAK", bench_text)
+        bench_rep = json.loads(bench_text)
+        self.assertEqual(bench_rep["comparisonStatus"], "DISTINCT_QUERY_PLANS")
+        self.assertEqual(bench_rep["warmupErrorCount"], 0)
 
     def test_direct_gold_record_to_query_api_rejected_before_cli_spawn(self) -> None:
         gold_q, _, _ = self._make_poison_gold_dataset_files("direct-reject")
@@ -2914,6 +2929,35 @@ class Phase3HarnessTests(unittest.TestCase):
             )
         self.assertFalse(sentinel_marker.exists())
 
+        mixed = [adapter.RuntimeQuestion(id="q-ok", question="稅務問題"), gold_q]
+        with self.assertRaises(TypeError):
+            adapter.execute_dataset_queries(
+                clec_bin=sentinel_cli,
+                data_dir=self.data_dir,
+                corpus_sha256=self.corpus_sha,
+                questions=cast(Any, mixed),
+            )
+        self.assertFalse(sentinel_marker.exists())
+
+        with self.assertRaises(TypeError):
+            adapter.execute_dataset_queries(
+                clec_bin=sentinel_cli,
+                data_dir=self.data_dir,
+                corpus_sha256=self.corpus_sha,
+                questions=cast(Any, gold_q),
+            )
+        self.assertFalse(sentinel_marker.exists())
+
+        duck_obj = SimpleNamespace(id="q-duck", question="稅務問題", evidence=["leak"])
+        with self.assertRaises(TypeError):
+            adapter.execute_dataset_queries(
+                clec_bin=sentinel_cli,
+                data_dir=self.data_dir,
+                corpus_sha256=self.corpus_sha,
+                questions=cast(Any, [duck_obj]),
+            )
+        self.assertFalse(sentinel_marker.exists())
+
         with self.assertRaises(TypeError):
             adapter.build_runtime_queries(
                 cast(Any, gold_q),
@@ -2921,6 +2965,260 @@ class Phase3HarnessTests(unittest.TestCase):
                 query_angle="question",
                 blind_map=None,
             )
+
+        with self.assertRaises(TypeError):
+            adapter.build_runtime_queries(
+                cast(Any, duck_obj),
+                mode="single_query_product_baseline",
+                query_angle="question",
+                blind_map=None,
+            )
+
+    def test_runtime_question_structural_restrictions_poison_isolation_and_narrow_positive_controls(self) -> None:
+        rq_type = adapter.RuntimeQuestion
+        self.assertTrue(dataclasses.is_dataclass(rq_type))
+        self.assertTrue(getattr(rq_type, "__dataclass_params__").frozen)
+        self.assertEqual(getattr(rq_type, "__slots__"), ("id", "question"))
+        self.assertEqual(tuple(f.name for f in dataclasses.fields(rq_type)), ("id", "question"))
+
+        rq = rq_type(id="q-struct", question="  匯回臺灣 稅務問題  ")
+        self.assertFalse(hasattr(rq, "__dict__"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            setattr(rq, "id", "other")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            setattr(rq, "question", "other")
+        with self.assertRaises((AttributeError, TypeError)):
+            setattr(rq, "evidence", [])
+        with self.assertRaises(AttributeError):
+            object.__setattr__(rq, "evidence", [])
+
+        build_sig = inspect.signature(adapter.build_runtime_queries)
+        exec_sig = inspect.signature(adapter.execute_dataset_queries)
+        self.assertIn("RuntimeQuestion", str(build_sig.parameters["question"].annotation))
+        self.assertIn("RuntimeQuestion", str(exec_sig.parameters["questions"].annotation))
+        self.assertNotIn("dict", str(build_sig.parameters["question"].annotation))
+        self.assertNotIn("Mapping", str(build_sig.parameters["question"].annotation))
+        self.assertNotIn("dict", str(exec_sig.parameters["questions"].annotation))
+        self.assertNotIn("Mapping", str(exec_sig.parameters["questions"].annotation))
+
+        with self.assertRaises(ValueError):
+            rq_type(id="", question="ok")
+        with self.assertRaises(TypeError):
+            rq_type(id=cast(Any, 123), question="ok")
+        with self.assertRaises(TypeError):
+            rq_type(id="q-1", question=cast(Any, None))
+        with self.assertRaises(ValueError):
+            adapter.extract_runtime_questions([{"id": "q-1"}])
+        with self.assertRaises(TypeError):
+            adapter.extract_runtime_questions(cast(Any, {"id": "q-1", "question": "ok"}))
+
+        gold_q, _, _ = self._make_poison_gold_dataset_files("poison-read")
+
+        class _ReadTrackingGoldMapping(Mapping[str, Any]):
+            def __init__(self, inner: dict[str, Any]) -> None:
+                self._inner = inner
+                self.read_keys: list[str] = []
+
+            def __getitem__(self, key: str) -> Any:
+                self.read_keys.append(key)
+                if key not in ("id", "question"):
+                    raise AssertionError(f"Forbidden gold key read outside validation/scoring: {key!r}")
+                return self._inner[key]
+
+            def __iter__(self) -> Iterator[str]:
+                raise AssertionError("Boundary extractor must not iterate over gold mapping keys")
+
+            def __len__(self) -> int:
+                return len(self._inner)
+
+            def __contains__(self, key: object) -> bool:
+                if key not in ("id", "question"):
+                    raise AssertionError(f"Forbidden gold key membership check: {key!r}")
+                return key in self._inner
+
+        tracked = _ReadTrackingGoldMapping(gold_q)
+        extracted = adapter.extract_runtime_questions([tracked])
+        self.assertEqual(extracted, (adapter.RuntimeQuestion(id=gold_q["id"], question=gold_q["question"]),))
+        self.assertEqual(set(tracked.read_keys), {"id", "question"})
+
+        blind_map = {
+            "q-pos": ["  匯回臺灣  ", "  稅務問題 ", "條件", "臺灣", "extra-fifth"],
+        }
+        q_ws = adapter.RuntimeQuestion(id="q-pos", question="  匯回臺灣 稅務問題  ")
+        self.assertEqual(
+            adapter.build_runtime_queries(
+                q_ws,
+                mode="single_query_product_baseline",
+                query_angle="question",
+                blind_map=blind_map,
+            ),
+            ["匯回臺灣 稅務問題"],
+        )
+        self.assertEqual(
+            adapter.build_runtime_queries(
+                q_ws,
+                mode="single_query_product_baseline",
+                query_angle="blind_rewrite",
+                blind_map=blind_map,
+            ),
+            ["匯回臺灣"],
+        )
+        self.assertEqual(
+            adapter.build_runtime_queries(
+                q_ws,
+                mode="rrf_multiquery",
+                query_angle="blind_rewrite",
+                blind_map=blind_map,
+            ),
+            ["匯回臺灣", "稅務問題", "條件", "臺灣"],
+        )
+        q_kw = adapter.RuntimeQuestion(
+            id="q-kw-pos",
+            question="  read --context 1 --release 匯回臺灣 稅務問題  ",
+        )
+        self.assertEqual(
+            adapter.build_runtime_queries(
+                q_kw,
+                mode="single_query_product_baseline",
+                query_angle="question",
+                blind_map=None,
+            ),
+            ["read --context 1 --release 匯回臺灣 稅務問題"],
+        )
+
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        full_dataset = {
+            "schemaVersion": 1,
+            "corpusSha256": self.corpus_sha,
+            "split": "development",
+            "questions": [
+                {
+                    "id": "q-pos",
+                    "category": "condition",
+                    "question": "  匯回臺灣 稅務問題  ",
+                    "answerable": True,
+                    "workKeys": ["w:ep1"],
+                    "evidence": [
+                        {
+                            "claimId": "c1",
+                            "sourceId": sid_srt,
+                            "path": "ep1.srt",
+                            "spans": [sp_srt],
+                            "quote": "若無稅務問題才能匯回臺灣",
+                            "kind": "condition",
+                        }
+                    ],
+                },
+                {
+                    "id": "q-kw-pos",
+                    "category": "condition",
+                    "question": "  read --context 1 --release 匯回臺灣 稅務問題  ",
+                    "answerable": True,
+                    "workKeys": ["w:ep1"],
+                    "evidence": [
+                        {
+                            "claimId": "c2",
+                            "sourceId": sid_srt,
+                            "path": "ep1.srt",
+                            "spans": [sp_srt],
+                            "quote": "若無稅務問題才能匯回臺灣",
+                            "kind": "condition",
+                        }
+                    ],
+                },
+            ],
+        }
+        narrow_outcomes, _ = adapter.execute_dataset_queries(
+            clec_bin=self.clec_bin,
+            data_dir=self.data_dir,
+            corpus_sha256=self.corpus_sha,
+            questions=(q_ws, q_kw),
+            read_top_n=1,
+        )
+        summary = score.summarize_evaluation(full_dataset, narrow_outcomes, self.corpus, self.corpus_sha)
+        self.assertEqual(summary["verdict"], "complete")
+        self.assertEqual(summary["counts"]["completeChains"], 2)
+        self.assertTrue(all(summary["gates"].values()))
+
+        pos_ds_path = self.tmp / "narrow-pos-eval-ds.json"
+        pos_ds_path.write_text(json.dumps(full_dataset, ensure_ascii=False), encoding="utf-8")
+        pos_blind_path = self.tmp / "narrow-pos-blind.json"
+        pos_blind_path.write_text(
+            json.dumps(
+                [
+                    {"id": "q-pos", "queries": ["匯回臺灣 稅務問題", "稅務 問題"]},
+                    {"id": "q-kw-pos", "queries": ["匯回臺灣", "稅務問題"]},
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        pos_eval_out = self.tmp / "narrow-pos-eval-out.json"
+        eval_py = Path(__file__).resolve().parent / "eval.py"
+        subprocess.run(
+            [
+                sys.executable,
+                str(eval_py),
+                "run",
+                "--clec",
+                str(self.clec_bin),
+                "--data-dir",
+                str(self.data_dir),
+                "--corpus-sha256",
+                self.corpus_sha,
+                "--dataset",
+                str(pos_ds_path),
+                "--mode",
+                "rrf_multiquery",
+                "--query-angle",
+                "blind_rewrite",
+                "--blind-queries",
+                str(pos_blind_path),
+                "--read-top-n",
+                "1",
+                "--output",
+                str(pos_eval_out),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pos_eval_rep = json.loads(pos_eval_out.read_text(encoding="utf-8"))
+        self.assertEqual(pos_eval_rep["verdict"], "complete")
+        self.assertEqual(pos_eval_rep["counts"]["completeChains"], 2)
+        self.assertTrue(all(pos_eval_rep["gates"].values()))
+
+        pos_bench_out = self.tmp / "narrow-pos-bench-out.json"
+        bench_py = Path(__file__).resolve().parent / "bench.py"
+        subprocess.run(
+            [
+                sys.executable,
+                str(bench_py),
+                "--clec",
+                str(self.clec_bin),
+                "--data-dir",
+                str(self.data_dir),
+                "--corpus-sha256",
+                self.corpus_sha,
+                "--dataset",
+                str(pos_ds_path),
+                "--blind-queries",
+                str(pos_blind_path),
+                "--query-angle",
+                "blind_rewrite",
+                "--repeats",
+                "5",
+                "--output",
+                str(pos_bench_out),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pos_bench_rep = json.loads(pos_bench_out.read_text(encoding="utf-8"))
+        self.assertEqual(pos_bench_rep["comparisonStatus"], "DISTINCT_QUERY_PLANS")
+        self.assertEqual(pos_bench_rep["comparisonVerdict"], "valid_interleaved_latency_comparison")
+        self.assertEqual(pos_bench_rep["warmupErrorCount"], 0)
 
 
 if __name__ == "__main__":
