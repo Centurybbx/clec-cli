@@ -14,8 +14,8 @@ use crate::domain::{
     WorkId,
 };
 use crate::retrieval::{
-    BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, MatchMode, SearchData, SearchRequest,
-    execute_search,
+    BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, MatchMode, PreparedSearch, SearchData,
+    SearchRequest, execute_search,
 };
 use crate::snapshot::{
     StatusData, SyncData, data_dir_status, open_current_store, sync_local_with_prepare,
@@ -439,6 +439,137 @@ fn resolve_data_dir(explicit: Option<&PathBuf>) -> PathBuf {
     home.join(".local").join("share").join("clec")
 }
 
+#[derive(Debug, Clone)]
+enum PreparedReadTarget {
+    Passage(PassageId),
+    SourceOriginal(SourceId),
+    SourceOverview(SourceId),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRead {
+    targets: Vec<PreparedReadTarget>,
+    context: usize,
+    find: Option<String>,
+}
+
+impl PreparedRead {
+    fn prepare(args: &ReadArgs) -> Result<Self, ClecError> {
+        if args.ids.is_empty() || args.ids.len() > 50 {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                "Read requires 1..=50 typed references.",
+            ));
+        }
+        if args.context > 2 {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                "--context must be 0..=2.",
+            ));
+        }
+        let mut targets = Vec::with_capacity(args.ids.len());
+        for (idx, raw_id) in args.ids.iter().enumerate() {
+            let parsed = TypedRef::parse(raw_id).map_err(|e| e.with_input_index(idx))?;
+            match parsed {
+                TypedRef::Passage(pid) => {
+                    if args.original {
+                        return Err(ClecError::new(
+                            ErrorCode::InvalidArgument,
+                            "--original requires a SourceId (s_...), not a PassageId.",
+                        )
+                        .with_input_index(idx));
+                    }
+                    targets.push(PreparedReadTarget::Passage(pid));
+                }
+                TypedRef::Source(sid) => {
+                    if args.original {
+                        targets.push(PreparedReadTarget::SourceOriginal(sid));
+                    } else {
+                        if args.find.is_some() {
+                            return Err(ClecError::new(
+                                ErrorCode::InvalidArgument,
+                                "--find on a SourceId requires --original.",
+                            )
+                            .with_input_index(idx));
+                        }
+                        targets.push(PreparedReadTarget::SourceOverview(sid));
+                    }
+                }
+            }
+        }
+        if let Some(needle) = args.find.as_deref()
+            && (needle.is_empty() || needle.len() > 512 || needle.contains('\0'))
+        {
+            return Err(ClecError::new(
+                ErrorCode::InvalidQuery,
+                "Literal --find needle must be 1..512 UTF-8 bytes without NUL.",
+            ));
+        }
+        Ok(Self {
+            targets,
+            context: args.context,
+            find: args.find.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSources {
+    query: Option<String>,
+    work_filter: Option<WorkId>,
+    role_filter: Option<SourceRole>,
+    canonical_only: bool,
+    limit: usize,
+    offset: usize,
+}
+
+impl PreparedSources {
+    fn prepare(args: &SourcesArgs) -> Result<Self, ClecError> {
+        if args.limit == 0 || args.limit > 100 {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                "--limit for sources must be 1..=100.",
+            ));
+        }
+        if let Some(q) = args.query.as_deref()
+            && (q.len() > 512 || q.contains('\0'))
+        {
+            return Err(ClecError::new(
+                ErrorCode::InvalidQuery,
+                "Sources query must be at most 512 UTF-8 bytes without NUL.",
+            ));
+        }
+        Ok(Self {
+            query: args.query.clone(),
+            work_filter: args.work.as_deref().map(WorkId::parse).transpose()?,
+            role_filter: args.role.map(Into::into),
+            canonical_only: args.canonical_only,
+            limit: args.limit,
+            offset: args.offset,
+        })
+    }
+}
+
+fn prepare_search_request(args: &SearchArgs) -> Result<PreparedSearch, ClecError> {
+    let req = SearchRequest {
+        queries: args.queries.clone(),
+        match_mode: args.match_mode.into(),
+        limit: args.limit,
+        per_work: args.per_work,
+        work_filter: args.work.as_deref().map(WorkId::parse).transpose()?,
+        source_filter: args.source.as_deref().map(SourceId::parse).transpose()?,
+        role_filter: args.role.map(Into::into),
+        date_from: args.date_from.as_deref().map(DateYmd::parse).transpose()?,
+        date_to: args.date_to.as_deref().map(DateYmd::parse).transpose()?,
+        release_pin: args
+            .release
+            .as_deref()
+            .map(ReleaseHash::parse)
+            .transpose()?,
+    };
+    PreparedSearch::prepare(req)
+}
+
 fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
     let data_dir = resolve_data_dir(cli.data_dir.as_ref());
     let max_bytes = cli.max_bytes;
@@ -458,53 +589,31 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
             })
         }
         Commands::Search(args) => {
+            let prepared = prepare_search_request(args)?;
             let store = open_current_store(&data_dir, None)?;
-            let req = SearchRequest {
-                queries: args.queries.clone(),
-                match_mode: args.match_mode.into(),
-                limit: args.limit,
-                per_work: args.per_work,
-                work_filter: args.work.as_deref().map(WorkId::parse).transpose()?,
-                source_filter: args.source.as_deref().map(SourceId::parse).transpose()?,
-                role_filter: args.role.map(Into::into),
-                date_from: args.date_from.as_deref().map(DateYmd::parse).transpose()?,
-                date_to: args.date_to.as_deref().map(DateYmd::parse).transpose()?,
-                release_pin: args
-                    .release
-                    .as_deref()
-                    .map(ReleaseHash::parse)
-                    .transpose()?,
-            };
-            let full = execute_search(&store, &req)?;
+            let full = execute_search(&store, &prepared)?;
             fit_search_budget(full, use_json, max_bytes)
         }
         Commands::Sources(args) => {
-            if args.limit == 0 || args.limit > 100 {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidArgument,
-                    "--limit for sources must be 1..=100.",
-                ));
-            }
+            let prepared = PreparedSources::prepare(args)?;
             let store = open_current_store(&data_dir, None)?;
-            let work_filter = args.work.as_deref().map(WorkId::parse).transpose()?;
-            let role_filter = args.role.map(Into::into);
             let matched = store.list_sources(
-                args.query.as_deref(),
-                work_filter.as_ref(),
-                role_filter,
-                args.canonical_only,
+                prepared.query.as_deref(),
+                prepared.work_filter.as_ref(),
+                prepared.role_filter,
+                prepared.canonical_only,
             )?;
             let total_matched = matched.len();
             let paged: Vec<SourceListEntry> = matched
                 .into_iter()
-                .skip(args.offset)
-                .take(args.limit)
+                .skip(prepared.offset)
+                .take(prepared.limit)
                 .collect();
             let data = SourcesData {
                 release: store.release,
                 total_matched,
-                offset: args.offset,
-                limit: args.limit,
+                offset: prepared.offset,
+                limit: prepared.limit,
                 items: paged,
                 budget: ReadBudgetReport {
                     max_bytes,
@@ -515,49 +624,28 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
             fit_sources_budget(data, use_json, max_bytes)
         }
         Commands::Read(args) => {
-            if args.context > 2 {
-                return Err(ClecError::new(
-                    ErrorCode::InvalidArgument,
-                    "--context must be 0..=2.",
-                ));
-            }
+            let prepared = PreparedRead::prepare(args)?;
             let store = open_current_store(&data_dir, None)?;
-            let mut items = Vec::with_capacity(args.ids.len());
-            for (idx, raw_id) in args.ids.iter().enumerate() {
-                let parsed = TypedRef::parse(raw_id).map_err(|e| e.with_input_index(idx))?;
-                match parsed {
-                    TypedRef::Passage(pid) => {
-                        if args.original {
-                            return Err(ClecError::new(
-                                ErrorCode::InvalidArgument,
-                                "--original requires a SourceId (s_...), not a PassageId.",
-                            )
-                            .with_input_index(idx));
-                        }
+            let mut items = Vec::with_capacity(prepared.targets.len());
+            for (idx, target) in prepared.targets.iter().enumerate() {
+                match target {
+                    PreparedReadTarget::Passage(pid) => {
                         let item = store
-                            .read_passage(&pid, args.context, args.find.as_deref())
+                            .read_passage(pid, prepared.context, prepared.find.as_deref())
                             .map_err(|e| e.with_input_index(idx))?;
                         items.push(ReadItem::Passage(Box::new(item)));
                     }
-                    TypedRef::Source(sid) => {
-                        if args.original {
-                            let item = store
-                                .read_source_original(&sid, args.find.as_deref())
-                                .map_err(|e| e.with_input_index(idx))?;
-                            items.push(ReadItem::SourceOriginal(item));
-                        } else {
-                            if args.find.is_some() {
-                                return Err(ClecError::new(
-                                    ErrorCode::InvalidArgument,
-                                    "--find on a SourceId requires --original.",
-                                )
-                                .with_input_index(idx));
-                            }
-                            let item = store
-                                .read_source_overview(&sid)
-                                .map_err(|e| e.with_input_index(idx))?;
-                            items.push(ReadItem::SourceOverview(item));
-                        }
+                    PreparedReadTarget::SourceOriginal(sid) => {
+                        let item = store
+                            .read_source_original(sid, prepared.find.as_deref())
+                            .map_err(|e| e.with_input_index(idx))?;
+                        items.push(ReadItem::SourceOriginal(item));
+                    }
+                    PreparedReadTarget::SourceOverview(sid) => {
+                        let item = store
+                            .read_source_overview(sid)
+                            .map_err(|e| e.with_input_index(idx))?;
+                        items.push(ReadItem::SourceOverview(item));
                     }
                 }
             }
@@ -1171,5 +1259,152 @@ mod tests {
 
         let plain_search = fit_search_budget(search_data, false, full_search.len()).unwrap();
         assert!(plain_search.contains(&"a".repeat(8600)));
+    }
+
+    #[test]
+    fn store_independent_validation_fails_before_opening_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent_dir = tmp.path().join("never_created");
+        let dir_arg = nonexistent_dir.display().to_string();
+
+        let cases: &[(&[&str], ErrorCode)] = &[
+            (
+                &["clec", "--data-dir", &dir_arg, "search", "   "],
+                ErrorCode::InvalidQuery,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "valid",
+                    "--limit",
+                    "6",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "valid",
+                    "--per-work",
+                    "0",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "valid",
+                    "--date-from",
+                    "2025-05-02",
+                    "--date-to",
+                    "2025-05-01",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "valid",
+                    "--work",
+                    "bad",
+                ],
+                ErrorCode::InvalidReference,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "valid",
+                    "--release",
+                    "short",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &["clec", "--data-dir", &dir_arg, "read", "bad_ref"],
+                ErrorCode::InvalidReference,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "read",
+                    "p_0123456789abcdef",
+                    "--original",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "read",
+                    "s_0123456789abcdef",
+                    "--find",
+                    "x",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "read",
+                    "p_0123456789abcdef",
+                    "--context",
+                    "3",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "read",
+                    "p_0123456789abcdef",
+                    "--find",
+                    "",
+                ],
+                ErrorCode::InvalidQuery,
+            ),
+            (
+                &["clec", "--data-dir", &dir_arg, "sources", "--limit", "101"],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &["clec", "--data-dir", &dir_arg, "sources", "--work", "bad"],
+                ErrorCode::InvalidReference,
+            ),
+            (
+                &["clec", "--data-dir", &dir_arg, "sources", &"a".repeat(513)],
+                ErrorCode::InvalidQuery,
+            ),
+        ];
+
+        for (argv, expected_code) in cases {
+            let owned: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+            let cli = Cli::try_parse_from(&owned).unwrap();
+            let err = dispatch(&cli, true).unwrap_err();
+            assert_eq!(err.code, *expected_code, "argv={argv:?}");
+        }
+        assert!(!nonexistent_dir.exists());
     }
 }

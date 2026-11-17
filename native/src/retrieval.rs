@@ -93,36 +93,74 @@ struct RankedCandidate {
     matched_queries: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedSearch {
+    pub queries: Vec<SearchQueryTerms>,
+    pub match_mode: MatchMode,
+    pub limit: usize,
+    pub per_work: usize,
+    pub work_filter: Option<WorkId>,
+    pub source_filter: Option<SourceId>,
+    pub role_filter: Option<SourceRole>,
+    pub date_from: Option<DateYmd>,
+    pub date_to: Option<DateYmd>,
+    pub release_pin: Option<ReleaseHash>,
+}
+
+impl PreparedSearch {
+    pub(crate) fn prepare(req: SearchRequest) -> Result<Self, ClecError> {
+        if req.queries.is_empty() || req.queries.len() > MAX_QUERIES {
+            return Err(ClecError::new(
+                ErrorCode::InvalidQuery,
+                format!("Search requires 1..={MAX_QUERIES} queries."),
+            ));
+        }
+        if req.limit == 0 || req.limit > MAX_SEARCH_LIMIT {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                format!("--limit must be 1..={MAX_SEARCH_LIMIT}."),
+            ));
+        }
+        if req.per_work == 0 || req.per_work > MAX_SEARCH_LIMIT {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                format!("--per-work must be 1..={MAX_SEARCH_LIMIT}."),
+            ));
+        }
+        if let (Some(from), Some(to)) = (&req.date_from, &req.date_to)
+            && from > to
+        {
+            return Err(ClecError::new(
+                ErrorCode::InvalidArgument,
+                "--date-from must be <= --date-to.",
+            ));
+        }
+
+        let mut parsed_queries = Vec::with_capacity(req.queries.len());
+        for q in req.queries {
+            let terms = query_terms(&q)?;
+            parsed_queries.push(SearchQueryTerms { query: q, terms });
+        }
+
+        Ok(Self {
+            queries: parsed_queries,
+            match_mode: req.match_mode,
+            limit: req.limit,
+            per_work: req.per_work,
+            work_filter: req.work_filter,
+            source_filter: req.source_filter,
+            role_filter: req.role_filter,
+            date_from: req.date_from,
+            date_to: req.date_to,
+            release_pin: req.release_pin,
+        })
+    }
+}
+
 pub(crate) fn execute_search(
     store: &CorpusStore,
-    req: &SearchRequest,
+    req: &PreparedSearch,
 ) -> Result<SearchData, ClecError> {
-    if req.queries.is_empty() || req.queries.len() > MAX_QUERIES {
-        return Err(ClecError::new(
-            ErrorCode::InvalidQuery,
-            format!("Search requires 1..={MAX_QUERIES} queries."),
-        ));
-    }
-    if req.limit == 0 || req.limit > MAX_SEARCH_LIMIT {
-        return Err(ClecError::new(
-            ErrorCode::InvalidArgument,
-            format!("--limit must be 1..={MAX_SEARCH_LIMIT}."),
-        ));
-    }
-    if req.per_work == 0 || req.per_work > MAX_SEARCH_LIMIT {
-        return Err(ClecError::new(
-            ErrorCode::InvalidArgument,
-            format!("--per-work must be 1..={MAX_SEARCH_LIMIT}."),
-        ));
-    }
-    if let (Some(from), Some(to)) = (&req.date_from, &req.date_to)
-        && from > to
-    {
-        return Err(ClecError::new(
-            ErrorCode::InvalidArgument,
-            "--date-from must be <= --date-to.",
-        ));
-    }
     if let Some(pin) = &req.release_pin
         && pin != &store.release
     {
@@ -130,15 +168,6 @@ pub(crate) fn execute_search(
             ErrorCode::VersionUnavailable,
             "Active release differs from requested --release.",
         ));
-    }
-
-    let mut parsed_queries = Vec::with_capacity(req.queries.len());
-    for q in &req.queries {
-        let terms = query_terms(q)?;
-        parsed_queries.push(SearchQueryTerms {
-            query: q.clone(),
-            terms,
-        });
     }
 
     let join_op = match req.match_mode {
@@ -156,7 +185,7 @@ pub(crate) fn execute_search(
 
     let mut fused: BTreeMap<PassageId, RankedCandidate> = BTreeMap::new();
 
-    for pq in &parsed_queries {
+    for pq in &req.queries {
         let fts_query = pq
             .terms
             .iter()
@@ -221,7 +250,7 @@ pub(crate) fn execute_search(
     Ok(SearchData {
         release: store.release.clone(),
         match_mode: req.match_mode,
-        queries: parsed_queries,
+        queries: req.queries.clone(),
         total_candidates,
         hits,
         budget: BudgetReport {
@@ -488,7 +517,7 @@ mod tests {
 
         let res_0050 = execute_search(
             &store,
-            &SearchRequest {
+            &PreparedSearch::prepare(SearchRequest {
                 queries: vec!["0050".to_owned()],
                 match_mode: MatchMode::Any,
                 limit: 5,
@@ -499,7 +528,8 @@ mod tests {
                 date_from: None,
                 date_to: None,
                 release_pin: None,
-            },
+            })
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(res_0050.hits.len(), 5);
@@ -525,7 +555,7 @@ mod tests {
 
         let res_w1 = execute_search(
             &store,
-            &SearchRequest {
+            &PreparedSearch::prepare(SearchRequest {
                 queries: vec!["0050".to_owned()],
                 match_mode: MatchMode::Any,
                 limit: 5,
@@ -536,14 +566,15 @@ mod tests {
                 date_from: None,
                 date_to: None,
                 release_pin: None,
-            },
+            })
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(res_w1.hits.len(), 4);
 
         let res_4pct = execute_search(
             &store,
-            &SearchRequest {
+            &PreparedSearch::prepare(SearchRequest {
                 queries: vec!["4%".to_owned(), "qqq".to_owned()],
                 match_mode: MatchMode::Any,
                 limit: 5,
@@ -554,7 +585,8 @@ mod tests {
                 date_from: None,
                 date_to: None,
                 release_pin: None,
-            },
+            })
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(res_4pct.hits.len(), 2);
