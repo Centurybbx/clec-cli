@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+import contextlib
 import copy
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -13,11 +16,14 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adapter
+import bench
+import eval as phase3_eval
 import projection
 import score
 
@@ -2739,6 +2745,182 @@ class Phase3HarnessTests(unittest.TestCase):
             self.assertIsNone(row["evidenceCoverage"])
             self.assertIsNone(row["completeChain"])
             self.assertIsNone(row["conditionLoss"])
+
+    def _make_poison_gold_dataset_files(self, tag: str) -> tuple[dict[str, Any], Path, Path]:
+        sid_srt, sp_srt = self._span_for("ep1.srt", "若無稅務問題才能匯回臺灣")
+        gold_q = {
+            "id": f"q-boundary-{tag}",
+            "category": "condition",
+            "question": "  匯回臺灣 稅務問題  ",
+            "answerable": True,
+            "workKeys": ["w:ep1"],
+            "notes": "POISON_GOLD_NOTES_DO_NOT_LEAK",
+            "evidence": [
+                {
+                    "claimId": "c1",
+                    "sourceId": sid_srt,
+                    "path": "ep1.srt",
+                    "spans": [sp_srt],
+                    "quote": "若無稅務問題才能匯回臺灣",
+                    "kind": "condition",
+                }
+            ],
+        }
+        ds_path = self.tmp / f"boundary-{tag}-ds.json"
+        ds_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "corpusSha256": self.corpus_sha,
+                    "split": "development",
+                    "questions": [gold_q],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        blind_path = self.tmp / f"boundary-{tag}-blind.json"
+        blind_path.write_text(
+            json.dumps([{"id": gold_q["id"], "queries": ["匯回臺灣 稅務問題", "稅務 問題"]}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return gold_q, ds_path, blind_path
+
+    def _assert_narrow_runtime_input(self, item: object, caller: str) -> None:
+        forbidden_fields = (
+            "evidence",
+            "spans",
+            "quote",
+            "quotes",
+            "path",
+            "paths",
+            "workKeys",
+            "notes",
+            "answerable",
+            "category",
+        )
+        self.assertNotIsInstance(item, Mapping, f"{caller} received Mapping instead of narrow type")
+        self.assertFalse(hasattr(item, "__dict__"), f"{caller} received object with __dict__")
+        for field in forbidden_fields:
+            self.assertFalse(hasattr(item, field), f"{caller} leaked forbidden attribute {field}")
+
+    def test_eval_run_passes_only_narrow_runtime_questions_without_gold_fields(self) -> None:
+        _, ds_path, _ = self._make_poison_gold_dataset_files("eval-spy")
+        observed_exec_items: list[object] = []
+        observed_builder_items: list[object] = []
+        orig_exec = adapter.execute_dataset_queries
+        orig_build = adapter.build_runtime_queries
+
+        def spy_exec(*args: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            passed_qs = cast(Iterable[object], kwargs["questions"])
+            for item in passed_qs:
+                observed_exec_items.append(item)
+            return orig_exec(*args, **kwargs)
+
+        def spy_build(question: Any, *args: Any, **kwargs: Any) -> list[str]:
+            observed_builder_items.append(question)
+            return orig_build(question, *args, **kwargs)
+
+        eval_out = self.tmp / "boundary-eval-spy-out.json"
+        eval_args = phase3_eval.build_parser().parse_args(
+            [
+                "run",
+                "--clec",
+                str(self.clec_bin),
+                "--data-dir",
+                str(self.data_dir),
+                "--corpus-sha256",
+                self.corpus_sha,
+                "--dataset",
+                str(ds_path),
+                "--output",
+                str(eval_out),
+            ]
+        )
+        with (
+            mock.patch.object(adapter, "execute_dataset_queries", side_effect=spy_exec),
+            mock.patch.object(adapter, "build_runtime_queries", side_effect=spy_build),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rc = phase3_eval.cmd_run(eval_args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(observed_exec_items), 1)
+        self.assertEqual(len(observed_builder_items), 1)
+        for item in observed_exec_items:
+            self._assert_narrow_runtime_input(item, "eval.execute_dataset_queries")
+        for item in observed_builder_items:
+            self._assert_narrow_runtime_input(item, "eval.build_runtime_queries")
+
+    def test_bench_warmup_passes_only_narrow_runtime_questions_without_gold_fields(self) -> None:
+        _, ds_path, blind_path = self._make_poison_gold_dataset_files("bench-spy")
+        bench_observed_items: list[object] = []
+        orig_build = adapter.build_runtime_queries
+
+        def spy_bench_build(question: Any, *args: Any, **kwargs: Any) -> list[str]:
+            bench_observed_items.append(question)
+            return orig_build(question, *args, **kwargs)
+
+        bench_out = self.tmp / "boundary-bench-spy-out.json"
+        with (
+            mock.patch.object(adapter, "build_runtime_queries", side_effect=spy_bench_build),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "bench.py",
+                    "--clec",
+                    str(self.clec_bin),
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--corpus-sha256",
+                    self.corpus_sha,
+                    "--dataset",
+                    str(ds_path),
+                    "--blind-queries",
+                    str(blind_path),
+                    "--query-angle",
+                    "blind_rewrite",
+                    "--repeats",
+                    "2",
+                    "--allow-smoke-repeats",
+                    "--output",
+                    str(bench_out),
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            bench_rc = bench.main()
+        self.assertEqual(bench_rc, 0)
+        self.assertEqual(len(bench_observed_items), 2)
+        for item in bench_observed_items:
+            self._assert_narrow_runtime_input(item, "bench.build_runtime_queries")
+
+    def test_direct_gold_record_to_query_api_rejected_before_cli_spawn(self) -> None:
+        gold_q, _, _ = self._make_poison_gold_dataset_files("direct-reject")
+        sentinel_marker = self.tmp / "sentinel-cli-invoked.marker"
+        sentinel_cli = self.tmp / "sentinel-clec.sh"
+        sentinel_cli.write_text(
+            f"#!/bin/sh\ntouch {str(sentinel_marker)!r}\nexit 1\n",
+            encoding="utf-8",
+        )
+        sentinel_cli.chmod(sentinel_cli.stat().st_mode | stat.S_IXUSR)
+
+        with self.assertRaises(TypeError):
+            adapter.execute_dataset_queries(
+                clec_bin=sentinel_cli,
+                data_dir=self.data_dir,
+                corpus_sha256=self.corpus_sha,
+                questions=cast(Any, [gold_q]),
+            )
+        self.assertFalse(sentinel_marker.exists())
+
+        with self.assertRaises(TypeError):
+            adapter.build_runtime_queries(
+                cast(Any, gold_q),
+                mode="single_query_product_baseline",
+                query_angle="question",
+                blind_map=None,
+            )
 
 
 if __name__ == "__main__":
