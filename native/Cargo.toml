@@ -13,6 +13,11 @@ path = "src/lib.rs"
 default = []
 test-hooks = []
 
+[[example]]
+name = "clec_test_fixture"
+path = "examples/clec_test_fixture.rs"
+required-features = ["test-hooks"]
+
 [[bin]]
 name = "clec"
 path = "src/bin/clec.rs"

@@ -93,6 +93,19 @@ pub(crate) struct SyncData {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct SyncDryRunData {
+    pub dry_run: bool,
+    pub manifest_path: String,
+    pub release: ReleaseHash,
+    pub corpus_format: String,
+    pub bytes: u64,
+    pub compressed_bytes: u64,
+    pub counts: CorpusCounts,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct StatusData {
     pub ready: bool,
     pub offline: bool,
@@ -995,16 +1008,11 @@ pub fn file_size_and_sha256(path: &Path) -> Result<(u64, String), ClecError> {
     Ok((total, crate::domain::hex_encode(&hasher.finalize())))
 }
 
-pub(crate) fn open_current_store(
+fn open_existing_store(
     data_dir: &Path,
+    state: &ActiveState,
     release_pin: Option<&ReleaseHash>,
 ) -> Result<CorpusStore, ClecError> {
-    let Some(state) = read_active_state(data_dir)? else {
-        return Err(ClecError::new(
-            ErrorCode::NoData,
-            "No active corpus snapshot in --data-dir. Run `clec sync --manifest PATH` first.",
-        ));
-    };
     if let Some(pin) = release_pin
         && pin != &state.release
     {
@@ -1020,7 +1028,112 @@ pub(crate) fn open_current_store(
             "Active corpus SQLite file is missing.",
         ));
     }
-    CorpusStore::open_readonly(&db_path, state.release)
+    CorpusStore::open_readonly(&db_path, state.release.clone())
+}
+
+pub(crate) fn ensure_current_store(
+    data_dir: &Path,
+    network_policy: NetworkPolicy,
+    default_origin: Option<&str>,
+    transfer_policy: &TransferPolicy,
+    release_pin: Option<&ReleaseHash>,
+) -> Result<CorpusStore, ClecError> {
+    if let Some(state) = read_active_state(data_dir)? {
+        return open_existing_store(data_dir, &state, release_pin);
+    }
+
+    if network_policy == NetworkPolicy::Offline {
+        return Err(ClecError::new(
+            ErrorCode::NoData,
+            "No active corpus snapshot in --data-dir and --offline prevents bootstrap. Run `clec sync --manifest PATH` first.",
+        ));
+    }
+    let Some(origin_url) = default_origin else {
+        return Err(ClecError::new(
+            ErrorCode::NoData,
+            "No active corpus snapshot in --data-dir and no built-in default manifest URL is configured. Run `clec sync --manifest PATH_OR_HTTPS_URL` first.",
+        ));
+    };
+
+    if data_dir.exists() && !data_dir.is_dir() {
+        return Err(ClecError::new(
+            ErrorCode::InvalidDataDir,
+            "--data-dir must point to a directory.",
+        ));
+    }
+    fs::create_dir_all(data_dir).map_err(|e| {
+        ClecError::new(
+            ErrorCode::InvalidDataDir,
+            format!("Cannot create --data-dir {}: {e}", data_dir.display()),
+        )
+    })?;
+
+    let lock_path = data_dir.join(".sync.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(map_io)?;
+    lock_file.try_lock().map_err(|_| {
+        ClecError::new(
+            ErrorCode::SyncLocked,
+            "Another sync or bootstrap process currently holds the lock on --data-dir.",
+        )
+    })?;
+
+    let res = (|| -> Result<CorpusStore, ClecError> {
+        if let Some(state) = read_active_state(data_dir)? {
+            return open_existing_store(data_dir, &state, release_pin);
+        }
+        sync_locked(
+            data_dir,
+            None,
+            network_policy,
+            Some(origin_url),
+            transfer_policy,
+            |_| Ok(()),
+        )?;
+        let installed = read_active_state(data_dir)?.ok_or_else(|| {
+            ClecError::new(
+                ErrorCode::InternalError,
+                "Bootstrap sync finished without active state.",
+            )
+        })?;
+        open_existing_store(data_dir, &installed, release_pin)
+    })();
+
+    let _ = lock_file.unlock();
+    res
+}
+
+pub(crate) fn sync_dry_run(
+    data_dir: &Path,
+    manifest_arg: Option<&str>,
+    network_policy: NetworkPolicy,
+    default_origin: Option<&str>,
+    transfer_policy: &TransferPolicy,
+) -> Result<SyncDryRunData, ClecError> {
+    let prev_state_res = read_active_state(data_dir);
+    let location = resolve_sync_location(manifest_arg, &prev_state_res, default_origin)?;
+    let loaded = load_manifest(&location, network_policy, transfer_policy)?;
+    let prev_state = prev_state_res.ok().flatten();
+    let active_db = data_dir.join(format!("{}.sqlite", loaded.manifest.sha256.as_str()));
+    let is_active = prev_state
+        .as_ref()
+        .is_some_and(|s| s.release == loaded.manifest.sha256)
+        && active_db.is_file();
+    Ok(SyncDryRunData {
+        dry_run: true,
+        manifest_path: loaded.persistent_origin,
+        release: loaded.manifest.sha256,
+        corpus_format: loaded.manifest.corpus_format,
+        bytes: loaded.manifest.bytes,
+        compressed_bytes: loaded.manifest.compressed_bytes,
+        counts: loaded.manifest.counts,
+        is_active,
+    })
 }
 
 pub(crate) fn data_dir_status(data_dir: &Path) -> Result<StatusData, ClecError> {
@@ -2245,7 +2358,11 @@ mod tests {
             |d| Ok(d.clone()),
         )
         .unwrap_err();
-        assert_eq!(slow_err.code, ErrorCode::TransferTimeout, "slow_err={slow_err:?}");
+        assert_eq!(
+            slow_err.code,
+            ErrorCode::TransferTimeout,
+            "slow_err={slow_err:?}"
+        );
         assert!(!slow_err.message.contains("sig=secret"));
 
         let trickle_err = sync_with_prepare(

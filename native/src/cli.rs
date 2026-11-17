@@ -19,15 +19,43 @@ use crate::retrieval::{
     SearchRequest, execute_search,
 };
 use crate::snapshot::{
-    StatusData, SyncData, data_dir_status, open_current_store, sync_with_prepare,
+    StatusData, SyncData, SyncDryRunData, data_dir_status, ensure_current_store, sync_dry_run,
+    sync_with_prepare,
 };
 use crate::store::{PassageReadItem, SourceListEntry, SourceOriginalItem, SourceOverviewItem};
+
+pub(crate) const BUILTIN_DEFAULT_MANIFEST_URL: Option<&str> = None;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeOptions {
+    pub default_origin: Option<String>,
+    pub transfer_policy: TransferPolicy,
+}
+
+impl RuntimeOptions {
+    pub(crate) fn shipped() -> Self {
+        Self {
+            default_origin: BUILTIN_DEFAULT_MANIFEST_URL.map(ToOwned::to_owned),
+            transfer_policy: TransferPolicy::shipped(),
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone)]
+pub struct TestFixtureOptions {
+    pub default_origin: Option<String>,
+    pub connect_timeout_ms: Option<u64>,
+    pub manifest_timeout_ms: Option<u64>,
+    pub artifact_timeout_ms: Option<u64>,
+    pub extra_root_pem: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "clec",
     version,
-    about = "Offline CLEC evidence search, exact byte-span reads, and local snapshot sync",
+    about = "CLEC evidence search, exact byte-span reads, and static snapshot sync",
     disable_help_subcommand = false
 )]
 struct Cli {
@@ -39,7 +67,7 @@ struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Enforce offline execution (always offline in Phase 2)
+    /// Forbid all HTTP network requests; allow local operations and local sync only
     #[arg(long, global = true)]
     pub offline: bool,
 
@@ -91,7 +119,7 @@ impl From<RoleArg> for SourceRole {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Verify and atomically activate a local release manifest
+    /// Verify and atomically activate a local or HTTPS release manifest
     Sync(SyncArgs),
     /// Search passages using 1 to 4 queries with BM25 + RRF and work-aware diversity
     Search(SearchArgs),
@@ -107,9 +135,13 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct SyncArgs {
-    /// Path to publisher manifest.json
-    #[arg(long, value_name = "FILE")]
+    /// Local path or HTTPS URL to publisher manifest.json
+    #[arg(long, value_name = "PATH_OR_HTTPS_URL")]
     pub manifest: Option<String>,
+
+    /// Validate manifest and report planned sync without downloading artifacts or modifying --data-dir
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -284,6 +316,7 @@ struct SchemaData {
     pub phase: String,
     pub binary: String,
     pub version: String,
+    pub default_configured: bool,
     pub corpus_format: String,
     pub segmentation_revision: String,
     pub tokenization_revision: String,
@@ -298,10 +331,39 @@ struct SchemaData {
 
 pub fn run_cli() -> i32 {
     let args: Vec<String> = env::args().collect();
-    run_cli_with_args(&args)
+    run_cli_with_args_and_options(&args, &RuntimeOptions::shipped())
 }
 
+#[cfg(feature = "test-hooks")]
+pub fn run_cli_with_test_options(options: TestFixtureOptions) -> i32 {
+    use std::time::Duration;
+
+    let shipped = TransferPolicy::shipped();
+    let runtime = RuntimeOptions {
+        default_origin: options.default_origin,
+        transfer_policy: TransferPolicy {
+            connect_timeout: options
+                .connect_timeout_ms
+                .map_or(shipped.connect_timeout, Duration::from_millis),
+            manifest_timeout: options
+                .manifest_timeout_ms
+                .map_or(shipped.manifest_timeout, Duration::from_millis),
+            artifact_timeout: options
+                .artifact_timeout_ms
+                .map_or(shipped.artifact_timeout, Duration::from_millis),
+            extra_root_pem: options.extra_root_pem,
+        },
+    };
+    let args: Vec<String> = env::args().collect();
+    run_cli_with_args_and_options(&args, &runtime)
+}
+
+#[cfg(test)]
 pub(crate) fn run_cli_with_args(args: &[String]) -> i32 {
+    run_cli_with_args_and_options(args, &RuntimeOptions::shipped())
+}
+
+pub(crate) fn run_cli_with_args_and_options(args: &[String], options: &RuntimeOptions) -> i32 {
     let parsed = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(err) => match err.kind() {
@@ -351,7 +413,7 @@ pub(crate) fn run_cli_with_args(args: &[String]) -> i32 {
     if parsed.sag2 {
         let err = ClecError::new(
             ErrorCode::UnsupportedFeature,
-            "--sag2 is unsupported in Phase 1; no external API calls are permitted.",
+            "--sag2 is unsupported; no external LLM API calls are permitted.",
         );
         emit_error(&err, Some(cmd_name));
         return err.code.exit_code();
@@ -367,7 +429,7 @@ pub(crate) fn run_cli_with_args(args: &[String]) -> i32 {
     }
 
     let use_json = parsed.json || !std::io::stdout().is_terminal();
-    match dispatch(&parsed, use_json) {
+    match dispatch(&parsed, use_json, options) {
         Ok(payload) => {
             let _ = write_stdout_safe(&payload);
             0
@@ -571,13 +633,19 @@ fn prepare_search_request(args: &SearchArgs) -> Result<PreparedSearch, ClecError
     PreparedSearch::prepare(req)
 }
 
-fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
+fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<String, ClecError> {
     let data_dir = resolve_data_dir(cli.data_dir.as_ref());
     let max_bytes = cli.max_bytes;
+    let network_policy = if cli.offline {
+        NetworkPolicy::Offline
+    } else {
+        NetworkPolicy::Allowed
+    };
+    let default_origin = options.default_origin.as_deref();
 
     match &cli.command {
         Commands::Schema => {
-            let data = build_schema_data();
+            let data = build_schema_data(default_origin.is_some());
             serialize_fixed("schema", &data, use_json, max_bytes, format_schema_text)
         }
         Commands::Status => {
@@ -585,29 +653,52 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
             serialize_fixed("status", &data, use_json, max_bytes, format_status_text)
         }
         Commands::Sync(args) => {
-            let network_policy = if cli.offline {
-                NetworkPolicy::Offline
-            } else {
-                NetworkPolicy::Allowed
-            };
+            if args.dry_run {
+                let data = sync_dry_run(
+                    &data_dir,
+                    args.manifest.as_deref(),
+                    network_policy,
+                    default_origin,
+                    &options.transfer_policy,
+                )?;
+                return serialize_fixed(
+                    "sync",
+                    &data,
+                    use_json,
+                    max_bytes,
+                    format_sync_dry_run_text,
+                );
+            }
             sync_with_prepare(
                 &data_dir,
                 args.manifest.as_deref(),
                 network_policy,
-                None,
-                &TransferPolicy::shipped(),
+                default_origin,
+                &options.transfer_policy,
                 |data| serialize_fixed("sync", data, use_json, max_bytes, format_sync_text),
             )
         }
         Commands::Search(args) => {
             let prepared = prepare_search_request(args)?;
-            let store = open_current_store(&data_dir, None)?;
+            let store = ensure_current_store(
+                &data_dir,
+                network_policy,
+                default_origin,
+                &options.transfer_policy,
+                None,
+            )?;
             let full = execute_search(&store, &prepared)?;
             fit_search_budget(full, use_json, max_bytes)
         }
         Commands::Sources(args) => {
             let prepared = PreparedSources::prepare(args)?;
-            let store = open_current_store(&data_dir, None)?;
+            let store = ensure_current_store(
+                &data_dir,
+                network_policy,
+                default_origin,
+                &options.transfer_policy,
+                None,
+            )?;
             let matched = store.list_sources(
                 prepared.query.as_deref(),
                 prepared.work_filter.as_ref(),
@@ -636,7 +727,13 @@ fn dispatch(cli: &Cli, use_json: bool) -> Result<String, ClecError> {
         }
         Commands::Read(args) => {
             let prepared = PreparedRead::prepare(args)?;
-            let store = open_current_store(&data_dir, None)?;
+            let store = ensure_current_store(
+                &data_dir,
+                network_policy,
+                default_origin,
+                &options.transfer_policy,
+                None,
+            )?;
             let mut items = Vec::with_capacity(prepared.targets.len());
             for (idx, target) in prepared.targets.iter().enumerate() {
                 match target {
@@ -847,7 +944,7 @@ fn write_stdout_safe(text: &str) -> std::io::Result<()> {
     }
 }
 
-fn build_schema_data() -> SchemaData {
+fn build_schema_data(default_configured: bool) -> SchemaData {
     let cmd = Cli::command();
     let global_options: Vec<SchemaArgSpec> = cmd
         .get_arguments()
@@ -881,6 +978,7 @@ fn build_schema_data() -> SchemaData {
 
     let envelopes = serde_json::json!({
         "sync": schema_for!(SuccessEnvelope<SyncData>),
+        "syncDryRun": schema_for!(SuccessEnvelope<SyncDryRunData>),
         "status": schema_for!(SuccessEnvelope<StatusData>),
         "search": schema_for!(SuccessEnvelope<SearchData>),
         "read": schema_for!(SuccessEnvelope<ReadData>),
@@ -889,9 +987,10 @@ fn build_schema_data() -> SchemaData {
     });
 
     SchemaData {
-        phase: "phase2".to_owned(),
+        phase: "phase4".to_owned(),
         binary: cmd.get_name().to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        default_configured,
         corpus_format: CORPUS_FORMAT.to_owned(),
         segmentation_revision: SEGMENTATION_REVISION.to_owned(),
         tokenization_revision: TOKENIZATION_REVISION.to_owned(),
@@ -900,18 +999,12 @@ fn build_schema_data() -> SchemaData {
         equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
         global_options,
         commands,
-        unsupported_features: vec![
-            UnsupportedFeatureSpec {
-                name: "sag2".to_owned(),
-                supported: false,
-                reason: "LLM/SAG2 retrieval is unsupported in Phase 2; no external API calls are made.".to_owned(),
-            },
-            UnsupportedFeatureSpec {
-                name: "http_bootstrap".to_owned(),
-                supported: false,
-                reason: "Remote HTTP manifest/artifact bootstrap is deferred to a later phase; use local `sync --manifest FILE`.".to_owned(),
-            },
-        ],
+        unsupported_features: vec![UnsupportedFeatureSpec {
+            name: "sag2".to_owned(),
+            supported: false,
+            reason: "LLM/SAG2 retrieval is unsupported; no external LLM API calls are made."
+                .to_owned(),
+        }],
         envelopes,
     }
 }
@@ -969,6 +1062,23 @@ fn format_sync_text(d: &SyncData) -> String {
         d.release,
         d.corpus_format,
         d.reused,
+        d.counts.works,
+        d.counts.sources,
+        d.counts.canonical_sources,
+        d.counts.passages
+    )
+}
+
+fn format_sync_dry_run_text(d: &SyncDryRunData) -> String {
+    format!(
+        "Dry run: {}\nOrigin: {}\nRelease: {}\nFormat: {}\nActive: {}\nBytes: {}, Compressed: {}\nWorks: {}, Sources: {}, Canonical: {}, Passages: {}\n",
+        d.dry_run,
+        d.manifest_path,
+        d.release,
+        d.corpus_format,
+        d.is_active,
+        d.bytes,
+        d.compressed_bytes,
         d.counts.works,
         d.counts.sources,
         d.counts.canonical_sources,
@@ -1051,7 +1161,9 @@ mod tests {
 
     #[test]
     fn schema_derives_directly_from_clap_and_serde() {
-        let schema = build_schema_data();
+        let schema = build_schema_data(false);
+        assert_eq!(schema.phase, "phase4");
+        assert!(!schema.default_configured);
         assert_eq!(schema.corpus_format, CORPUS_FORMAT);
         assert!(schema.commands.iter().any(|c| c.name == "search"));
         assert!(schema.commands.iter().any(|c| c.name == "sync"));
@@ -1065,8 +1177,11 @@ mod tests {
             .find(|o| o.id == "sag2")
             .unwrap();
         assert!(!sag2.supported);
+        assert_eq!(schema.unsupported_features.len(), 1);
+        assert_eq!(schema.unsupported_features[0].name, "sag2");
 
         let env_json = serde_json::to_string(&schema.envelopes).unwrap();
+        assert!(env_json.contains("syncDryRun"));
         assert!(env_json.contains("^w_[0-9a-f]{16,64}$"));
         assert!(env_json.contains("^s_[0-9a-f]{16,64}$"));
         assert!(env_json.contains("^p_[0-9a-f]{16,64}$"));
@@ -1413,9 +1528,181 @@ mod tests {
         for (argv, expected_code) in cases {
             let owned: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
             let cli = Cli::try_parse_from(&owned).unwrap();
-            let err = dispatch(&cli, true).unwrap_err();
+            let err = dispatch(&cli, true, &RuntimeOptions::shipped()).unwrap_err();
             assert_eq!(err.code, *expected_code, "argv={argv:?}");
         }
         assert!(!nonexistent_dir.exists());
+    }
+
+    #[test]
+    fn cold_bootstrap_dry_run_and_lock_recheck_behave_per_contract() {
+        use std::fs::{self, OpenOptions};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "0050 cold bootstrap fixture body").unwrap();
+        let intake = tmp.path().join("intake.json");
+        fs::write(
+            &intake,
+            r#"{"schemaVersion":1,"works":[{"key":"w1","title":"W1"}],"sources":[{"work":"w1","path":"a.txt","title":"A","role":"document","attribution":"authored_fixture","quality":"fixture","status":"ready"}]}"#,
+        )
+        .unwrap();
+        let rel = tmp.path().join("rel");
+        let manifest = crate::snapshot::publish_release(&ws, &intake, &rel).unwrap();
+        let manifest_bytes = fs::read(rel.join("manifest.json")).unwrap();
+        let zst_bytes = fs::read(rel.join("corpus.sqlite.zst")).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let manifest_gets = Arc::new(AtomicUsize::new(0));
+        let artifact_gets = Arc::new(AtomicUsize::new(0));
+        let mg = Arc::clone(&manifest_gets);
+        let ag = Arc::clone(&artifact_gets);
+        let m_srv = manifest_bytes.clone();
+        let z_srv = zst_bytes.clone();
+
+        let srv = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" || h == "\n" {
+                        break;
+                    }
+                }
+                if path == "/shutdown" {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    break;
+                } else if path == "/manifest.json" {
+                    mg.fetch_add(1, Ordering::SeqCst);
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", m_srv.len());
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&m_srv);
+                } else if path == "/corpus.sqlite.zst" {
+                    ag.fetch_add(1, Ordering::SeqCst);
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", z_srv.len());
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&z_srv);
+                } else {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                }
+            }
+        });
+
+        let default_url = format!("http://127.0.0.1:{port}/manifest.json");
+        let opts = RuntimeOptions {
+            default_origin: Some(default_url.clone()),
+            transfer_policy: TransferPolicy::shipped(),
+        };
+
+        let dry_dir = tmp.path().join("dry_data");
+        let dry_cli = Cli::try_parse_from([
+            "clec",
+            "--data-dir",
+            &dry_dir.display().to_string(),
+            "sync",
+            "--dry-run",
+        ])
+        .unwrap();
+        let dry_out = dispatch(&dry_cli, true, &opts).unwrap();
+        let dry_val: serde_json::Value = serde_json::from_str(&dry_out).unwrap();
+        assert_eq!(dry_val["data"]["dryRun"], true);
+        assert_eq!(dry_val["data"]["isActive"], false);
+        assert_eq!(dry_val["data"]["release"], manifest.sha256.as_str());
+        assert!(!dry_dir.exists());
+        assert_eq!(manifest_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(artifact_gets.load(Ordering::SeqCst), 0);
+
+        let data_dir = tmp.path().join("boot_data");
+        let dir_s = data_dir.display().to_string();
+
+        // Invalid query makes 0 HTTP requests and creates no cache.
+        let bad_cli = Cli::try_parse_from(["clec", "--data-dir", &dir_s, "search", "   "]).unwrap();
+        assert_eq!(
+            dispatch(&bad_cli, true, &opts).unwrap_err().code,
+            ErrorCode::InvalidQuery
+        );
+        assert!(!data_dir.exists());
+        assert_eq!(manifest_gets.load(Ordering::SeqCst), 1);
+
+        // Cold search bootstraps once, then missing ID / budget failure leaves cache usable offline.
+        let miss_cli = Cli::try_parse_from([
+            "clec",
+            "--data-dir",
+            &dir_s,
+            "read",
+            "p_000000000000000000000000",
+        ])
+        .unwrap();
+        assert_eq!(
+            dispatch(&miss_cli, true, &opts).unwrap_err().code,
+            ErrorCode::EvidenceNotFound
+        );
+        assert_eq!(manifest_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
+        assert!(data_dir.join("active.json").is_file());
+
+        // Subsequent search makes zero HTTP requests (warm cache).
+        let search_cli =
+            Cli::try_parse_from(["clec", "--data-dir", &dir_s, "search", "0050"]).unwrap();
+        let search_out = dispatch(&search_cli, true, &opts).unwrap();
+        let search_val: serde_json::Value = serde_json::from_str(&search_out).unwrap();
+        assert_eq!(search_val["data"]["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
+
+        // Corrupt active.json must never auto-bootstrap.
+        fs::write(data_dir.join("active.json"), "{corrupt").unwrap();
+        assert_eq!(
+            dispatch(&search_cli, true, &opts).unwrap_err().code,
+            ErrorCode::InvalidPackage
+        );
+        assert_eq!(manifest_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
+
+        // Lock contention during cold bootstrap fails SYNC_LOCKED with zero HTTP requests.
+        let lock_dir = tmp.path().join("lock_boot_data");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lf = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_dir.join(".sync.lock"))
+            .unwrap();
+        lf.lock().unwrap();
+        let lock_cli = Cli::try_parse_from([
+            "clec",
+            "--data-dir",
+            &lock_dir.display().to_string(),
+            "search",
+            "0050",
+        ])
+        .unwrap();
+        assert_eq!(
+            dispatch(&lock_cli, true, &opts).unwrap_err().code,
+            ErrorCode::SyncLocked
+        );
+        lf.unlock().unwrap();
+        assert_eq!(manifest_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(artifact_gets.load(Ordering::SeqCst), 1);
+
+        let _ = reqwest::blocking::get(format!("http://127.0.0.1:{port}/shutdown"));
+        let _ = srv.join();
     }
 }
