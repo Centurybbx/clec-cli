@@ -23,9 +23,17 @@ const ctrlOut = new Socket({ fd: 4 });
 let nativeChild = null;
 let goHandled = false;
 let exiting = false;
+let stopping = false;
+let nativeFinished = false;
 
 function writeFrame(obj) {
 	return ctrlOut.write(`${JSON.stringify(obj)}\n`, "utf8");
+}
+
+function finish() {
+	if (exiting) return;
+	exiting = true;
+	ctrlOut.end(() => process.exit(0));
 }
 
 function failAndExit(message, code = 1) {
@@ -90,10 +98,7 @@ ctrlIn.on("data", (chunk) => {
 });
 
 ctrlIn.on("end", () => {
-	if (!goHandled && !exiting) {
-		exiting = true;
-		ctrlOut.end(() => process.exit(0));
-	}
+	if (!goHandled) finish();
 });
 
 ctrlIn.on("error", (err) => {
@@ -153,28 +158,25 @@ function launchNative(goCmd) {
 
 	nativeChild.on("close", (code, signal) => {
 		if (exiting) return;
-		exiting = true;
+		nativeFinished = true;
 		writeFrame({
 			kind: "native_exited",
 			leaseId,
 			exitCode: code,
 			signal: signal ?? null,
 		});
-		ctrlOut.end(() => process.exit(0));
+		if (stopping) finish();
 	});
 }
 
 process.on("SIGTERM", () => {
+	stopping = true;
 	if (nativeChild && nativeChild.exitCode === null && nativeChild.signalCode === null) {
 		try {
 			nativeChild.kill("SIGTERM");
 		} catch {
 			// Ignore if already exited
 		}
-		return;
 	}
-	if (!goHandled && !exiting) {
-		exiting = true;
-		ctrlOut.end(() => process.exit(0));
-	}
+	if (!goHandled || nativeFinished) finish();
 });

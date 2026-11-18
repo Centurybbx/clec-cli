@@ -492,7 +492,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		let nativeStarted = false;
 		let completed = false;
 		let goSent = false;
-		const reportEnded = Promise.withResolvers<number>();
+		const cleanupArmed = Promise.withResolvers<number>();
 		const aborted = Promise.withResolvers<void>();
 		let firstChunk = true;
 		const stdout = Buffer.alloc(UNIT1_LIMITS.nativeStdoutBytes);
@@ -501,15 +501,16 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 			outcome = { ...failed(reason), nativeStarted };
 			params.onFatal(reason);
 		};
-		const reportChannelEnded = (): void => {
+		const beginCleanup = (): void => {
 			if (entry.stop) return;
 			const at = performance.now();
-			if (goSent) {
-				const stop = params.registry.beginOne(entry, { at, detectedAt: at });
-				reportEnded.resolve(stop.evidence.drainDeadline);
-			} else {
-				fail("Helper exited or closed its report channel before GO");
-			}
+			const stop = params.registry.beginOne(entry, { at, detectedAt: at });
+			cleanupArmed.resolve(stop.evidence.drainDeadline);
+		};
+		const reportChannelEnded = (): void => {
+			if (entry.stop) return;
+			if (goSent) beginCleanup();
+			else fail("Helper exited or closed its report channel before GO");
 		};
 		child.once("exit", reportChannelEnded);
 		const closeGo = (): void => {
@@ -618,6 +619,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 					case "native_exited": {
 						if (!nativeStarted || completed) return fail("Unexpected native exit report");
 						completed = true;
+						beginCleanup();
 						await commit("native_exited", { exitCode: rec.exitCode, signal: rec.signal });
 						outcome = {
 							ok: rec.exitCode === 0, exitCode: rec.exitCode, signal: rec.signal,
@@ -641,7 +643,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		const captured = await byDeadline(Promise.race([
 			reader.done,
 			aborted.promise,
-			reportEnded.promise.then(async (drainDeadline) => {
+			cleanupArmed.promise.then(async (drainDeadline) => {
 				const drained = await byDeadline(reader.done, drainDeadline);
 				if (drained.kind === "timeout") fail("Native report drain deadline");
 			}),
