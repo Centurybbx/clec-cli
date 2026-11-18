@@ -58,8 +58,10 @@ export class PiProjection {
 		| { kind: "open"; type: string; deltas: string[]; identity: { id: CallId; name: string } | null }
 		| { kind: "closed"; block: unknown }>();
 	private batch: Call[] = [];
-	private readonly turns: { start: number; response: number; answer: Answer; calls: Call[] }[] = [];
-	private worked = false;
+	private readonly turns: {
+		start: number; response: number; answer: Answer; calls: Call[]; workObserved: boolean; hasThinking: boolean;
+	}[] = [];
+	private turnWorked = false;
 	private frameIndex = -1;
 	private turnStart = -1;
 	private responseStart = -1;
@@ -77,7 +79,7 @@ export class PiProjection {
 	}
 
 	get progress() {
-		return { stage: this.stage, workObserved: this.worked, calls: this.calls.size };
+		return { stage: this.stage, workObserved: this.turnWorked || this.turns.some(turn => turn.workObserved), calls: this.calls.size };
 	}
 
 	finish(mode: Mode, denied?: { id: unknown; name: unknown; ordinal: number }) {
@@ -143,6 +145,7 @@ export class PiProjection {
 				requireFact(this.stage === "between" && (!this.answer || this.answer.stop === "toolUse"), "turn_start_order");
 				this.stage = "turn";
 				this.turnStart = this.frameIndex;
+				this.turnWorked = false;
 				this.assistant = undefined;
 				this.batch = [];
 				this.blocks.clear();
@@ -166,7 +169,7 @@ export class PiProjection {
 						requireFact(this.messages.length >= 2 && !this.assistant && (message.stopReason === "pending" || message.stopReason === "error"), "assistant_start_order");
 						requireFact(Array.isArray(message.content), "assistant_content");
 						this.responseStart = this.frameIndex;
-						if (message.content.length > 0) this.worked = true;
+						if (message.content.length > 0) this.turnWorked = true;
 						break;
 					case "toolResult": {
 						const call = this.callFor(message);
@@ -231,7 +234,7 @@ export class PiProjection {
 			update.contentIndex >= 0, "assistant_update_shape");
 		const [kind, transition] = update.type.split("_");
 		requireFact(["text", "thinking", "toolcall"].includes(kind) && update.type === `${kind}_${transition}`, "assistant_update_kind");
-		this.worked = true;
+		this.turnWorked = true;
 		const index = update.contentIndex;
 		const block = this.blocks.get(index);
 		if (transition === "start") {
@@ -281,9 +284,10 @@ export class PiProjection {
 				return block.block;
 			}), "assistant_content_mismatch");
 			const text: string[] = [];
+			let hasThinking = false;
 			for (const value of message.content) {
 				const block = record(value, "assistant_content");
-				this.worked = true;
+				this.turnWorked = true;
 				switch (block.type) {
 					case "text":
 						requireFact(typeof block.text === "string", "assistant_text");
@@ -291,6 +295,7 @@ export class PiProjection {
 						break;
 					case "thinking":
 						requireFact(typeof block.thinking === "string", "assistant_thinking");
+						hasThinking = true;
 						break;
 					case "toolCall": {
 						const id = idOf(block.id);
@@ -308,7 +313,8 @@ export class PiProjection {
 			const joined = text.join("");
 			requireFact(Buffer.byteLength(joined) <= UNIT1_LIMITS.answerBytes && Buffer.from(joined).toString("utf8") === joined, "assistant_answer_bytes");
 			this.answer = { text: joined, stop: message.stopReason, error: message.errorMessage ?? null };
-			this.turns.push({ start: this.turnStart, response: this.responseStart, answer: this.answer, calls: this.batch });
+			this.turns.push({ start: this.turnStart, response: this.responseStart, answer: this.answer, calls: this.batch,
+				workObserved: this.turnWorked, hasThinking });
 		} else {
 			equal(message, this.open, "message_end_mismatch");
 			if (message.role === "toolResult") this.callFor(message).state = "recorded";
@@ -556,6 +562,7 @@ function checkProviderOutcome(value: unknown, turn: PiTurn) {
 	const outcome = record(value, "provider_outcome");
 	const { kind } = outcome;
 	const { answer, calls } = turn;
+	requireFact(!turn.hasThinking, "provider_outcome");
 	switch (kind) {
 		case "tool_calls":
 			requireFact(answer.stop === "toolUse" && answer.text === "" && answer.error === null && calls.length > 0, "provider_outcome");
@@ -570,12 +577,12 @@ function checkProviderOutcome(value: unknown, turn: PiTurn) {
 			break;
 		}
 		case "transport_reset":
-			requireFact(answer.stop === "error" && answer.text === "" && typeof answer.error === "string" &&
+			requireFact(!turn.workObserved && answer.stop === "error" && answer.text === "" && typeof answer.error === "string" &&
 				answer.error.startsWith("Connection error.") && answer.error.endsWith("(UND_ERR_SOCKET)"), "provider_outcome");
 			break;
 		case "http_error": {
 			requireFact(unsigned(outcome.status) && outcome.status >= 400 && outcome.status <= 599 && typeof outcome.body === "string" &&
-				answer.stop === "error" && answer.text === "" && typeof answer.error === "string", "provider_outcome");
+				!turn.workObserved && answer.stop === "error" && answer.text === "" && typeof answer.error === "string", "provider_outcome");
 			const body = record(JSON.parse(outcome.body), "provider_outcome");
 			const error = record(body.error, "provider_outcome");
 			requireFact(typeof error.message === "string" && error.message.length > 0 &&

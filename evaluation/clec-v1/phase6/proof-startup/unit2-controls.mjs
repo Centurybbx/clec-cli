@@ -302,6 +302,13 @@ function changeOutcome({ read, set }, change) {
 }
 await mutate("contradictory_outcome", "provider_outcome", change =>
 	changeOutcome(change, () => ({ kind: "transport_reset" })));
+await mutate("assistant_work_in_reset_turn", "provider_outcome", ({ raw }) => raw(records =>
+	lines(records.map(JSON.parse).map(event => {
+		if (event.type === "message_start" && event.message?.role === "assistant") {
+			event.message.content = [{ type: "thinking", thinking: "Synthetic assistant work." }];
+		}
+		return event;
+	}))), "replacement");
 await mutate("refusal_claimed_as_stop", "provider_outcome", change =>
 	changeOutcome(change, outcome => ({ ...outcome, finishReason: "stop" })), "refusal");
 await mutate("truncation_claimed_as_stop", "provider_outcome", change =>
