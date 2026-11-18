@@ -1,6 +1,8 @@
 # Stage 6 darwin-x64 Rosetta evidence
 
-The full Stage 6 platform check passed for CLEC's x64 archive and npm install on an Apple Silicon Mac running macOS 26.4.1 (25E253). The run records `uname -m = x86_64` and `sysctl.proc_translated = 1` under Rosetta. Physical Intel execution and older macOS releases remain open. Independent review of this implementation is pending. [Environment observation](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/receipts/env-observation.json)
+Independent review `55f9db75` accepted `88ee6c2e20768ab08a4acab0f819ff0cafc79ea9` for CLEC's x64 archive and offline npm install under Rosetta on an Apple Silicon Mac running macOS 26.4.1 (25E253). Both verification runs recorded `uname -m = x86_64` and `sysctl.proc_translated = 1`. Physical Intel execution and older macOS releases remain open. [Environment observation](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/receipts/env-observation.json)
+
+The reviewer independently checked the staged and installed binaries, x64 npm lifecycle, UTF-8 reads, budget behavior, rollback and signal handling. The locked build and 79 Rust test results were inspected from the author receipts. The original author evidence links below resolve in the verification checkout at `/Users/century/.t3/worktrees/clec/t3-ee5bab60-74d5aec69d80962e`. Fresh review evidence is in `/private/tmp/clec-astra-x64.t0yaCLAC/`.
 
 ## Build and artifact identity
 
@@ -21,6 +23,8 @@ cargo +1.89.0 test --manifest-path native/Cargo.toml --locked --target x86_64-ap
 ```
 
 The three retained binaries have thin x86_64 `MH_EXECUTE` Mach-O headers. Their direct dylib dependencies are Security, CoreFoundation, libiconv, and libSystem. The load command `LC_VERSION_MIN_MACOSX` records 10.12 and SDK 26.4. Each binary embeds the x64 target, the locked dependency hash, the Rust 1.89.0 compiler, release profile, and an empty feature set. [Mach-O and library output](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/receipts/cross-build-observation.json) · [Embedded build identities](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/receipts/darwin-x64-prebuilt-receipt.json)
+
+The reviewed `clec` binary directly imports `SecTrustEvaluateWithError` from Security. The SDK declares the API available from macOS 10.14. The 10.12 load command is a build setting. The compatibility baseline must account for the imported APIs and be verified on the intended macOS version before publication.
 
 All 79 Rust tests passed across five inspected x86_64 test executables. The three run-ownership tests also passed. The lowest free-space sample was 3,546,380 KiB (3.38 GiB). The run retained the binaries and logs before deleting its Cargo intermediates. [Rust results](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/logs/tests/cargo-test-x64.stdout) · [Ownership results](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/logs/run-ownership.txt) · [Cleanup receipt](../../../.cache/phase6-darwin-x64-runs/run-337pggj3/receipts/cleanup-receipt.json)
 
