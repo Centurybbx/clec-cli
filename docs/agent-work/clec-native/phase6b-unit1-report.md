@@ -1,6 +1,14 @@
 # Stage 6B Unit 1 feasibility proof report
 
-Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. This candidate repairs the four authority failures in Stage 6B Unit 1 of the six-stage CLEC plan. The tested proof source is `55207fb0fb2be8de7505857aeb5fae8394ac9626`. Fresh independent GPT 6.2 Astra review is required before parent integration or work on Units 2 through 4.
+Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. The latest tested source is `9c37a076bb46ec2ee6df0e377a303a665e65a6eb`. Fresh independent acceptance is pending before integration or work on Units 2 through 4.
+
+## Finalization follow-up
+
+Independent review `96f07581` reproduced both failures at `09748a856921bc83ad9c4446d43938fc320333a5`. A Pi reap after the observation cutoff changed the returned stop evidence after the index had been serialized. The finalizer now detaches one snapshot before publishing it and returns that snapshot. A rejected duplicate attempt also indexed the previous run's files. Its result and index now identify the rejection's own journal, with null paths for the absent Pi streams. [Independent review](/tmp/clec-review097.IN960a/review.md)
+
+Both regression controls failed on the prior source. On the repaired source, the late-reap test reaped the real process 8.87 ms after the observation cutoff and confirmed that the returned and indexed records both retained the cutoff snapshot. The collision control confirmed that the indexed journal names the rejected run, both Pi streams are absent, and the first run's journal is unchanged. [Before-fix logs](/tmp/clec-unit1-index.eUvmVK)
+
+The repaired source passed 45 matrix controls, 16 parser and framing tests, 24 deadline controls, and the strict TypeScript check. A direct OS scan found no survivors across 150 recorded PIDs and 58 PGIDs after test cleanup. [Matrix receipt](/tmp/clec-unit1-index-verified.MoHjOH/matrix-1794962392628-0efce046/matrix-receipt.json) · [Deadline receipt](/tmp/clec-unit1-index-verified.MoHjOH/clec-deadline-controls-92ihli/receipt.json) · [Process scan](/tmp/clec-unit1-index-verified.MoHjOH/survivors.json)
 
 ## Authority repairs
 
@@ -10,6 +18,8 @@ Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. This candidate repairs
 - Each raw sink detaches a bounded payload before awaiting file I/O. Callers split larger reads, and native stdout and stderr assemble into fixed-size capped buffers. The sink reports the backing bytes it retains. [Protocol](../../../evaluation/clec-v1/phase6/proof-startup/PROTOCOL.md)
 
 ## Verification of the authority repairs
+
+The results below record the preceding authority repair at tested proof source `55207fb0fb2be8de7505857aeb5fae8394ac9626`. The finalization follow-up above records the latest run.
 
 The prepared parent was `6886ff11b89564337cebca54e956d0841558afa2`. Normal cherry-picks brought in deadline implementation `05a7405` and its report `ae87ffb`. The clean source run passed **45 matrix controls**, **7 process-observation tests**, **9 framing tests**, and **23 deadline controls**. Three additional injected `datasync` failures prevented provider permit or GO. TypeScript 5.9.3 checked all scoped TypeScript sources with zero diagnostics under pinned Node 25.7.0. The invocation uses the pinned Pi installation's Node type directory.
 
