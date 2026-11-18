@@ -1,8 +1,14 @@
 # Stage 6B Unit 2 evidence-boundary repair
 
+## Independent acceptance
+
+GPT 6.2 Astra accepted `b71390b4732e83a49064c29f348434fc69cf8313` for the status-only proof on pinned macOS ARM64. The reviewer reproduced no P0 or P1 and confirmed that both seal and inspect reject all six prior counterexamples. Scoped TypeScript, 12 live loopback runs, and 68 bundle controls passed. The ten-call batch executed eight calls, denied call nine, and recorded call ten without an ordinal. The late-close control stayed `Incomplete`. The coordinator fast-forwarded to the accepted commit. [Independent commands](/private/tmp/clec-6b-accept.tMA8rg/commands.sh) · [Unit 2 receipt](/private/tmp/clec-6b-accept.tMA8rg/unit2-controls-se1e3k/receipt.json)
+
+The P2 replay finding remains open. Seal and inspect accepted a mutation that moved call two's reservation ahead of call one's native group and result records. Both native executions still occurred in their original serial order and stayed within the call budget. The coordinator recorded this finding for reference under the P0 and P1 repair policy. [Batch timing probe](/private/tmp/clec-6b-accept.tMA8rg/batch-order.json)
+
 ## Astra recheck repair
 
-Replayed the six candidate patches in order on integrated `65a2c580ea1c0d63de213c739ba9c251a304098f`. The replayed predecessor was `0dac5bd2bb2fef6a4a7ea78e1a45991e1555bc38` and the tested repair was `e0bd8de5a60a5c506da41da375d5db7402c1e1c5`. The proof ran on macOS ARM64 with existing Node v25.7.0, Pi 1.5.2 and installed native CLEC. It used the synthetic loopback and a real native `status` invocation against the empty offline corpus. The result remains `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE`. Fresh independent Astra review is pending.
+Replayed the six candidate patches in order on integrated `65a2c580ea1c0d63de213c739ba9c251a304098f`. The replayed predecessor was `0dac5bd2bb2fef6a4a7ea78e1a45991e1555bc38` and the tested repair was `e0bd8de5a60a5c506da41da375d5db7402c1e1c5`. The proof ran on macOS ARM64 with existing Node v25.7.0, Pi 1.5.2 and installed native CLEC. It used the synthetic loopback and a real native `status` invocation against the empty offline corpus. The result remains `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE`.
 
 | Replayed counterexample | Predecessor seal and inspect | Repaired seal and inspect |
 | --- | --- | --- |
@@ -25,7 +31,7 @@ Unit 2 covers JSON object arguments in the synthetic fixture, including schema r
 
 ## Prior verification
 
-Unit 2 derives each public case outcome from retained evidence and closes the run only after the attempt owner has finished recording and published its index. The tested source was `4e8d282f62aba7b0285ac593f8d94ecb33942c00`, based on integrated `65a2c580ea1c0d63de213c739ba9c251a304098f` plus the original Unit 2 implementation and report. The proof ran on pinned macOS ARM64. Its status is `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE`. Independent GPT 6.2 Astra acceptance is pending before integration and Units 3–4. [Protocol](phase6b-unit2-protocol.md)
+Unit 2 derives each public case outcome from retained evidence and closes the run only after the attempt owner has finished recording and published its index. The tested source was `4e8d282f62aba7b0285ac593f8d94ecb33942c00`, based on integrated `65a2c580ea1c0d63de213c739ba9c251a304098f` plus the original Unit 2 implementation and report. The proof ran on pinned macOS ARM64. Its status is `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE`. [Protocol](phase6b-unit2-protocol.md)
 
 ### What the repaired evidence proves
 
