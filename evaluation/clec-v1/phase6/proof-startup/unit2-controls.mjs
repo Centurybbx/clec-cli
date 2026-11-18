@@ -41,6 +41,7 @@ async function baseline(name, ids, fixture, expectedStatus, replacements, status
 	assert.deepEqual(summary.attempts.map(a => a.status), statuses);
 	assert.deepEqual(run.progression.map(p => p.attempts.length), [0, ...summary.attempts.map((_, i) => i + 1)]);
 	assert.deepEqual(run.progression.at(-1).attempts, summary.attempts);
+	assert.deepEqual(await sealRun(run.root, run.expected), run.result);
 	assert.deepEqual(inspectRun(run.root, readJson(run.anchorPath)), run.result);
 	const runEntries = readLines(join(run.root, "run.jsonl"));
 	const prefixFacts = [];
@@ -157,9 +158,10 @@ async function mutate(name, expectedInvariant, change, baselineName = "one") {
 	const sealed = await sealRun(root, expected);
 	const inspected = inspectRun(root, expected);
 	assert.deepEqual(sealed, inspected);
-	assert.equal(sealed.invariant, expectedInvariant, `${name}: ${JSON.stringify(sealed)}`);
+	if (expectedInvariant === null) assert.deepEqual(sealed, baseline.result);
+	else assert.equal(sealed.invariant, expectedInvariant, `${name}: ${JSON.stringify(sealed)}`);
 	mutations.push({ name, root, sealed, inspected });
-	process.stdout.write(`pass mutation ${name} ${expectedInvariant}\n`);
+	process.stdout.write(`pass mutation ${name} ${expectedInvariant ?? sealed.kind}\n`);
 }
 
 await mutate("empty", "empty_attempts", ({ run }) => omitAttempt(run, 0));
@@ -397,6 +399,95 @@ await baseline("http_error", ["alpha"], () => ({
 await mutate("contradictory_http_status", "provider_outcome", change =>
 	changeOutcome(change, outcome => ({ ...outcome, status: 403 })), "http_error");
 
+const predecessorMutations = mutations.length;
+assert.equal(predecessorMutations, 53);
+await baseline("empty_text", ["alpha"], () => ({ kind: "text", text: "" }), "TaskFailed", 0, ["TaskFailed"]);
+const quotedMessage = 'Synthetic "field" error';
+const escapedMessage = 'Synthetic "field" at C:\\fixture\nSecond line\t✓';
+for (const [name, message] of [["quoted_http", quotedMessage], ["escaped_http", escapedMessage]]) {
+	await baseline(name, ["alpha"], () => ({
+		kind: "http_error", status: 400, body: JSON.stringify({ error: { message } }),
+	}), "TaskFailed", 0, ["TaskFailed"]);
+	assert.deepEqual(runs.get(name).result.summary.attempts[0].answer,
+		{ text: "", stop: "error", error: `400: ${JSON.stringify({ message })}` });
+}
+await mutate("http_message_substring", "provider_outcome", change =>
+	changeOutcome(change, outcome => ({ ...outcome, body: JSON.stringify({ error: { message: "HTTP" } }) })), "http_error");
+await mutate("http_escaped_message_changed", "provider_outcome", change =>
+	changeOutcome(change, outcome => ({ ...outcome, body: JSON.stringify({ error: { message: escapedMessage.replace("\n", "\\n") } }) })),
+	"escaped_http");
+
+function replaceToolDeltas({ raw }, chunks) {
+	raw(records => {
+		const events = records.map(JSON.parse);
+		const end = events.findIndex(event => event.assistantMessageEvent?.type === "toolcall_end");
+		const deltas = events.slice(0, end).map(event => event.assistantMessageEvent).filter(update => update?.type === "toolcall_delta");
+		assert.equal(deltas.map(update => update.delta).join(""), '{"action":"status"}');
+		assert.equal(chunks.length, deltas.length);
+		deltas.forEach((update, index) => { update.delta = chunks[index]; });
+		return lines(events);
+	});
+}
+await mutate("different_tool_delta_arguments", "assistant_tool_arguments", change =>
+	replaceToolDeltas(change, ["", '{"action":"other"}']));
+await mutate("different_split_tool_delta_arguments", "assistant_tool_arguments", change =>
+	replaceToolDeltas(change, [' { "act', 'ion" : "sta\\u0078us" } ']));
+await mutate("equivalent_split_tool_delta_arguments", null, change =>
+	replaceToolDeltas(change, [' { "act', 'ion" : "sta\\u0074us" } ']));
+
+function moveAfter(events, select, landmark) {
+	const index = events.findIndex(select);
+	assert(index >= 0);
+	const [moved] = events.splice(index, 1);
+	const anchor = events.findIndex(event => event.kind === landmark);
+	assert(anchor >= 0);
+	events.splice(anchor + 1, 0, { ...moved, monotonicMs: events[anchor].monotonicMs, utcIso: events[anchor].utcIso });
+	return events;
+}
+function moveSecondCandidateAndGrant(events, landmark) {
+	const moved = ["provider_candidate", "provider_grant"].map(kind => events.filter(event => event.kind === kind)[1]);
+	assert(moved.every(Boolean));
+	const kept = events.filter(event => !moved.includes(event));
+	const anchor = kept.findIndex(event => event.kind === landmark);
+	assert(anchor >= 0);
+	kept.splice(anchor + 1, 0, ...moved.map(event =>
+		({ ...event, monotonicMs: kept[anchor].monotonicMs, utcIso: kept[anchor].utcIso })));
+	return kept;
+}
+await mutate("authorization_ahead_of_rpc_turn_start", null, ({ journal }) =>
+	journal(events => moveSecondCandidateAndGrant(events, "tool_result_delivered")));
+await mutate("authorization_before_result_release", "provider_lifecycle", ({ journal }) =>
+	journal(events => moveSecondCandidateAndGrant(events, "native_exited")));
+for (const [name, landmark] of [["reservation_after_denial", "tool_start_denied"], ["reservation_after_exit", "pi_exited"]]) {
+	await mutate(name, "tool_reservation_order", ({ journal }) =>
+		journal(events => moveAfter(events, event => event.kind === "tool_start_reserved" && event.body.ordinal === 8, landmark)),
+		"budget_denial");
+}
+await mutate("batch_after_exit", "tool_declarations", ({ journal }) =>
+	journal(events => moveAfter(events, event => event.kind === "tool_declared_batch", "pi_exited")), "budget_denial");
+
+function changeOwnerDeclarations({ read, set }, transform) {
+	const owner = read("final_index");
+	owner.declaredToolCalls = transform(owner.declaredToolCalls);
+	set("final_index", Buffer.from(JSON.stringify(owner)));
+}
+await mutate("omitted_owner_declarations", "final_owner_declarations", change =>
+	changeOwnerDeclarations(change, calls => {
+		assert.equal(calls.length, 10);
+		return [];
+	}), "budget_denial");
+await mutate("foreign_denied_owner_call", "final_owner_declarations", change =>
+	changeOwnerDeclarations(change, calls => calls.map(call => call.ordinal === 9 ? { ...call, id: "foreign_denial" } : call)),
+	"budget_denial");
+await mutate("released_owner_tail_call", "final_owner_declarations", change =>
+	changeOwnerDeclarations(change, calls => calls.map(call => call.ordinal === null ? { ...call, name: "other", ordinal: 10 } : call)),
+	"budget_denial");
+
+await mutate("pi_drain_before_frame", "pi_exit_chronology", change =>
+	changeClosure(change, "pi_exited", ({ stop }) => { stop.drainCompletedAt = stop.detectedAt; }), "budget_denial");
+await mutate("helper_term_after_exit_report", "process_closure", change =>
+	changeClosure(change, "group_closure_observed", ({ stop }) => { stop.termAttemptAt = stop.reapedAt + 0.1; }));
+
 const originalClose = BoundedJournalWriter.prototype.close;
 let closeInvoked = false;
 BoundedJournalWriter.prototype.close = async function (deadline) {
@@ -481,6 +572,6 @@ assert.deepEqual(survivors, []);
 writeExclusiveFile(join(output, "receipt.json"), JSON.stringify({
 	runs: Array.from(runs, ([name, run]) => ({ name, root: run.root, anchorPath: run.anchorPath,
 		manifestSha256: sha256Buffer(readFileSync(join(run.root, "summary.json"))) })),
-	standardRuns, originalMutations, mutations, profile, closure, pids: [...pids], pgids: [...pgids], survivors,
+	standardRuns, originalMutations, predecessorMutations, mutations, profile, closure, pids: [...pids], pgids: [...pgids], survivors,
 }, null, 2));
-process.stdout.write(`pass ${standardRuns} standard runs, ${runs.size - standardRuns} supplemental HTTP run, ${mutations.length} isolated mutations, ${pids.size} PIDs and ${pgids.size} PGIDs clear\n`);
+process.stdout.write(`pass ${standardRuns} standard runs, ${runs.size - standardRuns} supplemental runs, ${mutations.length} isolated bundle controls, ${pids.size} PIDs and ${pgids.size} PGIDs clear\n`);

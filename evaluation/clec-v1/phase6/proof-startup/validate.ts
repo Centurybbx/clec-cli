@@ -32,6 +32,7 @@ type Call = {
 	readonly id: CallId;
 	readonly name: string;
 	readonly args: unknown;
+	startFrame: number | null;
 	state: "declared" | "started" | "ended" | "recorded";
 	result?: CallResult;
 };
@@ -47,8 +48,13 @@ function idOf(value: unknown): CallId {
 	return makeCallId(value);
 }
 
+function parseJson(text: string, invariant: string): unknown {
+	try { return JSON.parse(text); }
+	catch { throw new Error(invariant); }
+}
+
 export class PiProjection {
-	readonly calls = new Map<CallId, Call>();
+	private readonly calls = new Map<CallId, Call>();
 	private stage: "bootstrap" | "prompt" | "agent" | "between" | "turn" | "ended" | "settled" | "idle" = "bootstrap";
 	private open: Record<string, unknown> | undefined;
 	private assistant: Record<string, unknown> | undefined;
@@ -59,7 +65,7 @@ export class PiProjection {
 		| { kind: "closed"; block: unknown }>();
 	private batch: Call[] = [];
 	private readonly turns: {
-		start: number; response: number; answer: Answer; calls: Call[]; workObserved: boolean; hasThinking: boolean;
+		start: number; response: number; declaration: number; answer: Answer; calls: Call[]; workObserved: boolean; hasThinking: boolean;
 	}[] = [];
 	private turnWorked = false;
 	private frameIndex = -1;
@@ -100,7 +106,7 @@ export class PiProjection {
 		return {
 			...this.progress, answer: this.answer, bootstrap: this.bootstrap, promptFrame: this.promptFrame, idleFrame: this.idleFrame,
 			turns: this.turns.map(turn => ({
-				...turn, calls: turn.calls.map(({ id, name, args, result }) => ({ id, name, args, result: result ?? null })),
+				...turn, calls: turn.calls.map(({ id, name, args, startFrame, result }) => ({ id, name, args, startFrame, result: result ?? null })),
 			})),
 		};
 	}
@@ -192,7 +198,9 @@ export class PiProjection {
 				requireFact(this.stage === "turn" && this.assistant && !this.open, "tool_start_order");
 				const call = this.callFor(event);
 				requireFact(call.state === "declared", "duplicate_tool_start");
+				requireFact(this.batch.find(item => item.state !== "recorded") === call, "tool_start_order");
 				equal(event.args, call.args, "tool_start_args");
+				call.startFrame = this.frameIndex;
 				call.state = "started";
 				return;
 			}
@@ -259,6 +267,9 @@ export class PiProjection {
 			const call = record(update.toolCall, "assistant_delta_content");
 			requireFact(call.type === "toolCall" && call.id === block.identity?.id && call.name === block.identity?.name,
 				"assistant_delta_content");
+			const args = parseJson(block.deltas.join(""), "assistant_tool_arguments");
+			requireFact(object(args), "assistant_tool_arguments");
+			equal(args, call.arguments, "assistant_tool_arguments");
 			content = call;
 		} else {
 			equal(update.content, block.deltas.join(""), "assistant_delta_content");
@@ -301,7 +312,7 @@ export class PiProjection {
 						const id = idOf(block.id);
 						requireFact(!this.calls.has(id), "duplicate_call");
 						requireFact(typeof block.name === "string" && block.name.length > 0 && object(block.arguments), "call_declaration");
-						const call: Call = { id, name: block.name, args: block.arguments, state: "declared" };
+						const call: Call = { id, name: block.name, args: block.arguments, startFrame: null, state: "declared" };
 						this.calls.set(id, call);
 						this.batch.push(call);
 						break;
@@ -313,7 +324,7 @@ export class PiProjection {
 			const joined = text.join("");
 			requireFact(Buffer.byteLength(joined) <= UNIT1_LIMITS.answerBytes && Buffer.from(joined).toString("utf8") === joined, "assistant_answer_bytes");
 			this.answer = { text: joined, stop: message.stopReason, error: message.errorMessage ?? null };
-			this.turns.push({ start: this.turnStart, response: this.responseStart, answer: this.answer, calls: this.batch,
+			this.turns.push({ start: this.turnStart, response: this.responseStart, declaration: this.frameIndex, answer: this.answer, calls: this.batch,
 				workObserved: this.turnWorked, hasThinking });
 		} else {
 			equal(message, this.open, "message_end_mismatch");
@@ -471,7 +482,7 @@ function checkChunks(bytes: Buffer, stdout: Buffer, stderr: Buffer, started: Jou
 const groupKinds = ["group_reserved", "group_registered", "group_go_sent", "native_pid_reported", "native_exited", "tool_result_delivered", "group_closure_observed"];
 
 function checkGroup(input: {
-	events: JournalEvent[]; call: Call; ordinal: number; artifacts: ObservedArtifacts; capture: string; nativePath: string; originalRoot: string;
+	events: JournalEvent[]; call: PiTurn["calls"][number]; ordinal: number; artifacts: ObservedArtifacts; capture: string; nativePath: string; originalRoot: string;
 	origin: number; piStopAt: number;
 }): Readonly<{ nativePid: number; pgid: number }> {
 	const { events, call, ordinal, artifacts, capture, nativePath, originalRoot, origin, piStopAt } = input;
@@ -498,7 +509,9 @@ function checkGroup(input: {
 	requireFact(observation.kind === "gone" && observation.pgid === pgid && finite(observation.checkedAtMonotonicMs), "native_observation");
 	equal(observation.pidsChecked, [pgid, nativePid], "native_observation");
 	const stop = checkStop(closure.stop, origin, "native", events[2].monotonicMs, events[5].monotonicMs);
-	requireFact(observation.checkedAtMonotonicMs >= Math.max(stop.reap, stop.term ?? 0, stop.kill ?? 0) &&
+	// The completed helper waits for TERM. The reader arms it before journaling the exit report.
+	requireFact(stop.term !== null && stop.term <= Math.min(stop.reap, events[4].monotonicMs), "process_closure");
+	requireFact(observation.checkedAtMonotonicMs >= Math.max(stop.reap, stop.kill ?? 0) &&
 		observation.checkedAtMonotonicMs <= stop.observed && events[4].monotonicMs <= stop.drained &&
 		events[5].monotonicMs <= piStopAt, "native_observation");
 	const [stdout, stderr, chunks] = nativeArtifacts.map(([file, role, cap]) =>
@@ -524,16 +537,17 @@ function checkGroup(input: {
 type PiFacts = ReturnType<PiProjection["finish"]>;
 type PiTurn = PiFacts["turns"][number];
 
+function executesNative(call: PiTurn["calls"][number]): boolean {
+	return call.name === "clec" && object(call.args) && Object.keys(call.args).length === 1 && call.args.action === "status";
+}
+
 function wireCalls(value: unknown, invariant: string) {
 	requireFact(Array.isArray(value), invariant);
 	return value.map((item: unknown) => {
 		const call = record(item, invariant);
 		const fn = record(call.function, invariant);
 		requireFact(call.type === "function" && typeof fn.arguments === "string", invariant);
-		let args: unknown;
-		try { args = JSON.parse(fn.arguments); }
-		catch { throw new Error(invariant); }
-		return { id: call.id, name: fn.name, args };
+		return { id: call.id, name: fn.name, args: parseJson(fn.arguments, invariant) };
 	});
 }
 
@@ -583,11 +597,13 @@ function checkProviderOutcome(value: unknown, turn: PiTurn) {
 		case "http_error": {
 			requireFact(unsigned(outcome.status) && outcome.status >= 400 && outcome.status <= 599 && typeof outcome.body === "string" &&
 				!turn.workObserved && answer.stop === "error" && answer.text === "" && typeof answer.error === "string", "provider_outcome");
-			const body = record(JSON.parse(outcome.body), "provider_outcome");
+			const body = record(parseJson(outcome.body, "provider_outcome"), "provider_outcome");
 			const error = record(body.error, "provider_outcome");
-			requireFact(typeof error.message === "string" && error.message.length > 0 &&
-				(answer.error.startsWith(`${outcome.status} `) || answer.error.startsWith(`${outcome.status}: `)) &&
-				answer.error.includes(error.message), "provider_outcome");
+			// Pi 1.5.2 formats the OpenAI SDK's nested error object as "<status>: <JSON>".
+			const prefix = `${outcome.status}: `;
+			requireFact(typeof error.message === "string" && error.message.length > 0 && answer.error.startsWith(prefix),
+				"provider_outcome");
+			equal(parseJson(answer.error.slice(prefix.length), "provider_outcome"), error, "provider_outcome");
 			break;
 		}
 		default: throw new Error("provider_outcome");
@@ -597,15 +613,17 @@ function checkProviderOutcome(value: unknown, turn: PiTurn) {
 
 function providerRequests(input: {
 	events: JournalEvent[]; rawRefs: JournalEvent[]; prompt: string; cwd: string; seen: unknown; pi: PiFacts;
-	preflight: JournalEvent; terminal: JournalEvent; stopAt: number; origin: number; baseUrl: string;
+	promptCommit: JournalEvent; preflight: JournalEvent; terminal: JournalEvent; stopAt: number; origin: number; baseUrl: string;
 }) {
-	const { events, rawRefs, prompt, cwd, seen, pi, preflight, terminal, stopAt, origin, baseUrl } = input;
+	const { events, rawRefs, prompt, cwd, seen, pi, promptCommit, preflight, terminal, stopAt, origin, baseUrl } = input;
 	requireFact(Array.isArray(seen), "loopback_capture");
 	let authorization: { kind: "candidate" | "granted"; candidate: Body } | null = null;
 	let used = 0;
+	let priorCalls = 0;
 	let seq = 1;
 	let watermark = 1;
-	const outcomes: ReturnType<typeof checkProviderOutcome>[] = [];
+	const outcomes: { kind: ReturnType<typeof checkProviderOutcome>; receivedAt: number }[] = [];
+	const releases = new Set<unknown>();
 
 	for (const event of events) {
 		const { kind, body } = event;
@@ -615,14 +633,19 @@ function providerRequests(input: {
 			seq = watermark = body.bridgeSeq;
 			continue;
 		}
+		if (kind === "tool_result_delivered") releases.add(body.callId);
 		if (kind !== "provider_candidate" && kind !== "provider_grant" && kind !== "provider_permit_sent") continue;
 		const turn = pi.turns[outcomes.length];
 		const start = turn && rawRefs[turn.start];
 		const response = turn && rawRefs[turn.response];
-		requireFact(start && response && start.seq > preflight.seq && event.seq > start.seq &&
+		requireFact(start && response && start.seq > preflight.seq && event.seq > promptCommit.seq &&
 			event.seq < response.seq && event.seq < terminal.seq && event.monotonicMs <= stopAt, "provider_lifecycle");
 		switch (kind) {
 			case "provider_candidate": {
+				// RPC and bridge records can interleave. The next request follows the prior ACKs and native result delivery.
+				const previous = pi.turns[outcomes.length - 1];
+				requireFact(used === priorCalls && (!previous || previous.calls.every(call => !executesNative(call) || releases.has(call.id))),
+					"provider_lifecycle");
 				const { payloadJson } = body;
 				requireFact(!authorization && unsigned(body.seq) && body.seq > seq && body.watermark === watermark &&
 					typeof payloadJson === "string" && body.payloadDigest === sha256Buffer(payloadJson) &&
@@ -652,7 +675,8 @@ function providerRequests(input: {
 				const payload = record(JSON.parse(authorization.candidate.payloadJson), "provider_candidate");
 				equal(JSON.parse(wire.bodyText), payload, "wire_payload");
 				checkProviderHistory(payload.messages, pi.turns.slice(0, outcomes.length));
-				outcomes.push(checkProviderOutcome(wire.outcome, turn));
+				outcomes.push({ kind: checkProviderOutcome(wire.outcome, turn), receivedAt });
+				priorCalls += turn.calls.length;
 				authorization = null;
 				break;
 			}
@@ -661,6 +685,45 @@ function providerRequests(input: {
 	requireFact(!authorization && seen.length === outcomes.length && outcomes.length > 0, "provider_request_coverage");
 	requireFact(outcomes.length === pi.turns.length, "provider_turn_coverage");
 	return outcomes;
+}
+
+function toolLifecycle(input: {
+	turns: readonly PiTurn[]; rawRefs: JournalEvent[]; batches: JournalEvent[]; reservations: JournalEvent[];
+	requests: ReturnType<typeof providerRequests>; denial: JournalEvent | undefined; exit: JournalEvent; stopAt: number;
+}) {
+	const { turns, rawRefs, batches, reservations, requests, denial, exit, stopAt } = input;
+	let batchIndex = 0;
+	let callIndex = 0;
+	const calls = turns.flatMap((turn, turnIndex) => {
+		if (!turn.calls.length) return [];
+		const batch = batches[batchIndex++];
+		const declaration = rawRefs[turn.declaration];
+		const nextFrame = rawRefs[turn.declaration + 1] ?? exit;
+		requireFact(batch && declaration.seq < batch.seq && batch.seq < nextFrame.seq, "tool_declarations");
+		equal(batch.body.calls, turn.calls.map(({ id, name }) => ({ id, name })), "tool_declarations");
+		const { receivedAt } = requests[turnIndex];
+		return turn.calls.map(call => {
+			const reservation = reservations[callIndex++];
+			const ordinal = callIndex;
+			if (reservation) {
+				requireFact(reservation.body.callId === call.id && reservation.body.toolName === call.name &&
+					reservation.body.ordinal === ordinal, "tool_reservation");
+				const start = call.startFrame === null ? null : rawRefs[call.startFrame];
+				// The bridge can journal before the RPC reader catches up, but ACK gates the raw start.
+				requireFact(start && reservation.seq < start.seq && reservation.seq < (denial ?? exit).seq &&
+					receivedAt <= reservation.monotonicMs && reservation.monotonicMs <= stopAt, "tool_reservation_order");
+				return { call, ordinal, reservation };
+			}
+			requireFact(denial && ordinal > UNIT1_LIMITS.maxAttempts, "tool_reservation_coverage");
+			const denied = ordinal === UNIT1_LIMITS.maxAttempts + 1;
+			if (denied) requireFact(receivedAt <= stopAt && denial.seq < exit.seq, "budget_denial");
+			return { call, ordinal: denied ? ordinal : null, reservation: null };
+		});
+	});
+	requireFact(batchIndex === batches.length, "tool_declarations");
+	requireFact(reservations.length === (denial ? UNIT1_LIMITS.maxAttempts : calls.length) &&
+		reservations.length <= UNIT1_LIMITS.maxAttempts, "tool_reservation_coverage");
+	return calls;
 }
 
 function validateAttempt(params: {
@@ -762,7 +825,7 @@ function validateAttempt(params: {
 	const terminal = denials[0] ?? one("agent_settled");
 	requireFact(finite(piStop.triggerAt), "process_closure");
 	const outcomes = providerRequests({ events, rawRefs, prompt, cwd, seen: parseRawJson(wire), pi: piClosed,
-		preflight, terminal, stopAt: piStop.triggerAt - origin, origin, baseUrl });
+		promptCommit, preflight, terminal, stopAt: piStop.triggerAt - origin, origin, baseUrl });
 	requireFact(denial
 		? exited.code === null && (exited.signal === "SIGKILL" ? finite(piStop.killAttemptAt)
 			: exited.signal === "SIGTERM" && finite(piStop.termAttemptAt))
@@ -772,7 +835,7 @@ function validateAttempt(params: {
 	const exitObserved = exited.observedAtMonotonicMs;
 	const lastFrame = rawRefs.at(-1);
 	requireFact(finite(exitObserved) && exitObserved <= stopped.reap && stopped.reap === stopped.observed &&
-		lastFrame && lastFrame.seq < exitEvent.seq, "pi_exit_chronology");
+		lastFrame && lastFrame.seq < exitEvent.seq && lastFrame.monotonicMs <= stopped.drained, "pi_exit_chronology");
 	if (denial) {
 		const signalAt = exited.signal === "SIGKILL" ? stopped.kill : stopped.term;
 		requireFact(signalAt !== null && signalAt <= exitObserved && stopped.trigger <= terminal.monotonicMs &&
@@ -782,15 +845,8 @@ function validateAttempt(params: {
 			stopped.term === null && stopped.kill === null, "pi_exit_chronology");
 	}
 
-	const reservations = byKind("tool_start_reserved");
-	const declared = byKind("tool_declared_batch").flatMap(({ body }) => {
-		requireFact(Array.isArray(body.calls) && body.calls.length > 0, "tool_declarations");
-		return body.calls;
-	});
-	const calls = Array.from(pi.calls.values());
-	equal(declared, calls.map(({ id, name }) => ({ id, name })), "tool_declarations");
-	requireFact(reservations.length === (denial ? UNIT1_LIMITS.maxAttempts : calls.length) &&
-		reservations.length <= UNIT1_LIMITS.maxAttempts, "tool_reservation_coverage");
+	const calls = toolLifecycle({ turns: piClosed.turns, rawRefs, batches: byKind("tool_declared_batch"),
+		reservations: byKind("tool_start_reserved"), requests: outcomes, denial: denials[0], exit: exitEvent, stopAt: stopped.trigger });
 	const groups = new Map<string, JournalEvent[]>();
 	for (const event of events.filter(event => groupKinds.includes(event.kind))) {
 		const { leaseId } = event.body;
@@ -800,31 +856,24 @@ function validateAttempt(params: {
 		group.push(event);
 		groups.set(leaseId, group);
 	}
-	const callSummary = calls.map((call, i) => {
-		const ordinal = i + 1;
-		const reservation = reservations[i];
-		if (denial && !reservation) {
-			return { id: call.id, name: call.name, ordinal: ordinal === deniedOrdinal ? ordinal : null,
-				result: null, native: null };
-		}
-		requireFact(reservation.body.callId === call.id && reservation.body.toolName === call.name &&
-			reservation.body.ordinal === ordinal, "tool_reservation");
+	const callSummary = calls.map(({ call, ordinal, reservation }) => {
+		if (!reservation) return { id: call.id, name: call.name, ordinal, result: null, native: null };
 		const lease = `lease-${ordinal}`;
 		const group = groups.get(lease);
 		groups.delete(lease);
-		const executable = call.name === "clec" && object(call.args) && Object.keys(call.args).length === 1 && call.args.action === "status";
+		const executable = executesNative(call);
 		const native = executable ? checkGroup({
 			events: group ?? [], call, ordinal, artifacts, capture,
 			nativePath: String(nativePath), originalRoot, origin, piStopAt: stopped.trigger,
 		}) : null;
-		if (executable) requireFact(Number(group?.[0]?.seq) > Number(reservation.seq), "native_reservation_order");
+		if (executable) requireFact(group && group[0].seq > reservation.seq, "native_reservation_order");
 		else requireFact(!group && call.result?.isError === true, "invalid_tool_rejection");
 		return { id: call.id, name: call.name, ordinal, result: call.result, native };
 	});
 	requireFact(groups.size === 0, "unpaired_native");
 
 	const answer = piClosed.answer;
-	const transport = outcomes.length === 1 && outcomes[0] === "transport_reset";
+	const transport = outcomes.length === 1 && outcomes[0].kind === "transport_reset";
 	const eligible = transport && !piClosed.workObserved && calls.length === 0;
 	const status = denial ? "DeniedAndTerminated" : answer.stop === "stop" && answer.text.trim().length > 0 ? "Answered"
 		: eligible ? "PreWorkInfrastructureFailed" : "TaskFailed";
@@ -852,6 +901,7 @@ function validateAttempt(params: {
 	equal(owner.piStop, piStop, "final_owner_process");
 	equal(owner.piExitCode, exited.code, "final_owner_process");
 	equal(owner.piSignal, exited.signal, "final_owner_process");
+	equal(owner.declaredToolCalls, calls.map(({ call: { id, name }, ordinal }) => ({ id, name, ordinal })), "final_owner_declarations");
 	requireFact(Array.isArray(owner.groupObservations), "final_owner_process");
 	const closedGroups = byKind("group_closure_observed");
 	requireFact(owner.groupObservations.length === closedGroups.length, "final_owner_process");
