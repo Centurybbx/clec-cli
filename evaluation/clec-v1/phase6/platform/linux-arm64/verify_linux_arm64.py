@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rerunnable Linux ARM64 container build, staging, and glibc/musl verification driver."""
+"""Rerunnable Linux container build, staging, and glibc/musl verification driver."""
 import argparse
 import hashlib
 import json
@@ -12,34 +12,54 @@ import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 UNIT_DIR = pathlib.Path(__file__).resolve().parent
 FIXTURES_DIR = UNIT_DIR / "fixtures"
 CACHE_ROOT = None
 RUN = None
-OWNER_LABEL = "org.clec.linux-arm64.run"
 
-PINNED_IMAGES = {
-    "builder_rust": {
-        "tag": "rust:1.89.0-alpine3.22",
-        "ref": "rust@sha256:4b800f2e72e04be908e5f634c504c741bd943b763d1d8ad7b096cc340e1b5b46",
-        "expectedPlatform": "linux/arm64",
-    },
-    "guest_glibc": {
-        "tag": "node:22-bookworm-slim",
-        "ref": "node@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee",
-        "expectedPlatform": "linux/arm64",
-    },
-    "guest_musl": {
-        "tag": "node:22-alpine",
-        "ref": "node@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a",
-        "expectedPlatform": "linux/arm64",
-    },
+
+@dataclass(frozen=True)
+class LinuxProfile:
+    target_tuple: str
+    platform: str
+    rust_target: str
+    elf_machine: str
+    test_args: tuple[str, ...]
+    images: dict[str, str]
+    cargo_tmpfs_mib: int = 0
+
+
+IMAGE_TAGS = {
+    "builder_rust": "rust:1.89.0-alpine3.22",
+    "guest_glibc": "node:22-bookworm-slim",
+    "guest_musl": "node:22-alpine",
 }
+ARM64 = LinuxProfile(
+    "linux-arm64", "linux/arm64", "aarch64-unknown-linux-musl", "AArch64", (),
+    {
+        "builder_rust": "rust@sha256:4b800f2e72e04be908e5f634c504c741bd943b763d1d8ad7b096cc340e1b5b46",
+        "guest_glibc": "node@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee",
+        "guest_musl": "node@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a",
+    },
+)
+X64 = LinuxProfile(
+    "linux-x64", "linux/amd64", "x86_64-unknown-linux-musl", "Advanced Micro Devices X86-64", ("--release",),
+    {
+        "builder_rust": "docker.io/library/rust@sha256:f9617326395be71547efa3c8b8d58b89ff958afc594596713bceb585aabc067e",
+        "guest_glibc": "docker.io/library/node@sha256:47725aca53d3295ec2d3be8f62726599b3033cc262edc2c7e429909b3ac599fc",
+        "guest_musl": "docker.io/library/node@sha256:12f54cafa58d0e96554ae05871e29663ff7241836377dc9a7916449b8adb062c",
+    },
+    cargo_tmpfs_mib=1536,
+)
+PROFILES = {profile.target_tuple: profile for profile in (ARM64, X64)}
+
 
 class VerificationRun:
-    def __init__(self, root):
+    def __init__(self, root, profile=ARM64):
+        self.profile = profile
         self.root = pathlib.Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = self.root / ".driver.lock"
@@ -53,12 +73,19 @@ class VerificationRun:
                     raise RuntimeError("Invalid verification run identity")
                 if record.get("root") != str(self.root):
                     raise RuntimeError("Verification run root changed")
+                if record.get("profile", ARM64.target_tuple) != self.profile.target_tuple:
+                    raise RuntimeError("Verification run profile changed")
             else:
                 if set(self.root.iterdir()) != {self.lock}:
                     raise RuntimeError("Existing output directory has no run identity")
                 self.id = uuid.uuid4().hex
                 with manifest.open("x") as fh:
-                    json.dump({"schemaVersion": 1, "runId": self.id, "root": str(self.root)}, fh)
+                    json.dump({
+                        "schemaVersion": 1,
+                        "runId": self.id,
+                        "root": str(self.root),
+                        "profile": self.profile.target_tuple,
+                    }, fh)
             self.resources = self.root / "resources"
             self.resources.mkdir(exist_ok=True)
         except BaseException:
@@ -67,7 +94,11 @@ class VerificationRun:
 
     @property
     def volume(self):
-        return f"clec-linux-arm64-{self.id}-cargo"
+        return f"clec-{self.profile.target_tuple}-{self.id}-cargo"
+
+    @property
+    def owner_label(self):
+        return f"org.clec.{self.profile.target_tuple}.run"
 
     def close(self):
         os.close(self.lock_fd)
@@ -90,7 +121,10 @@ class VerificationRun:
             idx = cmd.index("--name") + 1
             cmd[idx] = f"{cmd[idx]}-{self.id}"
         cid = self.resources / f"{uuid.uuid4().hex}.cid"
-        return cmd[:2] + ["--label", f"{OWNER_LABEL}={self.id}", "--cidfile", str(cid)] + cmd[2:]
+        return cmd[:2] + [
+            "--pull", "never", "--platform", self.profile.platform,
+            "--label", f"{self.owner_label}={self.id}", "--cidfile", str(cid),
+        ] + cmd[2:]
 
     def inspect_owned(self, kind, identity):
         res = subprocess.run(["docker", kind, "inspect", identity], text=True, capture_output=True, timeout=30)
@@ -100,7 +134,7 @@ class VerificationRun:
             raise RuntimeError(f"Cannot establish resource ownership: {res.stderr}")
         obj = json.loads(res.stdout)[0]
         labels = obj.get("Config", {}).get("Labels", {}) if kind == "container" else obj.get("Labels", {})
-        if not labels or labels.get(OWNER_LABEL) != self.id:
+        if not labels or labels.get(self.owner_label) != self.id:
             raise RuntimeError(f"Resource ownership mismatch: {identity}")
         return obj
 
@@ -146,17 +180,18 @@ def ensure_dirs():
         (CACHE_ROOT / sub).mkdir(parents=True, exist_ok=True)
 
 
-def verify_pinned_images():
+def verify_pinned_images(*roles):
     info = {}
-    for role, meta in PINNED_IMAGES.items():
-        res = run_checked(["docker", "image", "inspect", meta["ref"]])
+    for role in roles:
+        ref = RUN.profile.images[role]
+        res = run_checked(["docker", "image", "inspect", ref])
         insp = json.loads(res.stdout)[0]
         actual_platform = f"{insp.get('Os')}/{insp.get('Architecture')}"
-        if actual_platform != meta["expectedPlatform"]:
-            raise RuntimeError(f"Image {role} platform {actual_platform} != {meta['expectedPlatform']}")
+        if actual_platform != RUN.profile.platform:
+            raise RuntimeError(f"Image {role} platform {actual_platform} != {RUN.profile.platform}")
         info[role] = {
-            "tag": meta["tag"],
-            "ref": meta["ref"],
+            "tag": IMAGE_TAGS[role],
+            "ref": ref,
             "id": insp["Id"],
             "repoDigests": insp.get("RepoDigests", []),
             "platform": actual_platform,
@@ -167,11 +202,9 @@ def verify_pinned_images():
 
 def unit_build():
     ensure_dirs()
-    images_info = verify_pinned_images()
+    images_info = verify_pinned_images("builder_rust")
 
     src_export = CACHE_ROOT / "src-export"
-    if src_export.exists():
-        shutil.rmtree(src_export)
     run_checked(["python3", str(REPO_ROOT / "tools" / "export_cli.py"), str(src_export)])
 
     native_hashes = {}
@@ -184,26 +217,34 @@ def unit_build():
     if native_hashes.get("native/Cargo.lock") != repo_lock_sha:
         raise RuntimeError("Exported Cargo.lock SHA-256 mismatch")
 
-    if RUN.inspect_owned("volume", RUN.volume) is not None:
-        raise RuntimeError("Build volume already exists")
-    run_checked(["docker", "volume", "create", "--label", f"{OWNER_LABEL}={RUN.id}", RUN.volume])
-    RUN.inspect_owned("volume", RUN.volume)
+    if RUN.profile.cargo_tmpfs_mib:
+        cargo_mount = ["--tmpfs", f"/work:exec,rw,nosuid,size={RUN.profile.cargo_tmpfs_mib}m"]
+    else:
+        if RUN.inspect_owned("volume", RUN.volume) is not None:
+            raise RuntimeError("Build volume already exists")
+        run_checked(["docker", "volume", "create", "--label", f"{RUN.owner_label}={RUN.id}", RUN.volume])
+        RUN.inspect_owned("volume", RUN.volume)
+        cargo_mount = ["-v", f"{RUN.volume}:/work:rw"]
 
     bin_dir = CACHE_ROOT / "bin"
     release_out = bin_dir / "release"
-    if release_out.exists():
-        shutil.rmtree(release_out)
-    release_out.mkdir(parents=True, exist_ok=True)
+    release_out.mkdir()
 
+    cargo_args = ["--manifest-path", "/src/native/Cargo.toml", "--locked", "-j", "2"]
+    build_argv = ["cargo", "build", *cargo_args, "--release", "--bins"]
+    test_argv = ["cargo", "test", *cargo_args, *RUN.profile.test_args]
     container_script = r"""
 set -eu
-apk add --no-cache musl-dev file >/tmp/apk.log 2>&1
+apk add --no-cache musl-dev file
 uname -a
 cat /etc/os-release
 rustc --version --verbose
 cargo --version
+test "$(rustc --version | cut -d ' ' -f 2)" = 1.89.0
+test "$(rustc -vV | sed -n 's/^host: //p')" = "$CLEC_RUST_TARGET"
+df -k /work
 echo "===BUILD_START==="
-cargo build --manifest-path /src/native/Cargo.toml --locked --release --bins -j 2
+BUILD_COMMAND
 echo "===BUILD_DONE==="
 for b in clec clec-publish clec-validate; do
   echo "===INSPECT:$b==="
@@ -214,11 +255,14 @@ for b in clec clec-publish clec-validate; do
   cp "/work/target/release/$b" "/out/release/$b"
 done
 echo "===TEST_START==="
-apk add --no-cache openssl python3 >/tmp/apk-test.log 2>&1
-cargo test --manifest-path /src/native/Cargo.toml --locked -j 2
-echo "===TEST_DONE==="
+test_exit=0
+(apk add --no-cache openssl python3 && TEST_COMMAND) || test_exit=$?
+df -k /work
+du -sk /work/target /work/cargo-home
+printf '===TEST_EXIT:%s===\n' "$test_exit"
 """
-    cname = "clec-linux-arm64-builder"
+    container_script = container_script.replace("BUILD_COMMAND", " ".join(build_argv)).replace("TEST_COMMAND", " ".join(test_argv))
+    cname = f"clec-{RUN.profile.target_tuple}-builder"
 
     docker_cmd = [
         "docker",
@@ -232,8 +276,7 @@ echo "===TEST_DONE==="
         "4g",
         "-v",
         f"{src_export}:/src:ro",
-        "-v",
-        f"{RUN.volume}:/work:rw",
+        *cargo_mount,
         "-v",
         f"{bin_dir}:/out:rw",
         "-e",
@@ -244,16 +287,24 @@ echo "===TEST_DONE==="
         "CARGO_BUILD_JOBS=2",
         "-e",
         "CMAKE_BUILD_PARALLEL_LEVEL=2",
-        PINNED_IMAGES["builder_rust"]["ref"],
+        "-e",
+        "RUST_TEST_THREADS=2",
+        "-e",
+        f"CLEC_RUST_TARGET={RUN.profile.rust_target}",
+        RUN.profile.images["builder_rust"],
         "sh",
         "-c",
         container_script,
     ]
-    res = run_process(docker_cmd, text=True, capture_output=True)
-    (CACHE_ROOT / "logs" / "build" / "builder.stdout.log").write_text(res.stdout, encoding="utf-8")
-    (CACHE_ROOT / "logs" / "build" / "builder.stderr.log").write_text(res.stderr, encoding="utf-8")
-    if res.returncode != 0:
-        raise RuntimeError(f"Builder container failed ({res.returncode}); see logs/build/builder.stderr.log")
+    build_logs = CACHE_ROOT / "logs" / "build"
+    docker_argv = RUN.container_command(docker_cmd)
+    with (build_logs / "builder.argv.json").open("x") as log:
+        json.dump(docker_argv, log, indent=2)
+    with (build_logs / "builder.stdout.log").open("x") as stdout, (build_logs / "builder.stderr.log").open("x") as stderr:
+        res = subprocess.run(docker_argv, stdout=stdout, stderr=stderr, timeout=3600)
+    build_stdout = (build_logs / "builder.stdout.log").read_text()
+    if "===BUILD_DONE===" not in build_stdout.splitlines():
+        raise RuntimeError(f"Builder exited {res.returncode} before completing release build; see logs/build")
 
     elf_checks = {}
     for b in ("clec", "clec-publish", "clec-validate"):
@@ -269,10 +320,10 @@ echo "===TEST_DONE==="
                 "none",
                 "--read-only",
                 "--name",
-                f"clec-linux-arm64-elfcheck-{b}",
+                f"clec-{RUN.profile.target_tuple}-elfcheck-{b}",
                 "-v",
                 f"{release_out}:/bins:ro",
-                PINNED_IMAGES["builder_rust"]["ref"],
+                RUN.profile.images["builder_rust"],
                 "sh",
                 "-c",
                 f"readelf -h -l -d /bins/{b}",
@@ -280,8 +331,8 @@ echo "===TEST_DONE==="
         )
         elf_text = inspect_res.stdout + inspect_res.stderr
         (CACHE_ROOT / "logs" / "build" / f"readelf-{b}.log").write_text(elf_text, encoding="utf-8")
-        if "ELF64" not in elf_text or "AArch64" not in elf_text:
-            raise RuntimeError(f"{b} is not ELF64 AArch64")
+        if "ELF64" not in elf_text or RUN.profile.elf_machine not in elf_text:
+            raise RuntimeError(f"{b} is not ELF64 {RUN.profile.elf_machine}")
         if "INTERP" in elf_text or "Requesting program interpreter" in elf_text:
             raise RuntimeError(f"{b} contains PT_INTERP")
         if "NEEDED" in elf_text:
@@ -289,16 +340,16 @@ echo "===TEST_DONE==="
         elf_checks[b] = {
             "bytes": bpath.stat().st_size,
             "sha256": sha256_file(bpath),
-            "elf64Aarch64": True,
+            "elf64Machine": RUN.profile.elf_machine,
             "ptInterpAbsent": True,
             "neededAbsent": True,
         }
 
-    test_results = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", res.stdout)
+    test_results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored", build_stdout)
     total_passed = sum(int(m[0]) for m in test_results)
     total_failed = sum(int(m[1]) for m in test_results)
-    if total_failed != 0 or total_passed == 0:
-        raise RuntimeError(f"Unexpected container cargo test summary: {test_results}")
+    test_exit_marker = re.search(r"^===TEST_EXIT:(\d+)===$", build_stdout, re.MULTILINE)
+    test_exit = int(test_exit_marker[1]) if test_exit_marker else None
 
     git_head = run_checked(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"]).stdout.strip()
     native_commit = run_checked(["git", "-C", str(REPO_ROOT), "log", "-n", "1", "--format=%H", "--", "native/"]).stdout.strip()
@@ -308,22 +359,23 @@ echo "===TEST_DONE==="
         "observationKind": "clec-container-build-observation",
         "gitHead": git_head,
         "nativeTreeCommit": native_commit,
-        "sourceMount": "read-only 38-file export from tools/export_cli.py",
+        "sourceMount": "read-only export from tools/export_cli.py",
+        "exportFileSha256": {
+            p.relative_to(src_export).as_posix(): sha256_file(p)
+            for p in sorted(src_export.rglob("*")) if p.is_file()
+        },
         "cargoLockSha256": repo_lock_sha,
         "nativeInputFileSha256": native_hashes,
         "builderImage": images_info["builder_rust"],
-        "containerArgs": [
-            "--cpus 2",
-            "--memory 4g",
-            "CARGO_BUILD_JOBS=2",
-            "CMAKE_BUILD_PARALLEL_LEVEL=2",
-            "-v src-export:/src:ro",
-        ],
-        "executedCargoBuild": "cargo build --manifest-path /src/native/Cargo.toml --locked --release --bins -j 2",
-        "executedCargoTest": "cargo test --manifest-path /src/native/Cargo.toml --locked -j 2",
+        "containerArgv": docker_argv,
+        "executedCargoBuild": " ".join(build_argv),
+        "cargoTestCommand": " ".join(test_argv),
+        "containerExit": res.returncode,
+        "testStepExit": test_exit,
         "containerCargoTestSuites": len(test_results),
         "containerCargoTestPassed": total_passed,
         "containerCargoTestFailed": total_failed,
+        "containerCargoTestIgnored": sum(int(m[2]) for m in test_results),
         "binaries": elf_checks,
         "logs": {
             "stdout": str(CACHE_ROOT / "logs/build/builder.stdout.log"),
@@ -334,23 +386,25 @@ echo "===TEST_DONE==="
         json.dumps(obs, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps({"unit": "build", "binaries": elf_checks, "testsPassed": total_passed}, indent=2))
+    if res.returncode != 0 or test_exit != 0 or total_failed != 0 or total_passed == 0:
+        raise RuntimeError(f"Test step exit {test_exit}, suite results {test_results}; build observation retained")
 
 
 def unit_stage():
     ensure_dirs()
-    receipt_path = CACHE_ROOT / "receipts" / "linux-arm64-prebuilt-receipt.json"
+    receipt_path = CACHE_ROOT / "receipts" / f"{RUN.profile.target_tuple}-prebuilt-receipt.json"
     run_checked(
         [
             "node",
             str(REPO_ROOT / "cli" / "scripts" / "build-receipt.mjs"),
             "--tuple",
-            "linux-arm64",
+            RUN.profile.target_tuple,
             "--target-dir",
             str(CACHE_ROOT / "bin"),
             "--cargo-lock",
             str(REPO_ROOT / "native" / "Cargo.lock"),
             "--host-baseline",
-            "linux-arm64-alpine-3.22-container",
+            f"{RUN.profile.target_tuple}-alpine-3.22-container",
             "--build-command",
             "cargo build --manifest-path /src/native/Cargo.toml --locked --release --bins -j 2",
             "--out",
@@ -358,30 +412,35 @@ def unit_stage():
         ]
     )
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    if receipt["receiptKind"] != "clec-inspected-prebuilt-receipt":
+    if receipt["schemaVersion"] != 2 or receipt["receiptKind"] != "clec-inspected-prebuilt-receipt":
         raise RuntimeError(f"Expected inspected-prebuilt receipt, got {receipt['receiptKind']}")
-    if receipt["provenance"]["source"]["status"] != "not_verified_unknown":
-        raise RuntimeError("Receipt provenance.source must remain not_verified_unknown")
+    for key in ("source", "buildInvocation"):
+        if receipt["provenance"][key]["status"] != "not_verified_unknown":
+            raise RuntimeError(f"Receipt provenance.{key} must remain not_verified_unknown")
+    identity = receipt["verifiedEmbeddedMetadata"]
+    if (identity["profile"], identity["features"], identity["testHooksIncluded"]) != ("release", [], False):
+        raise RuntimeError(f"Unexpected release binary metadata: {identity}")
+    if not identity["rustcVersion"].startswith("rustc 1.89.0 "):
+        raise RuntimeError(f"Unexpected release compiler: {identity['rustcVersion']}")
 
-    stage_input_path = CACHE_ROOT / "receipts" / "stage-input-linux-arm64.json"
+    stage_input_path = CACHE_ROOT / "receipts" / f"stage-input-{RUN.profile.target_tuple}.json"
     stage_input = {
         "targets": {
-            "linux-arm64": {
+            RUN.profile.target_tuple: {
                 "clec": str(CACHE_ROOT / "bin" / "release" / "clec"),
                 "clecPublish": str(CACHE_ROOT / "bin" / "release" / "clec-publish"),
                 "clecValidate": str(CACHE_ROOT / "bin" / "release" / "clec-validate"),
                 "buildReceipt": str(receipt_path),
-                "executionEvidence": "verified-linux-arm64-container-pending",
+                "executionEvidence": f"verified-{RUN.profile.target_tuple}-container-pending",
             }
         }
     }
     stage_input_path.write_text(json.dumps(stage_input, indent=2) + "\n", encoding="utf-8")
 
     staged_results = []
+    staged_hashes = []
     for idx in (1, 2):
         out_dir = CACHE_ROOT / f"staged-{idx}"
-        if out_dir.exists():
-            shutil.rmtree(out_dir)
         res = run_checked(
             [
                 "node",
@@ -396,11 +455,10 @@ def unit_stage():
             ]
         )
         staged_results.append(json.loads(res.stdout))
+        staged_hashes.append({p.name: sha256_file(p) for p in sorted(out_dir.iterdir())})
 
-    sums1 = sha256_file(CACHE_ROOT / "staged-1" / "SHA256SUMS")
-    sums2 = sha256_file(CACHE_ROOT / "staged-2" / "SHA256SUMS")
-    if sums1 != sums2:
-        raise RuntimeError(f"Non-deterministic staging SHA256SUMS: {sums1} != {sums2}")
+    if staged_hashes[0] != staged_hashes[1]:
+        raise RuntimeError(f"Non-deterministic staging outputs: {staged_hashes}")
 
     inv = json.loads((CACHE_ROOT / "staged-1" / "inventory.json").read_text(encoding="utf-8"))
     prov = json.loads((CACHE_ROOT / "staged-1" / "provenance.json").read_text(encoding="utf-8"))
@@ -410,23 +468,21 @@ def unit_stage():
         raise RuntimeError("Expected inspected-prebuilt provenance classification")
 
     inspect_tmp = CACHE_ROOT / "stage-inspect-tmp"
-    if inspect_tmp.exists():
-        shutil.rmtree(inspect_tmp)
     inspect_tmp.mkdir(parents=True)
     run_checked(["tar", "-xzf", str(CACHE_ROOT / "staged-1" / "clec-cli-1.0.0-dev.0.tgz"), "-C", str(inspect_tmp)])
-    run_checked(["tar", "-xzf", str(CACHE_ROOT / "staged-1" / "clec-v1.0.0-dev.0-linux-arm64.tar.gz"), "-C", str(inspect_tmp)])
+    run_checked(["tar", "-xzf", str(CACHE_ROOT / "staged-1" / f"clec-v1.0.0-dev.0-{RUN.profile.target_tuple}.tar.gz"), "-C", str(inspect_tmp)])
 
     src_skill = sha256_file(REPO_ROOT / "cli" / "skills" / "clec" / "SKILL.md")
     src_readme = sha256_file(REPO_ROOT / "cli" / "README.md")
     for p in (
         inspect_tmp / "package" / "skills" / "clec" / "SKILL.md",
-        inspect_tmp / "clec-v1.0.0-dev.0-linux-arm64" / "skills" / "clec" / "SKILL.md",
+        inspect_tmp / f"clec-v1.0.0-dev.0-{RUN.profile.target_tuple}" / "skills" / "clec" / "SKILL.md",
     ):
         if sha256_file(p) != src_skill:
             raise RuntimeError(f"Skill SHA-256 mismatch in {p}")
     for p in (
         inspect_tmp / "package" / "README.md",
-        inspect_tmp / "clec-v1.0.0-dev.0-linux-arm64" / "README.md",
+        inspect_tmp / f"clec-v1.0.0-dev.0-{RUN.profile.target_tuple}" / "README.md",
     ):
         if sha256_file(p) != src_readme:
             raise RuntimeError(f"README SHA-256 mismatch in {p}")
@@ -434,7 +490,8 @@ def unit_stage():
 
     summary = {
         "unit": "stage",
-        "sha256sumsSha256": sums1,
+        "sha256sumsSha256": staged_hashes[0]["SHA256SUMS"],
+        "outputSha256": staged_hashes[0],
         "deterministic": True,
         "complete": inv["complete"],
         "publishable": inv["publishable"],
@@ -448,41 +505,34 @@ def unit_stage():
 
 def unit_fixtures():
     ensure_dirs()
+    verify_pinned_images("guest_musl")
     maint_dir = CACHE_ROOT / "maintainer-bin"
-    if maint_dir.exists():
-        shutil.rmtree(maint_dir)
     maint_dir.mkdir(parents=True)
     run_checked(
         [
             "tar",
             "-xzf",
-            str(CACHE_ROOT / "staged-1" / "clec-maintainer-v1.0.0-dev.0-linux-arm64.tar.gz"),
+            str(CACHE_ROOT / "staged-1" / f"clec-maintainer-v1.0.0-dev.0-{RUN.profile.target_tuple}.tar.gz"),
             "-C",
             str(maint_dir),
         ]
     )
     cons_dir = CACHE_ROOT / "consumer-bin"
-    if cons_dir.exists():
-        shutil.rmtree(cons_dir)
     cons_dir.mkdir(parents=True)
     run_checked(
         [
             "tar",
             "-xzf",
-            str(CACHE_ROOT / "staged-1" / "clec-v1.0.0-dev.0-linux-arm64.tar.gz"),
+            str(CACHE_ROOT / "staged-1" / f"clec-v1.0.0-dev.0-{RUN.profile.target_tuple}.tar.gz"),
             "-C",
             str(cons_dir),
         ]
     )
 
     rel_dir = CACHE_ROOT / "releases"
-    for sub in ("release-a", "release-b", "release-b-corrupt"):
-        p = rel_dir / sub
-        if p.exists():
-            shutil.rmtree(p)
 
-    maint_inner = f"/maintainer/clec-maintainer-v1.0.0-dev.0-linux-arm64"
-    cons_inner = f"/consumer/clec-v1.0.0-dev.0-linux-arm64"
+    maint_inner = f"/maintainer/clec-maintainer-v1.0.0-dev.0-{RUN.profile.target_tuple}"
+    cons_inner = f"/consumer/clec-v1.0.0-dev.0-{RUN.profile.target_tuple}"
     script = f"""
 set -eu
 {maint_inner}/clec-publish --workspace /fixtures/release-a/workspace --intake /fixtures/release-a/intake.json --output /releases/release-a >/tmp/pub-a.json
@@ -510,7 +560,7 @@ cp /tmp/pub-b.json /releases/publish-b.json
             "--memory",
             "1g",
             "--name",
-            "clec-linux-arm64-publish",
+            f"clec-{RUN.profile.target_tuple}-publish",
             "-v",
             f"{maint_dir}:/maintainer:ro",
             "-v",
@@ -519,7 +569,7 @@ cp /tmp/pub-b.json /releases/publish-b.json
             f"{FIXTURES_DIR}:/fixtures:ro",
             "-v",
             f"{rel_dir}:/releases:rw",
-            PINNED_IMAGES["guest_musl"]["ref"],
+            RUN.profile.images["guest_musl"],
             "sh",
             "-c",
             script,
@@ -555,6 +605,7 @@ cp /tmp/pub-b.json /releases/publish-b.json
 
 def unit_guests():
     ensure_dirs()
+    images = verify_pinned_images("guest_glibc", "guest_musl")
     clec_sha = sha256_file(CACHE_ROOT / "bin" / "release" / "clec")
     skill_sha = sha256_file(REPO_ROOT / "cli" / "skills" / "clec" / "SKILL.md")
     readme_sha = sha256_file(REPO_ROOT / "cli" / "README.md")
@@ -563,9 +614,7 @@ def unit_guests():
     receipts = {}
     for libc_label, img_role in (("glibc", "guest_glibc"), ("musl", "guest_musl")):
         out_dir = CACHE_ROOT / "logs" / libc_label
-        if out_dir.exists():
-            shutil.rmtree(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir()
         cmd = [
             "docker",
             "run",
@@ -580,7 +629,7 @@ def unit_guests():
             "--memory",
             "1g",
             "--name",
-            f"clec-linux-arm64-guest-{libc_label}",
+            f"clec-{RUN.profile.target_tuple}-guest-{libc_label}",
             "-v",
             f"{CACHE_ROOT / 'staged-1'}:/staged:ro",
             "-v",
@@ -594,6 +643,12 @@ def unit_guests():
             "-e",
             "HOME=/tmp/clec-home",
             "-e",
+            "NPM_CONFIG_USERCONFIG=/tmp/clec-home/user.npmrc",
+            "-e",
+            "NPM_CONFIG_GLOBALCONFIG=/tmp/clec-home/global.npmrc",
+            "-e",
+            f"CLEC_TUPLE={RUN.profile.target_tuple}",
+            "-e",
             f"CLEC_LIBC_LABEL={libc_label}",
             "-e",
             f"CLEC_EXPECTED_SHA256={clec_sha}",
@@ -601,7 +656,7 @@ def unit_guests():
             f"CLEC_SKILL_SHA256={skill_sha}",
             "-e",
             f"CLEC_README_SHA256={readme_sha}",
-            PINNED_IMAGES[img_role]["ref"],
+            RUN.profile.images[img_role],
             "sh",
             "-c",
             "mkdir -p /tmp/clec-home && node /verify/guest_verify.mjs",
@@ -617,14 +672,16 @@ def unit_guests():
 
     if receipts["glibc"]["installedBinarySha256"] != receipts["musl"]["installedBinarySha256"]:
         raise RuntimeError("Installed static binary SHA-256 differs between glibc and musl guests")
-    print(json.dumps({"unit": "guests", "glibc": "PASS", "musl": "PASS", "sha256": clec_sha}, indent=2))
+    summary = {"unit": "guests", "images": images, "glibc": "PASS", "musl": "PASS", "sha256": clec_sha}
+    (CACHE_ROOT / "receipts" / "guests.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
 
 
 def unit_cleanup():
     removed_containers, removed_volumes = RUN.cleanup_resources()
 
     removed_dirs = []
-    for sub in ("src-export", "maintainer-bin", "consumer-bin", "docker-cfg"):
+    for sub in ("maintainer-bin", "consumer-bin"):
         p = CACHE_ROOT / sub
         if p.exists():
             shutil.rmtree(p)
@@ -649,14 +706,16 @@ def main():
         default="all",
     )
     parser.add_argument("--run-root", type=pathlib.Path, help="Dedicated run directory; completed or failed units cannot be repeated here")
+    parser.add_argument("--profile", choices=PROFILES, default=ARM64.target_tuple)
     args = parser.parse_args()
+    profile = PROFILES[args.profile]
     if args.run_root is None:
-        parent = REPO_ROOT / ".cache" / "phase6-linux-arm64-runs"
+        parent = REPO_ROOT / ".cache" / f"phase6-{profile.target_tuple}-runs"
         parent.mkdir(parents=True, exist_ok=True)
         root = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=parent))
     else:
         root = args.run_root
-    RUN = VerificationRun(root)
+    RUN = VerificationRun(root, profile)
     CACHE_ROOT = RUN.root
     print(json.dumps({"runId": RUN.id, "runRoot": str(CACHE_ROOT)}), flush=True)
     units = {"build": unit_build, "stage": unit_stage, "fixtures": unit_fixtures, "guests": unit_guests, "cleanup": unit_cleanup}

@@ -19,6 +19,14 @@ const FIXTURES_DIR = process.env.CLEC_FIXTURES_DIR ?? '/fixtures';
 const WORK_DIR = process.env.CLEC_WORK_DIR ?? '/tmp/clec-work';
 const OUT_DIR = process.env.CLEC_OUT_DIR ?? '/out';
 const LIBC_LABEL = process.env.CLEC_LIBC_LABEL ?? 'unknown';
+const TUPLE = process.env.CLEC_TUPLE ?? 'linux-arm64';
+const TARGETS = new Map([
+  ['linux-arm64', { machine: 183, wrongMachine: 62, interpreter: '/lib/ld-musl-aarch64.so.1' }],
+  ['linux-x64', { machine: 62, wrongMachine: 183, interpreter: '/lib/ld-musl-x86_64.so.1' }],
+]);
+const target = TARGETS.get(TUPLE);
+assert.ok(target, `Unsupported verification tuple: ${TUPLE}`);
+assert.equal(`${process.platform}-${process.arch}`, TUPLE);
 const EXPECTED_CLEC_SHA256 = process.env.CLEC_EXPECTED_SHA256;
 const EXPECTED_SKILL_SHA256 = process.env.CLEC_SKILL_SHA256;
 const EXPECTED_README_SHA256 = process.env.CLEC_README_SHA256;
@@ -73,6 +81,12 @@ function parseJsonStdout(res, label) {
   return JSON.parse(res.stdout);
 }
 
+function assertCommandParity(installed, direct) {
+  for (const field of ['status', 'stdout', 'stderr']) {
+    assert.equal(direct[field], installed[field], `Installed and direct ${installed.args.join(' ')} differ on ${field}`);
+  }
+}
+
 function collectEnvironment() {
   const uname = runCmd('uname', ['-a']);
   const osRelease = existsSync('/etc/os-release') ? readFileSync('/etc/os-release', 'utf8') : '';
@@ -110,7 +124,9 @@ function runNegativeInstallerControls(tgzPath, directClecPath) {
   const igExec = recordRun('neg-ignore-scripts-exec', ignoredBin, ['--version'], {
     env: { PATH: '/nonexistent-empty-path' },
   });
-  assert.notEqual(igExec.status, 0, 'placeholder installed under --ignore-scripts must fail non-zero');
+  assert.equal(readFileSync(ignoredBin)[0], 0, '--ignore-scripts must leave the package placeholder');
+  assert.ok(igExec.status === 127 || igExec.error?.endsWith(' ENOEXEC'),
+    'placeholder installed under --ignore-scripts must fail to execute');
 
   const unpackedDir = join(negRoot, 'unpacked');
   mkdirSync(unpackedDir, { recursive: true });
@@ -121,7 +137,7 @@ function runNegativeInstallerControls(tgzPath, directClecPath) {
   const badShaDir = join(negRoot, 'pkg-bad-sha');
   cpSync(pkgDir, badShaDir, { recursive: true });
   const invBadSha = JSON.parse(readFileSync(join(badShaDir, 'inventory.json'), 'utf8'));
-  invBadSha.targets['linux-arm64'].sha256 = '0'.repeat(64);
+  invBadSha.targets[TUPLE].sha256 = '0'.repeat(64);
   writeFileSync(join(badShaDir, 'inventory.json'), JSON.stringify(invBadSha, null, 2));
   const badShaRes = recordRun('neg-install-bad-sha', 'node', [join(badShaDir, 'scripts', 'install.mjs')]);
   assert.notEqual(badShaRes.status, 0, 'corrupt inventory sha256 must fail install.mjs');
@@ -130,30 +146,30 @@ function runNegativeInstallerControls(tgzPath, directClecPath) {
 
   const wrongTupleDir = join(negRoot, 'pkg-wrong-tuple');
   cpSync(pkgDir, wrongTupleDir, { recursive: true });
-  const x64Elf = Buffer.alloc(128, 0);
-  x64Elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1], 0);
-  x64Elf.writeUInt16LE(3, 16);
-  x64Elf.writeUInt16LE(62, 18);
-  x64Elf.writeUInt32LE(1, 20);
-  x64Elf.writeUInt16LE(64, 52);
-  const payloadPath = join(wrongTupleDir, 'payloads', 'linux-arm64', 'clec');
-  writeFileSync(payloadPath, x64Elf);
+  const wrongArchElf = Buffer.alloc(128, 0);
+  wrongArchElf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1], 0);
+  wrongArchElf.writeUInt16LE(3, 16);
+  wrongArchElf.writeUInt16LE(target.wrongMachine, 18);
+  wrongArchElf.writeUInt32LE(1, 20);
+  wrongArchElf.writeUInt16LE(64, 52);
+  const payloadPath = join(wrongTupleDir, 'payloads', TUPLE, 'clec');
+  writeFileSync(payloadPath, wrongArchElf);
   const invWrong = JSON.parse(readFileSync(join(wrongTupleDir, 'inventory.json'), 'utf8'));
-  invWrong.targets['linux-arm64'].bytes = x64Elf.length;
-  invWrong.targets['linux-arm64'].sha256 = sha256Buf(x64Elf);
+  invWrong.targets[TUPLE].bytes = wrongArchElf.length;
+  invWrong.targets[TUPLE].sha256 = sha256Buf(wrongArchElf);
   writeFileSync(join(wrongTupleDir, 'inventory.json'), JSON.stringify(invWrong, null, 2));
   const wrongRes = recordRun('neg-install-wrong-arch', 'node', [join(wrongTupleDir, 'scripts', 'install.mjs')]);
-  assert.notEqual(wrongRes.status, 0, 'x64 ELF in linux-arm64 slot must fail install.mjs');
+  assert.notEqual(wrongRes.status, 0, `Wrong ELF machine in ${TUPLE} slot must fail install.mjs`);
   assert.match(wrongRes.stderr, /Executable format\/architecture mismatch/);
   assert.equal(readFileSync(join(wrongTupleDir, 'bin', 'clec.exe'))[0], 0);
 
   const interpDir = join(negRoot, 'pkg-pt-interp');
   cpSync(pkgDir, interpDir, { recursive: true });
-  const interpStr = Buffer.from('/lib/ld-musl-aarch64.so.1\0', 'utf8');
+  const interpStr = Buffer.from(`${target.interpreter}\0`, 'utf8');
   const interpElf = Buffer.alloc(64 + 56 + interpStr.length, 0);
   interpElf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1], 0);
   interpElf.writeUInt16LE(3, 16);
-  interpElf.writeUInt16LE(183, 18);
+  interpElf.writeUInt16LE(target.machine, 18);
   interpElf.writeUInt32LE(1, 20);
   interpElf.writeBigUInt64LE(64n, 32);
   interpElf.writeUInt16LE(64, 52);
@@ -163,10 +179,10 @@ function runNegativeInstallerControls(tgzPath, directClecPath) {
   interpElf.writeBigUInt64LE(120n, 72);
   interpElf.writeBigUInt64LE(BigInt(interpStr.length), 96);
   interpStr.copy(interpElf, 120);
-  writeFileSync(join(interpDir, 'payloads', 'linux-arm64', 'clec'), interpElf);
+  writeFileSync(join(interpDir, 'payloads', TUPLE, 'clec'), interpElf);
   const invInterp = JSON.parse(readFileSync(join(interpDir, 'inventory.json'), 'utf8'));
-  invInterp.targets['linux-arm64'].bytes = interpElf.length;
-  invInterp.targets['linux-arm64'].sha256 = sha256Buf(interpElf);
+  invInterp.targets[TUPLE].bytes = interpElf.length;
+  invInterp.targets[TUPLE].sha256 = sha256Buf(interpElf);
   writeFileSync(join(interpDir, 'inventory.json'), JSON.stringify(invInterp, null, 2));
   const interpRes = recordRun('neg-install-pt-interp', 'node', [join(interpDir, 'scripts', 'install.mjs')]);
   assert.notEqual(interpRes.status, 0, 'ELF with PT_INTERP must fail musl-static install.mjs');
@@ -202,15 +218,22 @@ function spawnConcurrentSync(bin, args, env) {
 
 async function main() {
   const envInfo = collectEnvironment();
+  if (LIBC_LABEL === 'glibc') {
+    assert.ok(envInfo.glibcVersionRuntime, 'Node must report its glibc runtime');
+  } else if (LIBC_LABEL === 'musl') {
+    assert.equal(envInfo.glibcVersionRuntime, null);
+    assert.match(envInfo.lddVersion, /musl libc/);
+  }
 
   const tgzPath = join(STAGED_DIR, 'clec-cli-1.0.0-dev.0.tgz');
-  const consumerArchive = join(STAGED_DIR, 'clec-v1.0.0-dev.0-linux-arm64.tar.gz');
+  const consumerName = `clec-v1.0.0-dev.0-${TUPLE}`;
+  const consumerArchive = join(STAGED_DIR, `${consumerName}.tar.gz`);
   const directExtract = join(WORK_DIR, 'consumer-direct');
   rmSync(directExtract, { recursive: true, force: true });
   mkdirSync(directExtract, { recursive: true });
   const extractRes = runCmd('tar', ['-xzf', consumerArchive, '-C', directExtract]);
   assert.equal(extractRes.status, 0, `consumer archive extract failed: ${extractRes.stderr}`);
-  const directClec = join(directExtract, 'clec-v1.0.0-dev.0-linux-arm64', 'clec');
+  const directClec = join(directExtract, consumerName, 'clec');
   assert.equal(sha256File(directClec), EXPECTED_CLEC_SHA256);
 
   const negativeControls = runNegativeInstallerControls(tgzPath, directClec);
@@ -246,13 +269,17 @@ async function main() {
   const verInstalled = recordRun('empty-path-version-installed', installedBin, ['--version'], { env: emptyPathEnv });
   const verDirect = recordRun('empty-path-version-direct', directClec, ['--version'], { env: emptyPathEnv });
   assert.equal(verInstalled.status, 0);
-  assert.equal(verInstalled.stdout, verDirect.stdout);
+  assertCommandParity(verInstalled, verDirect);
   assert.match(verInstalled.stdout, /1\.0\.0-dev\.0/);
 
   const helpRes = recordRun('empty-path-help', installedBin, ['--help'], { env: emptyPathEnv });
+  const helpDirect = recordRun('empty-path-help-direct', directClec, ['--help'], { env: emptyPathEnv });
   assert.equal(helpRes.status, 0);
+  assertCommandParity(helpRes, helpDirect);
 
   const schemaRes = recordRun('empty-path-schema-no-home', installedBin, ['schema'], { env: emptyPathEnv });
+  const schemaDirect = recordRun('empty-path-schema-direct', directClec, ['schema'], { env: emptyPathEnv });
+  assertCommandParity(schemaRes, schemaDirect);
   const schemaJson = parseJsonStdout(schemaRes, 'schema');
   assert.equal(schemaJson.data.defaultConfigured, false);
   assert.equal(schemaJson.data.providerVerified, false);
@@ -265,7 +292,12 @@ async function main() {
     cwd: noHomeCwd,
     env: emptyPathEnv,
   });
+  const statusDirect = recordRun('empty-path-status-no-home-direct', directClec, ['status'], {
+    cwd: noHomeCwd,
+    env: emptyPathEnv,
+  });
   assert.equal(noHomeStatus.status, 4);
+  assertCommandParity(noHomeStatus, statusDirect);
   const noHomeErr = JSON.parse(noHomeStatus.stderr);
   assert.equal(noHomeErr.error.code, 'INVALID_DATA_DIR');
   assert.equal(existsSync(join(noHomeCwd, '.local')), false, 'must not create ./.local fallback');
@@ -364,7 +396,7 @@ async function main() {
     { env: emptyPathEnv },
   );
   assert.equal(searchInstalled.status, 0);
-  assert.equal(searchInstalled.stdout, searchDirect.stdout, 'installed vs direct search stdout must match byte-for-byte');
+  assertCommandParity(searchInstalled, searchDirect);
 
   const searchJson = JSON.parse(searchInstalled.stdout);
   assert.equal(searchJson.data.mode, 'local');
@@ -386,12 +418,14 @@ async function main() {
     { env: emptyPathEnv },
   );
   assert.equal(readPassageInstalled.status, 0);
-  assert.equal(readPassageInstalled.stdout, readPassageDirect.stdout, 'installed vs direct read stdout must match');
+  assertCommandParity(readPassageInstalled, readPassageDirect);
 
   const readPassageJson = JSON.parse(readPassageInstalled.stdout);
   const passageItem = readPassageJson.data.items[0];
   assert.equal(passageItem.kind, 'passage');
   const rawDocABytes = readFileSync(join(FIXTURES_DIR, 'release-a', 'workspace', 'doc_a.txt'));
+  assert.deepEqual(rawDocABytes.subarray(0, 3), Buffer.from([0xef, 0xbb, 0xbf]));
+  assert.ok(rawDocABytes.includes(Buffer.from('\r\n')), 'fixture must contain CRLF');
   const spanSlice = Buffer.concat(
     passageItem.spans.map((s) => rawDocABytes.subarray(s.startByte, s.endByte)),
   ).toString('utf8');
@@ -413,18 +447,19 @@ async function main() {
 
   const allPassageIds = searchJson.data.hits.map((h) => h.passageId);
   assert.ok(allPassageIds.length >= 2);
-  const smallBudgetSearch = parseJsonStdout(
-    recordRun(
-      'empty-path-search-omission-budget',
-      installedBin,
-      ['--offline', '--max-bytes', '4000', '--data-dir', dataDir, 'search', '0050 QQQ 4%', '退休 提領 😀'],
-      { env: emptyPathEnv },
-    ),
-    'search small --max-bytes',
+  const smallBudgetRun = recordRun(
+    'empty-path-search-omission-budget',
+    installedBin,
+    ['--offline', '--max-bytes', '4000', '--data-dir', dataDir, 'search', '0050 QQQ 4%', '退休 提領 😀'],
+    { env: emptyPathEnv },
   );
+  const smallBudgetSearch = parseJsonStdout(smallBudgetRun, 'search small --max-bytes');
+  assert.ok(Buffer.byteLength(smallBudgetRun.stdout) <= 4000, 'search stdout must fit the byte budget');
   assert.ok(smallBudgetSearch.data.budget.omittedCount > 0, 'small --max-bytes must report whole-item omission');
   assert.ok(smallBudgetSearch.data.budget.omittedIds.length > 0, 'small --max-bytes must populate omittedIds');
 
+  const activeSqlite = join(dataDir, `${releaseAHash}.sqlite`);
+  const activeSqliteSha = sha256File(activeSqlite);
   const corruptSync = recordRun(
     'empty-path-sync-corrupt-b-rollback',
     installedBin,
@@ -439,6 +474,7 @@ async function main() {
     'status after rollback',
   );
   assert.equal(statusAfterRollback.data.activeRelease, releaseAHash);
+  assert.equal(sha256File(activeSqlite), activeSqliteSha, 'rollback must preserve the active snapshot bytes');
   assert.deepEqual(readFileSync(unknownMarkerPath), unknownMarkerBytes);
   assert.deepEqual(readFileSync(unrelatedSqlitePath), unrelatedSqliteBytes);
 
@@ -452,7 +488,12 @@ async function main() {
     'sync release-b',
   );
   assert.notEqual(syncB.data.release, releaseAHash);
-  assert.equal(existsSync(join(dataDir, `${releaseAHash}.sqlite`)), false, 'prior native active sqlite cleaned up');
+  const statusAfterActivation = parseJsonStdout(
+    recordRun('empty-path-status-after-activation', installedBin, ['--data-dir', dataDir, 'status'], { env: emptyPathEnv }),
+    'status after activation',
+  );
+  assert.equal(statusAfterActivation.data.activeRelease, syncB.data.release);
+  assert.equal(existsSync(activeSqlite), false, 'prior native active sqlite cleaned up');
   assert.deepEqual(readFileSync(unknownMarkerPath), unknownMarkerBytes, 'unknown marker file preserved');
   assert.deepEqual(readFileSync(unrelatedSqlitePath), unrelatedSqliteBytes, 'unrelated 71-char sqlite preserved');
 

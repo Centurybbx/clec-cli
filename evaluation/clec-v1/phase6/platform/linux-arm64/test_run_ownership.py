@@ -30,6 +30,20 @@ class RunOwnershipTests(unittest.TestCase):
             finally:
                 resumed.close()
 
+    def test_profiles_cannot_adopt_each_others_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "run"
+            run = DRIVER.VerificationRun(root, DRIVER.X64)
+            cmd = run.container_command(["docker", "run", "image", "true"])
+            self.assertEqual(cmd[cmd.index("--platform") + 1], "linux/amd64")
+            self.assertEqual(cmd[cmd.index("--pull") + 1], "never")
+            self.assertIn(f"org.clec.linux-x64.run={run.id}", cmd)
+            run.close()
+            with self.assertRaisesRegex(RuntimeError, "run profile changed"):
+                DRIVER.VerificationRun(root)
+            resumed = DRIVER.VerificationRun(root, DRIVER.X64)
+            resumed.close()
+
     def test_failed_unit_evidence_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = DRIVER.VerificationRun(pathlib.Path(tmp) / "run")
@@ -67,10 +81,10 @@ class RunOwnershipTests(unittest.TestCase):
                 commands.append(cmd)
                 if cmd[:3] == ["docker", "container", "inspect"]:
                     self.assertEqual(cmd[-1], own_id)
-                    return subprocess.CompletedProcess(cmd, 0, json.dumps([{"Config": {"Labels": {DRIVER.OWNER_LABEL: first.id}}}]), "")
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps([{"Config": {"Labels": {first.owner_label: first.id}}}]), "")
                 if cmd[:3] == ["docker", "volume", "inspect"]:
                     self.assertEqual(cmd[-1], first.volume)
-                    return subprocess.CompletedProcess(cmd, 0, json.dumps([{"Labels": {DRIVER.OWNER_LABEL: first.id}}]), "")
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps([{"Labels": {first.owner_label: first.id}}]), "")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
 
             try:
@@ -89,7 +103,7 @@ class RunOwnershipTests(unittest.TestCase):
             run = DRIVER.VerificationRun(pathlib.Path(tmp) / "run")
             try:
                 (run.resources / "bad.cid").write_text("f" * 64)
-                foreign = subprocess.CompletedProcess([], 0, json.dumps([{"Config": {"Labels": {DRIVER.OWNER_LABEL: "foreign"}}}]), "")
+                foreign = subprocess.CompletedProcess([], 0, json.dumps([{"Config": {"Labels": {run.owner_label: "foreign"}}}]), "")
                 with patch.object(DRIVER.subprocess, "run", return_value=foreign) as mock:
                     with self.assertRaisesRegex(RuntimeError, "ownership mismatch"):
                         run.cleanup_resources()
@@ -109,7 +123,7 @@ class RunOwnershipTests(unittest.TestCase):
                 cmd = ["docker", "run", "--rm", "--name", "clec-linux-arm64-guest", "image", "true"]
                 a, b = first.container_command(cmd), second.container_command(cmd)
                 self.assertNotEqual(a[a.index("--name") + 1], b[b.index("--name") + 1])
-                self.assertIn(f"{DRIVER.OWNER_LABEL}={first.id}", a)
+                self.assertIn(f"{first.owner_label}={first.id}", a)
                 self.assertEqual(pathlib.Path(a[a.index("--cidfile") + 1]).parent, first.resources)
                 self.assertEqual(cmd, ["docker", "run", "--rm", "--name", "clec-linux-arm64-guest", "image", "true"])
             finally:
