@@ -29,7 +29,25 @@ import bench
 import eval as phase3_eval
 import projection
 import score
+import score_routes
 import verify_local
+
+
+class EvidenceRouteTest(unittest.TestCase):
+    def test_requires_a_complete_route_and_does_not_mix_branches(self) -> None:
+        one_obligation = [{"id": "bridge", "kind": "required", "routes": [["a", "b"], ["c", "d"]]}]
+        mixed = score_routes.score_obligations(one_obligation, {"a", "d"}.__contains__)
+        self.assertFalse(mixed["allEvidence"])
+        self.assertEqual(mixed["evidenceRecall"], 0)
+        for route in ({"a", "b"}, {"c", "d"}):
+            complete = score_routes.score_obligations(one_obligation, route.__contains__)
+            self.assertTrue(complete["allEvidence"])
+            self.assertEqual(complete["evidenceRecall"], 1)
+
+    def test_unanswerable_cases_do_not_count_as_full_retrieval(self) -> None:
+        result = score_routes.score_obligations([], set().__contains__)
+        self.assertIsNone(result["evidenceRecall"])
+        self.assertIsNone(result["allEvidence"])
 
 
 class LocalVerificationTest(unittest.TestCase):
