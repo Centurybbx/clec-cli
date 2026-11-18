@@ -41,7 +41,7 @@ The artifact-admission fix was implemented in two verifiable commits on top of c
 2. **Production default endpoint (`OPEN`).** `BUILTIN_DEFAULT_MANIFEST_URL` stays `None` (`schema.defaultConfigured` is `false`). No public `clec-native-v2` release endpoint exists yet.
 3. **Stage 3 retrieval quality (`FAILED` / `OPEN`).** `P3-QUALITY-CRITICAL-CONDITIONS` and `P3-QUALITY-EXACT-TOP5-CHAINS` remain open. The Stage 3 holdout is consumed and closed; no private Phase 3 labels, frozen questions, outcomes, blind sets, or reviews are read or rerun.
 4. **Cross-OS platform support (`OPEN`, partially verified).** Local `darwin-arm64`, `darwin-x64` under Rosetta on macOS 26.4.1, and Linux ARM64 and x64 glibc/musl containers on Apple Silicon are accepted. The platform reports record independent reviews and evidence. Physical Intel, older macOS, bare-metal Linux, and `win32-x64` (`x86_64-pc-windows-msvc`) remain open. The macOS x64 binary's 10.12 load command needs reconciliation with its direct import of the macOS 10.14 API `SecTrustEvaluateWithError` before claiming a minimum macOS version.
-5. **Stage 6B host-answer quality (`OPEN`).** Deferred to an independent follow-up unit after Stage 6A acceptance. Stage 6A authors the distributable Skill and a concise Stage 6B preregistration draft without running host-answer author, runtime, or judge evaluations.
+5. **Stage 6B host-answer quality (`OPEN`).** The synthetic host preparation passed independent review and is integrated. An authorized public smoke on an entitled Pi model remains pending. The 24-case evaluation remains a preregistration draft. [Host preparation acceptance](phase6b-unit4-report.md)
 
 ## Source hazards tracked for Stage 6A
 

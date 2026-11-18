@@ -1,6 +1,12 @@
 # Stage 6B Unit 4 host preparation
 
-The verified source is `a4a7118f29081a1f344291389ec2d3053bfb5203` on integrated base `6dc8cff626cc8590321265fc4018d49f132013c0`. The migrated macOS arm64 host used the installed native CLI and Skill, Node v25.7.0, and Pi 1.5.2 against scripted IPv4 loopback. Independent GPT 6.2 Astra P0/P1 review remains pending. This evidence covers synthetic execution and closure. Actual-host evaluation and quality remain open.
+The verified source is `a4a7118f29081a1f344291389ec2d3053bfb5203` on integrated base `6dc8cff626cc8590321265fc4018d49f132013c0`. The migrated macOS arm64 host used the installed native CLI and Skill, Node v25.7.0, and Pi 1.5.2 against scripted IPv4 loopback. This evidence covers synthetic execution and closure. Actual-host evaluation and quality remain open.
+
+## Independent acceptance
+
+GPT 6.2 Astra accepted `d207a2929d1b471d090dc4e72cc2298f0d8bac63` for synthetic host preparation on pinned macOS arm64. The reviewer reproduced no P0 or P1. Focused tests confirmed the action boundary, exact tool results, drift rejection, and ninth-call denial. The independent cleanup scan found no survivors among 74 recorded PIDs and 32 PGIDs. The coordinator fast-forwarded to the accepted commit. [Independent replay](/private/tmp/clec-6b4-review.SZUYMr/replay.sh) · [Process scan](/private/tmp/clec-6b4-review.SZUYMr/process-scan.json)
+
+The reviewer recorded the `schema` limit as P2. Its full response requires 37,408 bytes. At the frozen 32,768-byte cap it returns `OUTPUT_BUDGET_TOO_SMALL` and consumes one attempt. All six help targets succeeded at the cap. An independent mixed run reached filtered search, sources, passage read, and original read within eight calls. Actual provider smoke and host-answer quality remain open. [Direct sizes](/private/tmp/clec-6b4-review.SZUYMr/direct.json) · [Mixed run](/private/tmp/clec-6b4-review.SZUYMr/mixed.json)
 
 ## Migration
 
