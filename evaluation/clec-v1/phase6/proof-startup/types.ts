@@ -345,8 +345,8 @@ export interface ProofRunResult {
 	readonly uncertified: boolean;
 	readonly rawArtifacts: {
 		readonly journalPath: string;
-		readonly piStdoutPath: string;
-		readonly piStderrPath: string;
+		readonly piStdoutPath: string | null;
+		readonly piStderrPath: string | null;
 	};
 	readonly closureBeforeSha256: Sha256Hex;
 	readonly closureAfterSha256: Sha256Hex | null;

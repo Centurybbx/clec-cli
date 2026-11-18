@@ -1177,7 +1177,7 @@ setInterval(() => {
 			);
 			const h1 = sha256FileStreaming(r1.rawArtifacts.journalPath).sha256;
 			const idx1 = sha256FileStreaming(r1.indexEntryPath).sha256;
-			assert(existsSync(r1.rawArtifacts.piStderrPath), "zero-byte pi.stderr.bin must exist");
+			assert(r1.rawArtifacts.piStderrPath !== null && existsSync(r1.rawArtifacts.piStderrPath), "zero-byte pi.stderr.bin must exist");
 
 			const r2 = await runUnit1Proof(
 				{ caseLabel: "ownership_run_2", evidenceParentDir, question: "Second run.", mockBaseUrl: srv.baseUrl },
@@ -1236,6 +1236,12 @@ setInterval(() => {
 			);
 			assert(second.status === "PreWorkInfrastructureFailed", `expected collision rejection, got ${second.status}`);
 			assert(sha256FileStreaming(first.rawArtifacts.journalPath).sha256 === firstJournalSha, "collision modified first run journal");
+			const rejected = JSON.parse(readFileSync(second.indexEntryPath, "utf8"));
+			assert(rejected.runId === second.runId, "duplicate attempt index must identify the rejected run");
+			assert(rejected.rawArtifacts.journalPath === join(second.bundleDir, "collision.journal.jsonl"), "duplicate attempt must index its own journal");
+			assert(rejected.rawArtifacts.piStdoutPath === null && rejected.rawArtifacts.piStderrPath === null, "duplicate attempt never starts Pi");
+			const [record] = readFileSync(rejected.rawArtifacts.journalPath, "utf8").split("\n");
+			assert(JSON.parse(record).runId === second.runId, "indexed journal must belong to the rejected run");
 			return { detail: "All 4 precreated agentDir files + duplicate AttemptId rejected without overwrite", result: second, serverRequests: srv.requests };
 		} finally {
 			await srv.close();
@@ -1284,6 +1290,7 @@ process.exit(0);`,
 				},
 				{ cachedClosure: closureBefore },
 			);
+			assert(rStderr.rawArtifacts.piStderrPath !== null, "Pi stderr capture must exist");
 			const piStderrSize = statSync(rStderr.rawArtifacts.piStderrPath).size;
 			assert(piStderrSize === UNIT1_LIMITS.piStderrBytes, `expected exact ${UNIT1_LIMITS.piStderrBytes} prefix, got ${piStderrSize}`);
 			assert(rStderr.uncertified, "Pi stderr overflow must mark uncertified");

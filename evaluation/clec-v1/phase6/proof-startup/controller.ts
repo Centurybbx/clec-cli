@@ -206,7 +206,8 @@ export async function runUnit1Proof(
 		createExclusiveDir(captureDir);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		const collisionJournal = new BoundedJournalWriter({ path: join(bundleDir, "collision.journal.jsonl") });
+		const collisionJournalPath = join(bundleDir, "collision.journal.jsonl");
+		const collisionJournal = new BoundedJournalWriter({ path: collisionJournalPath });
 		await collisionJournal.append(
 			{
 				runId,
@@ -240,7 +241,7 @@ export async function runUnit1Proof(
 			piExitCode: null,
 			piSignal: null,
 			uncertified: true,
-			rawArtifacts: { journalPath, piStdoutPath, piStderrPath },
+			rawArtifacts: { journalPath: collisionJournalPath, piStdoutPath: null, piStderrPath: null },
 			closureBeforeSha256: closureBefore.closureDigest,
 			closureAfterSha256: null,
 		});
@@ -1520,12 +1521,13 @@ export async function runUnit1Proof(
 }
 
 async function publishAttemptIndex(result: ProofRunResult): Promise<ProofRunResult> {
+	const snapshot = structuredClone(result);
 	try {
-		await publishExclusiveIndex(result.indexEntryPath, JSON.stringify(result, null, 2));
-		return result;
+		await publishExclusiveIndex(snapshot.indexEntryPath, JSON.stringify(snapshot, null, 2));
+		return snapshot;
 	} catch (err) {
 		return {
-			...result, status: "InvalidEvidence", uncertified: true,
+			...snapshot, status: "InvalidEvidence", uncertified: true,
 			indexPublicationError: err instanceof Error ? err.message : String(err),
 		};
 	}

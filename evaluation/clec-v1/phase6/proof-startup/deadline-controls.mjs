@@ -811,6 +811,56 @@ async function indexPublication(dir, fail) {
   }
 }
 
+async function lateReapDuringPublication(dir) {
+  const server = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Public synthetic answer." }));
+  let pi;
+  let kill;
+  let reapAt;
+  cp.spawn = (...args) => {
+    const child = originalSpawn(...args);
+    if (args[1]?.includes("--mode")) {
+      pi = { child, exited: once(child, "exit") };
+      kill = child.kill.bind(child);
+      child.kill = () => false;
+    }
+    return child;
+  };
+  syncBuiltinESMExports();
+  try {
+    fileHandle.write = async function (buffer, ...args) {
+      if (buffer.includes(Buffer.from('"indexEntryPath":'))) {
+        assert.equal(JSON.parse(buffer.toString()).piStop.reapedAt, null);
+        assert.equal(pi.child.exitCode, null);
+        assert.equal(pi.child.signalCode, null);
+        kill("SIGKILL");
+        await bounded(pi.exited);
+        reapAt = performance.now();
+      }
+      return actualWrite.call(this, buffer, ...args);
+    };
+    const result = await runUnit1Proof({
+      caseLabel: "late reap during index publication", evidenceParentDir: dir,
+      question: "Public synthetic control.", mockBaseUrl: server.baseUrl,
+      faults: { caseDeadlineMsOverride: 200, injectJournalFailOnKind: "provider_grant" },
+    }, { cachedClosure: closure });
+    const indexed = JSON.parse(fs.readFileSync(result.indexEntryPath, "utf8"));
+    assert.equal(result.uncertified, true);
+    assert.ok(reapAt > result.piStop.observationDeadline);
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), indexed);
+    assert.deepEqual(observeOwned([pi.child.pid], []), []);
+    return { reapAt, indexed, result };
+  } finally {
+    fileHandle.write = actualWrite;
+    cp.spawn = originalSpawn;
+    syncBuiltinESMExports();
+    if (pi) {
+      pi.child.kill = kill;
+      await reapOwned(pi);
+    }
+    await server.close();
+  }
+}
+
 const cases = [
   ["old-ps", oldPsSensitivity],
   ["async-ps-timeout", (dir) => asyncPsTiming(dir, false)],
@@ -822,6 +872,7 @@ const cases = [
   ["buffered-adapter-eof", bufferedAdapterEof],
   ["delayed-index-publication", (dir) => indexPublication(dir, false)],
   ["failed-index-publication", (dir) => indexPublication(dir, true)],
+  ["late-reap-during-index-publication", lateReapDuringPublication],
 ];
 for (const mode of ["raw", "journal"]) {
   for (const old of [true, false]) cases.push([`fifo-${mode}-${old ? "old" : "async"}`, (dir) => blockSyscall(dir, mode, old)]);
