@@ -1,8 +1,33 @@
 # Stage 6B Unit 2 evidence-boundary repair
 
+## Astra recheck repair
+
+Replayed the six candidate patches in order on integrated `65a2c580ea1c0d63de213c739ba9c251a304098f`. The replayed predecessor was `0dac5bd2bb2fef6a4a7ea78e1a45991e1555bc38` and the tested repair was `e0bd8de5a60a5c506da41da375d5db7402c1e1c5`. The proof ran on macOS ARM64 with existing Node v25.7.0, Pi 1.5.2 and installed native CLEC. It used the synthetic loopback and a real native `status` invocation against the empty offline corpus. The result remains `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE`. Fresh independent Astra review is pending.
+
+| Replayed counterexample | Predecessor seal and inspect | Repaired seal and inspect |
+| --- | --- | --- |
+| Reservation 8 moved past denial 9 and Pi exit | `Complete` | `Invalid`, `tool_reservation_order` |
+| Final owner omitted all ten declarations | `Complete` | `Invalid`, `final_owner_declarations` |
+| Pi drain claimed before the last RPC frame | `Complete` | `Invalid`, `pi_exit_chronology` |
+| Healthy helper TERM claimed after exit report and reap | `Complete` | `Invalid`, `process_closure` |
+| Delta arguments changed while the invocation kept `status` | `Complete` | `Invalid`, `assistant_tool_arguments` |
+| HTTP receipt message shortened to `HTTP` | `Complete` | `Invalid`, `provider_outcome` |
+
+The live `Synthetic "field" error` response failed on the predecessor. The repair accepts it and a message with quotes, a backslash, a newline and a tab as `Complete` runs containing one `TaskFailed` attempt each. The pinned Pi source in `pi-ai/dist/api/openai-completions.js` formats the SDK error through `pi-ai/dist/utils/error-body.js`. The retained Pi JSONL contains the normalized status followed by the serialized nested error object. Replay decodes that object and compares its exact contents. [Recorder clocks and HTTP bytes](/private/tmp/clec-unit2-repair.ntTdr3/clock-and-http.json)
+
+The first clean verification exposed a live ordering race in the earlier provider-turn check. A provider candidate and grant arrived before prior `turn_end` and next `turn_start` were retained. Replay now uses the journal's prompt release, tool reservations and native result delivery as the authorization fences, with request history and loopback receipts tying each authorization to its Pi turn. The new controls accept this valid interleaving and reject a candidate before native result release. [Initial clean run](/private/tmp/clec-unit2-repair.ntTdr3/failed-first-clean-run/unit2.log)
+
+The final clean-source run completed between `2026-11-18T01:59:27Z` and `2026-11-18T02:02:05Z`. All eight original runs, four supplemental runs and 68 isolated bundle controls passed. The bundle controls cover all 53 predecessor mutations, 13 new rejection controls and two accepted variants. The exact late-close replay returned `Incomplete` with no next attempt or summary. The reset late-close and index publication refusal controls also blocked progression. All 85 Unit 1 controls passed, with 16 framing and observation tests, 45 matrix cases and 24 deadline controls. The supplemental live adapter EOF and three durable-write failures passed. Scoped strict TypeScript 5.9.3 emitted zero diagnostics. A direct `/bin/ps` scan found zero survivors across 258 recorded PIDs and 85 PGIDs from the new runs. [Unit 2 receipt](/private/tmp/clec-unit2-repair.ntTdr3/after/unit2-controls-un1qgs/receipt.json) · [Process scan](/private/tmp/clec-unit2-repair.ntTdr3/process-scan.json)
+
+The source inventory SHA-256 was `7c378c407d4f36a16ee44ae4be1b29009a00d332c401195ae3b4a81a8ad327b3`. The runtime closure was `754a35ff6f4f76829f74dcad2b5601fb165a1dcb902336883e1ffcb2d0e4022b` across Unit 2, the matrix before and after, and the deadline controls. The verified receipt index has SHA-256 `bacb56e058b49a5969689622b0954b4dca3978878b26b19252534c9f8ae3ce1b`. The predecessor and repaired command records give the exact runtime, compiler, type roots and arguments. The original reviewer receipts stayed in place and passed their retained hash checks. [Receipt digests](/private/tmp/clec-unit2-repair.ntTdr3/verified-receipts.json) · [Predecessor commands](/private/tmp/clec-unit2-repair.ntTdr3/before/commands.sh) · [Repair commands](/private/tmp/clec-unit2-repair.ntTdr3/after/commands.sh)
+
+Unit 2 covers JSON object arguments in the synthetic fixture, including schema rejections, and full, decodable HTTP error objects in the pinned runtime's format. The proof depends on the recorder and process ownership assumptions in the protocol. [Protocol](phase6b-unit2-protocol.md)
+
+## Prior verification
+
 Unit 2 derives each public case outcome from retained evidence and closes the run only after the attempt owner has finished recording and published its index. The tested source was `4e8d282f62aba7b0285ac593f8d94ecb33942c00`, based on integrated `65a2c580ea1c0d63de213c739ba9c251a304098f` plus the original Unit 2 implementation and report. The proof ran on pinned macOS ARM64. Its status is `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE`. Independent GPT 6.2 Astra acceptance is pending before integration and Units 3–4. [Protocol](phase6b-unit2-protocol.md)
 
-## What the repaired evidence proves
+### What the repaired evidence proves
 
 | Fresh standard control | Closed result |
 | --- | --- |
@@ -21,7 +46,7 @@ All 27 original mutations rejected at their original invariants. The 26 added mu
 
 The reviewer's original journal-file-close script still produced a raw `attempt_closed` with `Answered`. The detached Unit 1 owner published `InvalidEvidence`, with `uncertified: true` and `Journal drain deadline`. Unit 2 collection and offline inspection both returned `Incomplete` with no next attempt, summary or final entry. A delayed close on an eligible reset also prevented a replacement. A separate successful Pi capture with the exclusive index link refused produced no next attempt or final entry.
 
-## Evidence ownership and scope
+### Evidence ownership and scope
 
 Root-cause tracing put the progression gate after final capture and exclusive publication. The run journal records the active attempt before launching it. The validator requires the published Unit 1 index and checks its identity, closure, terminal journal position, process facts and outcome against independent raw records. It derives pre-work replacement from a server-observed reset, the corresponding Pi error and the absence of work. The owner's `TaskFailed` status is consistent with this specific Unit 2 translation.
 
@@ -31,7 +56,7 @@ The first clean-source run exposed a real Darwin `kill EPERM` while a normally c
 
 The proof uses the installed `status` action against the synthetic empty offline corpus and loopback endpoint. It relies on the trusted recorder and inherited process groups described in the protocol. Evidence from the earlier candidate requires fresh capture. Actual provider and host quality remain outside this proof.
 
-## Clean-source verification
+### Clean-source verification
 
 The run started at `2026-11-18T01:36:35Z` and ended at `2026-11-18T01:38:59Z`. TypeScript 5.9.3 checked the strict scoped project with the pinned Pi Node types and emitted zero diagnostics. The 16 framing and process-observation tests, 45 Unit 1 matrix cases, and 24 Unit 1 deadline controls passed. A buffered control-pipe EOF during grant commit produced zero requests and no permit. Three separate `datasync` failures blocked the relevant permit or GO and produced zero native starts.
 
