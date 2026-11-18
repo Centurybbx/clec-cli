@@ -10,6 +10,7 @@
 		"erasableSyntaxOnly": true,
 		"types": ["node"],
 		"paths": {
+			"typescript": ["/Users/century/vibing/clec/cli/node_modules/typescript/lib/typescript.d.ts"],
 			"@earendil-works/pi-coding-agent": [
 				"/Users/century/.pi/agent/install/releases/1.5.2/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
 			],

@@ -4,7 +4,7 @@ import { lstat } from "node:fs/promises";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { join, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { attachBoundedJsonlReader, byDeadline, BoundedJournalWriter, BoundedRawSink, type DrainResult, scheduleDeadline, writeBoundedFrame } from "./framing.ts";
+import { attachBoundedJsonlReader, byDeadline, BoundedJournalWriter, BoundedRawSink, type DrainResult, scheduleDeadline, strictUtf8, writeBoundedFrame } from "./framing.ts";
 import { buildScrubbedChildEnv } from "./pins.ts";
 import type {
 	AttemptId,
@@ -429,6 +429,7 @@ export interface RunRegisteredNativeParams {
 	readonly onKillPiBetweenRegAndGo?: () => Promise<void>;
 	readonly onNativeFirstChunk?: () => void;
 	readonly onOverflow: (stream: string, observedBytes: number) => void;
+	readonly onInvalidStdout: () => void;
 	readonly onSinkFailure: (stream: string, err: Error) => void;
 	readonly sinkStallMs?: number;
 	readonly onFatal: (reason: string, deadline?: number) => void;
@@ -603,16 +604,18 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 						const boundedBase64 = rec.dataBase64.slice(0, Math.ceil(prefixLength / 3) * 4);
 						const raw = output.subarray(offset, offset + prefixLength);
 						raw.write(boundedBase64, 0, prefixLength, "base64");
-						const chunkRecord = Buffer.from(`${JSON.stringify({
-							runId: params.runId, attemptId: params.attemptId, callId: params.callId, leaseId: params.leaseId,
-							stream: rec.stream, offset, bytes: byteLength, sha256: sha256Buffer(raw), monotonicMs: nowMs(),
-						})}\n`);
 						if (byteLength > prefixLength) params.onOverflow(`${params.leaseId}:${rec.stream}`, sink.bytesWritten + byteLength);
 						if (firstChunk) {
 							firstChunk = false;
 							params.onNativeFirstChunk?.();
 						}
-						await Promise.all([entry.chunksSink.writeChunk(chunkRecord), sink.writeChunk(raw)]);
+						if (prefixLength > 0) {
+							const chunkRecord = Buffer.from(`${JSON.stringify({
+								runId: params.runId, attemptId: params.attemptId, callId: params.callId, leaseId: params.leaseId,
+								stream: rec.stream, offset, bytes: prefixLength, sha256: sha256Buffer(raw), monotonicMs: nowMs(),
+							})}\n`);
+							await Promise.all([entry.chunksSink.writeChunk(chunkRecord), sink.writeChunk(raw)]);
+						}
 						if (byteLength > prefixLength) reader.stop();
 						break;
 					}
@@ -621,9 +624,17 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 						completed = true;
 						beginCleanup();
 						await commit("native_exited", { exitCode: rec.exitCode, signal: rec.signal });
+						const rawStdout = stdout.subarray(0, entry.stdoutSink.bytesWritten);
+						let stdoutText: string;
+						try {
+							stdoutText = rec.exitCode === 0 ? strictUtf8(rawStdout) : rawStdout.toString("utf8");
+						} catch {
+							params.onInvalidStdout();
+							return;
+						}
 						outcome = {
 							ok: rec.exitCode === 0, exitCode: rec.exitCode, signal: rec.signal,
-							stdoutText: stdout.toString("utf8", 0, entry.stdoutSink.bytesWritten),
+							stdoutText,
 							stderrText: stderr.toString("utf8", 0, entry.stderrSink.bytesWritten),
 							errorMessage: rec.exitCode === 0 ? null : `Native exited code=${rec.exitCode} signal=${rec.signal}`,
 							nativeStarted,

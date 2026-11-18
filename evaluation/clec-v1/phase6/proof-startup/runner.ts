@@ -63,8 +63,6 @@ export async function collectRun(input: unknown, evidenceParent: string, fixture
 			requireFact(item, "case_order");
 			requireFact(performance.now() + UNIT1_LIMITS.caseDeadlineMs + UNIT1_LIMITS.killGraceMs <= deadline, "run_deadline");
 			equal(parseRawJson(readEvidence(parent, `${runId}.expected.json`, UNIT1_LIMITS.controlFrameBytes)), expected, "external_anchor");
-			const before = captureExecutionClosure();
-			equal(runtimeWitness(before), witness, "closure_prelaunch");
 			const pi = new PiProjection(UNIT1_LIMITS.promptPrefix + item.question, join(root, "attempts", identity.attemptId, "cwd"));
 			const mock = await startUnit1LoopbackOpenAI(req => fixture(identity, req.seq));
 			try {
@@ -72,7 +70,7 @@ export async function collectRun(input: unknown, evidenceParent: string, fixture
 				const result = await runUnit1Proof({
 					caseLabel: item.id, evidenceParentDir: root, question: item.question, mockBaseUrl: mock.baseUrl,
 					providerId: PROOF_MODEL.provider, modelId: PROOF_MODEL.model, thinkingLevel: PROOF_MODEL.thinking,
-				}, { cachedClosure: before, evidence: { identity, anchor: expected, pi } });
+				}, { cachedClosure: closure, evidence: { identity, anchor: expected, pi } });
 				const capture = join(root, "attempts", identity.attemptId, "capture");
 				if (lstatSync(capture, { throwIfNoEntry: false }) === undefined) return report(inspectRun(root, expected));
 				writeExclusiveFile(join(capture, "question.bin"), Buffer.from(item.question));

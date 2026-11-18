@@ -242,7 +242,11 @@ export function attachBoundedJsonlReader<T>(params: {
 	params.stream.once("end", onEnd);
 	params.stream.once("close", onClose);
 	params.stream.on("error", onError);
-	params.stream.on("data", ingest);
+	const onReadable = (): void => wake?.();
+	// ChildProcess resumes stdio on exit. A readable listener keeps raw
+	// capture in pull mode even then, while the current write owns its bytes.
+	if (params.rawSink) params.stream.on("readable", onReadable);
+	else params.stream.on("data", ingest);
 	if (params.stream.readableEnded) onEnd();
 	else if (params.stream.destroyed) onClose();
 
@@ -254,6 +258,10 @@ export function attachBoundedJsonlReader<T>(params: {
 		const faulted = () => terminal?.kind === "fault";
 		try {
 			for (;;) {
+				if (params.rawSink && !terminal && queue.length === 0) {
+					const chunk = params.stream.read(Math.min(params.stream.readableLength, UNIT1_LIMITS.maxPendingSinkBytes));
+					if (chunk !== null) ingest(chunk);
+				}
 				const chunk = queue.shift();
 				if (!chunk) {
 					if (terminal?.kind === "end") return { kind: "drained" };
@@ -303,6 +311,7 @@ export function attachBoundedJsonlReader<T>(params: {
 			queue.length = 0;
 			// Leave the error listener through close if destroy has queued a stream error.
 			params.stream.off("data", ingest);
+			params.stream.off("readable", onReadable);
 			params.stream.off("end", onEnd);
 			if (params.stream.closed) params.stream.off("error", onError);
 			else params.stream.once("close", () => params.stream.off("error", onError));
@@ -335,11 +344,15 @@ export async function captureRawStream(
 		for await (const chunk of stream.iterator({ destroyOnReturn: false })) {
 			checkPipeChunk(chunk);
 			const result = await writeRawChunks(sink, chunk);
-			if (result.kind !== "written") return { kind: "incomplete", reason: result.kind };
+			if (result.kind !== "written") {
+				stream.destroy();
+				return { kind: "incomplete", reason: result.kind === "failed" ? result.reason : "Raw capture overflow" };
+			}
 		}
 		return { kind: "drained" };
 	} catch (err) {
 		onError(err instanceof Error ? err : new Error(String(err)));
+		stream.destroy();
 		return { kind: "incomplete", reason: errorText(err) };
 	} finally {
 		stream.off("error", onError);

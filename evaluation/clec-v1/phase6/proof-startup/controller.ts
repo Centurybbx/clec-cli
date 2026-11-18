@@ -22,7 +22,7 @@ import {
 	buildScrubbedChildEnv,
 	captureExecutionClosure,
 	type ExecutionClosure,
-	PI_BUNDLE_ENTRY,
+	verifyExecutionClosure,
 	sha256Buffer,
 	verifyFilePin,
 } from "./pins.ts";
@@ -72,6 +72,9 @@ export async function runUnit1Proof(
 		readonly anchor: ExpectedCommitments; readonly identity: AttemptIdentity; readonly pi: PiProjection;
 	} },
 ): Promise<ProofRunResult> {
+	const closureBefore = options?.cachedClosure
+		? verifyExecutionClosure(options.cachedClosure)
+		: captureExecutionClosure();
 	const monotonicStartMs = performance.now();
 	const nowMs = (): number => performance.now() - monotonicStartMs;
 	const endpoint = new URL(request.mockBaseUrl);
@@ -83,7 +86,6 @@ export async function runUnit1Proof(
 	const runId = options?.evidence?.anchor.runId ?? makeRunId(`u1-${Date.now()}-${randomBytes(4).toString("hex")}`);
 	const attemptId = options?.evidence?.identity.attemptId ?? request.faults?.duplicateAttemptIdCollision ?? makeAttemptId(`${runId}-a1`);
 
-	const closureBefore = options?.cachedClosure ?? captureExecutionClosure();
 	const helperPin = closureBefore.unit1Files.find((file) => file.logicalPath === resolveDefaultHelperPath());
 	if (!helperPin) throw new Error("Missing pinned native helper");
 
@@ -337,7 +339,7 @@ export async function runUnit1Proof(
 
 	const adapterPath = request.faults?.adapterPathOverride ?? resolveDefaultAdapterPath();
 	const piArgs = [
-		PI_BUNDLE_ENTRY,
+		closureBefore.piEntryPin.canonicalPath,
 		"--mode",
 		"rpc",
 		"--no-session",
@@ -431,7 +433,7 @@ export async function runUnit1Proof(
 	};
 
 	try {
-		piChild = spawn(process.execPath, piArgs, {
+		piChild = spawn(closureBefore.nodePin.canonicalPath, piArgs, {
 			cwd,
 			env: piEnv,
 			detached: false,
@@ -1060,6 +1062,7 @@ export async function runUnit1Proof(
 							overflow = { stream, observedBytes: bytes };
 						},
 						onSinkFailure: (stream, err) => ioFailure(`${stream}: ${err.message}`),
+						onInvalidStdout: () => ioFailure("Successful native stdout is invalid UTF-8"),
 						sinkStallMs: request.faults?.simulatedSinkStallMs,
 						onFatal: (reason, at) => terminatePiAndGroups(reason, "DeniedAndTerminated", at),
 					});
