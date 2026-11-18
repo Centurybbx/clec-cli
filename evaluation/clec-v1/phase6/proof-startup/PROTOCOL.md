@@ -44,15 +44,19 @@ Each attempt runs in a freshly created exclusive directory tree (`cwd`, `home`, 
 2. Outer allocates the native registry entry and exclusively opens capture sinks before spawning the detached helper. The spawn handle supplies provisional PID and PGID ownership. Outer compares `helper_ready` with that handle and verifies the expected PID, PPID, PGID, and start identity in the OS table.
 3. The helper waits for GO. Outer commits and synchronizes `group_registered` and `group_go_sent` before sending GO. The latter record denotes authorization intent. The wire send and native PID report establish subsequent events.
 4. The helper launches the fixed invocation with `shell: false`, `detached: false`, empty stdin, and no inherited control descriptors. The native child inherits the owned group. Its PID report adds an observation obligation. Only the group derived from the original spawn handle grants signal authority.
-5. Outer reconciles each native group and its capture before returning a result and admitting another native call. A helper leader exit or report EOF can arm a local stop while capture drains. Only positive group absence and a reaped direct child can cancel a pending group escalation.
+5. Outer reconciles each native group and its capture before returning a result and admitting another native call. A helper leader exit or report EOF can arm a local stop while capture drains. A reaped direct child and corroborated group absence retire the lease and cancel its pending escalation.
 
 ## Commit and capture
 
-Each reader processes one decoded record at a time and stops pulling while that record awaits I/O. The adapter policy reader holds at most one outstanding request. Pi exit, channel failure, overflow, and deadlines signal outside that reader. A terminal stop closes the admission epoch. Every ACK, prompt, permit, tool result, and GO rechecks the epoch before writing to the pipe.
+Each JSONL pipe keeps reading while its one ordered consumer awaits I/O. Ingestion counts wire bytes and frame boundaries and queues at most one frame's worth of bytes and 1,024 chunks. Each accepted chunk has independently backed storage. The consumer holds one active chunk, one partial frame bounded by the frame cap, and one decoded record bounded by the wire frame. During frame growth both the old and new bounded backing can be live. The 128 KiB input backing cap covers one native read plus Node's default 64 KiB pipe high water mark on the pinned runtime. There is no per-record queue of decoded objects.
+
+Pi exit, EOF, channel error, overflow, and deadlines signal outside policy handling. Expected EOF after clean shutdown still drains queued records in order. Unexpected EOF closes admission immediately, even with a pending commit and unread trailing bytes. Every ACK, prompt, permit, tool result, and GO rechecks the epoch before writing to the pipe.
 
 One journal writer accepts at most four outstanding appends, including the active append. It writes each record in order and advances the committed sequence and byte range only after the full write and the required `datasync` succeed. A partial write loops until complete or fails the journal. The emergency reserve cannot repair a partial record.
 
-Raw sinks use asynchronous exclusive open, one pending write, and asynchronous close. Each write retains at most 64 KiB of copied payload. The reader accounts for its input chunk and frame separately. Capture retains the exact prefix up to each byte cap. During the active lifetime, native launch pin checks use bounded asynchronous reads. Final synchronous hashing is allowed after positive target closure.
+Raw sinks use asynchronous exclusive open, one pending write, and asynchronous close. The sink copies the bounded prefix into its own backing before returning a promise. Readers split admitted input into pieces of at most 64 KiB. Native capture keeps fixed stdout and stderr buffers under their individual byte caps. Capture writes the exact prefix up to each byte cap. When ingestion or drain fails it keeps the prefix already written and reports incomplete evidence. Native launch pin checks use bounded asynchronous reads. Final synchronous hashing is allowed after positive target closure.
+
+Index publication follows cleanup and has a separate asynchronous completion. The controller fully writes and syncs an exclusive staging file, then creates the final name with an exclusive POSIX hard link. A failed write cannot expose a partial final entry. A successful link fixes the retained and returned verdict. The signal, observation, and drain cutoffs do not limit post-cleanup publication.
 
 ## Stop, observation, and drain
 
@@ -60,9 +64,9 @@ A case deadline, native deadline, Pi exit, denial, bridge EOF, or I/O failure cl
 
 The shared trigger is the armed monotonic deadline for timer expiry and the detection time for events. The receipt includes the detection time, actual TERM and SIGKILL call times, scheduled escalation time, signal errors, any justified cancellation, direct-child reaping, observation completion, and drain disposition. `killEscalationMs` is the actual SIGKILL call time minus the trigger time. A canceled escalation has a null value.
 
-A bounded asynchronous `/bin/ps` observer runs at most one invocation at a time with C locale and capped stdout and stderr. A timed-out observer is killed and reaped. Group closure requires a fresh validated sample, consistent identities, and direct-child reaping. Signal initiation, observation, and drain each have the original two-second cutoff. Missing process evidence produces Unknown. Missing capture or journal evidence produces Incomplete. Either makes the proof uncertified even if all required signals were timely.
+A bounded asynchronous `/bin/ps` observer runs at most one invocation at a time with C locale and capped stdout and stderr. A timed-out observer is killed and reaped. Group closure requires a fresh validated sample, consistent known identities, direct-child reaping, and an `ESRCH` result from signal 0 to the owned negative PGID. Kernel presence or a probe error such as `EPERM` leaves observation Unknown and keeps escalation armed. Rows can add observation obligations without granting a signaling identity. Signal initiation, observation, and drain each have the original two-second cutoff. Missing process evidence produces Unknown. Missing capture or journal evidence produces Incomplete. Either makes the proof uncertified even if all required signals were timely.
 
-The contract covers trusted inherited POSIX groups on the tested runtime. PID/PGID reuse and second-resolution start times limit identity precision. OS scheduling and uninterruptible kernel work can prevent timely signals or closure. Supervisor SIGKILL, host death, malicious group escape, and hostile same-account interference are outside the proof.
+The contract covers trusted inherited POSIX groups on the tested runtime. Retired leases cannot act through stale callbacks. A POSIX PGID is numeric and can be reused between observations and signals. Process start times from `ps` have one-second granularity. OS scheduling and uninterruptible kernel work can prevent timely signals or closure. Supervisor SIGKILL, host death, malicious group escape, and hostile same-account interference are outside the proof.
 
 ## Frozen Unit 1 Caps
 
@@ -79,4 +83,5 @@ The contract covers trusted inherited POSIX groups on the tested runtime. PID/PG
 - Journal cap: `67108864` bytes (64 MiB), including a `1048576`-byte (1 MiB) emergency reserve unavailable to ordinary records
 - TERM grace: `350` ms for Pi and `400` ms for native groups
 - Signal initiation, observation, and drain cutoff: `2000` ms from trigger
-- Bounded pending sink write buffer: `65536` bytes (64 KiB) with source pause until drain
+- Pending raw sink backing: `65536` bytes (64 KiB)
+- Queued input per JSONL pipe: at most `16777216` bytes (16 MiB) and `1024` chunks

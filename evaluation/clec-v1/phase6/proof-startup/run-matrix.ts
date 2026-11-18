@@ -40,7 +40,7 @@ interface MatrixCaseOutcome {
 	readonly extraEvidence?: Record<string, unknown>;
 }
 
-function assert(cond: boolean, message: string): void {
+function assert(cond: boolean, message: string): asserts cond {
 	if (!cond) {
 		throw new Error(`Assertion failed: ${message}`);
 	}

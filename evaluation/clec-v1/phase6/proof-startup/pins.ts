@@ -236,6 +236,7 @@ export function captureExecutionClosure(): ExecutionClosure {
 		"fixtures.ts",
 		"run-matrix.ts",
 		"process-observation.test.mjs",
+		"framing.test.mjs",
 		"deadline-controls.mjs",
 	];
 	const unit1Files: FilePin[] = [];

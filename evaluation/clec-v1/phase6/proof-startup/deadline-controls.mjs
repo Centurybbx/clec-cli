@@ -56,7 +56,7 @@ function observeOwned(pids, pgids) {
 function trackSignals(pids) {
   const calls = [];
   process.kill = function (pid, signal) {
-    if (pids.includes(pid)) calls.push({ pid, signal, at: performance.now(), wallMs: Date.now() });
+    if (signal !== 0 && pids.includes(pid)) calls.push({ pid, signal, at: performance.now(), wallMs: Date.now() });
     return originalKill.call(this, pid, signal);
   };
   return calls;
@@ -365,7 +365,8 @@ async function writerBounds(dir) {
       return actualWrite.call(this, buffer, offset, Math.min(length, 8192));
     };
     const input = Buffer.alloc(65_538, 53);
-    assert.equal((await raw.writeChunk(input)).kind, "overflow");
+    assert.equal((await raw.writeChunk(input.subarray(0, 32_768))).kind, "written");
+    assert.equal((await raw.writeChunk(input.subarray(32_768))).kind, "overflow");
     assert.equal((await raw.close(performance.now() + 500)).kind, "drained");
     assert.deepEqual(fs.readFileSync(rawPath), input.subarray(0, 65_536));
 
@@ -594,13 +595,20 @@ async function wrongReporter(dir) {
 
 async function retiredLease(dir) {
   const first = await target({ ignoreTerm: false });
+  const setTimer = globalThis.setTimeout;
+  let staleCallback;
   const next = await target();
   const registry = new ProcessGroupRegistry(performance.now());
   const entry = reserve(registry, dir, "retired", first);
   const signals = trackSignals([-first.pid, -next.pid, first.pid, next.pid]);
   try {
     const firstAt = performance.now();
+    globalThis.setTimeout = (callback, ...args) => {
+      staleCallback = callback;
+      return setTimer(callback, ...args);
+    };
     const ticket = registry.beginOne(entry, { at: firstAt, detectedAt: firstAt });
+    globalThis.setTimeout = setTimer;
     await registry.finishOne(entry);
     assert.equal(entry.state, "Closed");
     assert.throws(() => reserve(registry, dir, "retired", next), /Cannot reserve/);
@@ -608,6 +616,7 @@ async function retiredLease(dir) {
     const secondAt = performance.now();
     assert.equal(registry.beginOne(entry, { at: secondAt, detectedAt: secondAt }), ticket);
     await sleep(500);
+    staleCallback();
     assert.equal(ticket.evidence.killAttemptAt, null);
     assert.deepEqual(signals.map(({ pid, signal }) => ({ pid, signal })), [{ pid: -first.pid, signal: "SIGTERM" }]);
     const unaffected = observeOwned([next.pid], [next.pid]);
@@ -617,10 +626,188 @@ async function retiredLease(dir) {
     assert.equal(nextEntry.state, "Closed");
     const survivors = observeOwned([first.pid, next.pid], [first.pid, next.pid]);
     assert.deepEqual(survivors, []);
-    return { unaffected, survivors, signals, retired: ticket.evidence, next: nextEntry.stop.evidence };
+    return { unaffected, survivors, signals, staleCallbackInvoked: true, retired: ticket.evidence, next: nextEntry.stop.evidence };
   } finally {
+    globalThis.setTimeout = setTimer;
     process.kill = originalKill;
     await reapOwned(first, next);
+  }
+}
+
+async function partialProcessTable(dir) {
+  const leader = originalSpawn(node, ["-e", `
+    require("node:child_process").spawn(process.execPath, ["-e",
+      'process.on("SIGTERM", () => {}); console.log(process.pid); setInterval(() => {}, 1000);'],
+      { stdio: ["ignore", 1, 2] });
+    setInterval(() => {}, 1000);
+  `], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const exited = once(leader, "exit");
+  const signals = trackSignals([-leader.pid]);
+  let nativePid;
+  try {
+    const [reported] = await bounded(once(leader.stdout, "data"));
+    nativePid = Number(String(reported).trim());
+    assert.deepEqual(observeOwned([nativePid], []).map(([, pgid]) => Number(pgid)), [leader.pid]);
+    const samples = [];
+    cp.execFile = (file, args, options, callback) => originalExec(file, args, options, (err, output, stderr) => {
+      if (err || file !== "/bin/ps") return callback(err, output, stderr);
+      const rows = output.trimEnd().split("\n");
+      const ownIndex = rows.findIndex((row) => Number(row.trim().split(/\s+/)[0]) === process.pid);
+      const ownRow = rows[ownIndex];
+      const omitted = rows.slice(0, ownIndex + 1).filter((row) => Number(row.trim().split(/\s+/)[2]) !== leader.pid);
+      samples.push({ reaped: leader.exitCode !== null || leader.signalCode !== null, ownRow, reportedRows: omitted.length });
+      callback(err, omitted.join("\n") + "\n", stderr);
+    });
+    syncBuiltinESMExports();
+    const registry = new ProcessGroupRegistry(performance.now());
+    const group = reserve(registry, dir, "partial-table", { child: leader, pid: leader.pid });
+    group.nativePid = nativePid;
+    const at = performance.now();
+    registry.beginStop({ at, detectedAt: at });
+    await bounded(registry.finishStop());
+    const actualAfterGrace = observeOwned([leader.pid, nativePid], [leader.pid]);
+    assert.ok(samples.some((sample) => sample.reaped && sample.ownRow));
+    assert.deepEqual(actualAfterGrace, [], "a valid-looking prefix must not retire a live group");
+    assert.deepEqual(signals.map(({ signal }) => signal), ["SIGTERM", "SIGKILL"]);
+    assert.ok(group.stop.evidence.reapedAt < group.stop.evidence.killAttemptAt);
+    assert.equal(group.state, "Closed");
+    return { pgid: leader.pid, nativePid, samples, signals, stop: group.stop.evidence, closure: group.closure, actualAfterGrace };
+  } finally {
+    cp.execFile = originalExec;
+    syncBuiltinESMExports();
+    process.kill = originalKill;
+    if (observeOwned([], [leader.pid]).length) originalKill(-leader.pid, "SIGKILL");
+    await bounded(exited);
+    assert.deepEqual(observeOwned([leader.pid, nativePid], [leader.pid]), []);
+  }
+}
+
+async function bufferedAdapterEof(dir) {
+  const adapter = join(dir, "adapter-eof.ts");
+  const marker = join(dir, "adapter-finished");
+  const original = fs.readFileSync(join(import.meta.dirname, "clec-adapter.ts"), "utf8");
+  const spliceAt = "if (!sent) {\n\t\t\t\t\tpendingPermits";
+  const modified = original.replace(spliceAt, `
+    setTimeout(() => ctrlOut.end("\\n", () => writeFileSync(${JSON.stringify(marker)}, String(Date.now()))), 90);
+    ${spliceAt}`);
+  assert.notEqual(modified, original);
+  fs.writeFileSync(adapter, 'import { writeFileSync } from "node:fs";\n' + modified, { flag: "wx" });
+  const server = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Public synthetic answer." }));
+  const wire = [];
+  let pi;
+  let atEof;
+  let grant;
+  let postSendWrites = 0;
+  cp.spawn = (...args) => {
+    const child = originalSpawn(...args);
+    if (args[1]?.includes("--mode")) {
+      pi = { child, exited: once(child, "exit") };
+      child.stdio[4].once("end", () => {
+        atEof = { at: performance.now(), live: child.exitCode === null && child.signalCode === null };
+      });
+      const socket = child.stdio[3];
+      const write = socket.write;
+      socket.write = function (bytes, ...args) {
+        wire.push({ kind: JSON.parse(String(bytes)).kind, at: performance.now() });
+        return write.call(this, bytes, ...args);
+      };
+    }
+    return child;
+  };
+  syncBuiltinESMExports();
+  const grantCompleted = Promise.withResolvers();
+  try {
+    fileHandle.write = async function (buffer, ...args) {
+      if (buffer.includes(Buffer.from('"kind":"provider_grant"'))) {
+        grant = { enteredAt: performance.now() };
+        await sleep(450);
+        grant.writerFinishedWallMs = Number(fs.readFileSync(marker, "utf8"));
+        grant.buffered = pi.child.stdio[4].readableLength;
+        grant.releasedAt = performance.now();
+        grantCompleted.resolve();
+      }
+      if (buffer.includes(Buffer.from('"kind":"provider_permit_sent"'))) {
+        postSendWrites++;
+        await sleep(350);
+      }
+      return actualWrite.call(this, buffer, ...args);
+    };
+    const result = await runUnit1Proof({
+      caseLabel: "buffered EOF during grant", evidenceParentDir: dir, question: "Public synthetic control.",
+      mockBaseUrl: server.baseUrl, faults: { adapterPathOverride: adapter, caseDeadlineMsOverride: 7_000 },
+    }, { cachedClosure: closure });
+    await bounded(grantCompleted.promise);
+    assert.equal(result.failureReason, "Adapter private pipe EOF");
+    assert.equal(atEof.live, true, "Pi must be live when the control pipe ends");
+    assert.ok(atEof.at >= grant.enteredAt && atEof.at < grant.releasedAt);
+    assert.ok(result.piStop.triggerAt >= atEof.at && result.piStop.triggerAt < grant.releasedAt);
+    assert.ok(!wire.some(({ kind }) => kind === "provider_permit"));
+    assert.equal(postSendWrites, 0);
+    assert.deepEqual(server.requests, []);
+    const survivors = observeOwned([result.piPid], []);
+    assert.deepEqual(survivors, []);
+    return { atEof, grant, wire, result, requests: server.requests, survivors };
+  } finally {
+    fileHandle.write = actualWrite;
+    cp.spawn = originalSpawn;
+    syncBuiltinESMExports();
+    if (pi) await reapOwned(pi);
+    await server.close();
+  }
+}
+
+async function indexPublication(dir, fail) {
+  const server = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Public synthetic answer." }));
+  let firstWriteAt;
+  let lastWriteAt;
+  let writes = 0;
+  try {
+    fileHandle.write = async function (buffer, offset, length) {
+      if (buffer.includes(Buffer.from('"indexEntryPath":'))) {
+        writes++;
+        firstWriteAt ??= performance.now();
+        if (fail) {
+          if (offset === 0) return actualWrite.call(this, buffer, offset, 7);
+          throw new Error("Test index write failure after partial progress");
+        }
+        await sleep(2_350);
+        const written = await actualWrite.call(this, buffer, offset, length);
+        lastWriteAt = performance.now();
+        return written;
+      }
+      return actualWrite.call(this, buffer, offset, length);
+    };
+    const result = await runUnit1Proof({
+      caseLabel: fail ? "index-failed" : "index-delayed", evidenceParentDir: dir,
+      question: "Public synthetic control.", mockBaseUrl: server.baseUrl,
+    }, { cachedClosure: closure });
+    const returnedAt = performance.now();
+    assert.equal(server.requests.length, 1);
+    assert.equal(result.piExitCode, 0);
+    assert.ok(firstWriteAt >= result.piStop.reapedAt);
+    const indexDir = join(dir, "_index");
+    let durableIndex;
+    if (fail) {
+      assert.equal(writes, 2);
+      assert.equal(result.status, "InvalidEvidence");
+      assert.equal(result.uncertified, true);
+      assert.match(result.indexPublicationError, /index write failure after partial/);
+      assert.deepEqual(fs.readdirSync(indexDir), []);
+    } else {
+      assert.ok(lastWriteAt - firstWriteAt > 2_000);
+      assert.ok(returnedAt >= lastWriteAt);
+      assert.equal(result.status, "Answered");
+      assert.equal(result.uncertified, false);
+      durableIndex = JSON.parse(fs.readFileSync(result.indexEntryPath, "utf8"));
+      assert.deepEqual(durableIndex, JSON.parse(JSON.stringify(result)));
+      assert.equal(fs.readdirSync(indexDir).length, 1);
+    }
+    const survivors = observeOwned([result.piPid], []);
+    assert.deepEqual(survivors, []);
+    return { firstWriteAt, lastWriteAt, returnedAt, writes, durableIndex, result, requests: server.requests, survivors };
+  } finally {
+    fileHandle.write = actualWrite;
+    await server.close();
   }
 }
 
@@ -631,6 +818,10 @@ const cases = [
   ["writer-bounds", writerBounds],
   ["wrong-reporter", wrongReporter],
   ["retired-lease", retiredLease],
+  ["partial-process-table", partialProcessTable],
+  ["buffered-adapter-eof", bufferedAdapterEof],
+  ["delayed-index-publication", (dir) => indexPublication(dir, false)],
+  ["failed-index-publication", (dir) => indexPublication(dir, true)],
 ];
 for (const mode of ["raw", "journal"]) {
   for (const old of [true, false]) cases.push([`fifo-${mode}-${old ? "old" : "async"}`, (dir) => blockSyscall(dir, mode, old)]);

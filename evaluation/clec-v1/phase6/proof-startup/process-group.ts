@@ -139,9 +139,26 @@ export async function observeGroupInProcessTable(params: {
 			survivors.push(entry);
 		}
 	}
-	return survivors.length > 0
-		? { ...base, kind: "alive", survivors }
+	if (survivors.length > 0) return { ...base, kind: "alive", survivors };
+
+	// A successful ps result can omit complete rows. Probe only the existing
+	// owned PGID and accept ESRCH as the kernel's evidence of absence.
+	const reason = checkGroupAbsence(params.pgid);
+	return reason !== null ? { ...base, kind: "unknown", reason }
 		: { ...base, kind: "gone", pidsChecked: [...known.keys()] };
+}
+
+function checkGroupAbsence(pgid: number): string | null {
+	if (!Number.isInteger(pgid) || pgid <= 0 || pgid > 0x7fffffff) return "Invalid owned PGID";
+	try {
+		process.kill(-pgid, 0);
+		return "Kernel still reports a group absent from the process table";
+	} catch (err) {
+		const code = err instanceof Error && "code" in err ? err.code : undefined;
+		if (code === "ESRCH") return null;
+		if (code === "EPERM") return "Kernel denied access to the group";
+		return `Kernel group existence probe failed: ${err instanceof Error ? err.message : String(err)}`;
+	}
 }
 
 function isReaped(child: ChildProcess): boolean {
@@ -193,7 +210,9 @@ export function armStop(params: {
 		termError: null, killError: null, reapedAt: null, observationCompletedAt: null, drain: null,
 	};
 	let cancelTimer: (() => void) | undefined;
+	let retired = false;
 	const retire = (reason: string): void => {
+		retired = true;
 		cancelTimer?.();
 		if (evidence.killAttemptAt === null) evidence.noKillReason ??= reason;
 	};
@@ -223,6 +242,7 @@ export function armStop(params: {
 		retire("Teardown omitted by sensitivity control");
 	} else if (pgid !== undefined || (child?.pid && !isReaped(child))) {
 		cancelTimer = scheduleDeadline(evidence.scheduledKillAt, () => {
+			if (retired) return;
 			evidence.killAttemptAt = performance.now();
 			evidence.killError = signal("SIGKILL");
 		});
@@ -320,8 +340,14 @@ export class ProcessGroupRegistry {
 
 	private async reconcile(entry: GroupRegistryEntry, stop: ArmedStop, injectPsFailure?: boolean): Promise<void> {
 		const { evidence } = stop;
+		let captureComplete = !entry.capture;
+		const capturing = byDeadline(entry.capture ?? Promise.resolve<DrainResult>({ kind: "drained" }), evidence.drainDeadline)
+			.then((result) => {
+				captureComplete = result.kind === "completed";
+				return result;
+			});
 		const capture = async (): Promise<void> => {
-			const captured = await byDeadline(entry.capture ?? Promise.resolve<DrainResult>({ kind: "drained" }), evidence.drainDeadline);
+			const captured = await capturing;
 			if (captured.kind === "timeout") entry.stopCapture?.();
 			const closes = await Promise.all([entry.stdoutSink, entry.stderrSink, entry.chunksSink].map((sink) => sink.close(evidence.drainDeadline)));
 			evidence.drain = captured.kind === "timeout"
@@ -330,29 +356,43 @@ export class ProcessGroupRegistry {
 					?? (captured.value.kind === "drained" ? { kind: "drained" } : captured.value);
 		};
 		const draining = capture();
+		let groupRetired = false;
 		if (entry.pgid !== null) {
-			const knownIdentities = [];
-			if (entry.helperPid !== null) knownIdentities.push({ pid: entry.helperPid, lstart: entry.helperLstart });
-			if (entry.nativePid !== null) knownIdentities.push({ pid: entry.nativePid, lstart: entry.nativeLstart });
+			let freshAfter = evidence.triggerAt;
 			do {
-				entry.closure = await observeGroupInProcessTable({
+				const { nativePid, nativeLstart, helperPid, helperLstart } = entry;
+				const knownIdentities = [];
+				if (helperPid !== null) knownIdentities.push({ pid: helperPid, lstart: helperLstart });
+				if (nativePid !== null) knownIdentities.push({ pid: nativePid, lstart: nativeLstart });
+				const observed = await observeGroupInProcessTable({
 					pgid: entry.pgid, knownIdentities, monotonicMs: performance.now() - this.monotonicStartMs,
-					deadline: evidence.observationDeadline, freshAfter: evidence.triggerAt, injectPsFailure,
+					deadline: evidence.observationDeadline, freshAfter, injectPsFailure,
 				});
-				if (entry.closure.kind === "gone" && evidence.reapedAt !== null &&
+				entry.closure = observed;
+				if (observed.kind === "gone" && evidence.reapedAt !== null &&
 					performance.now() <= evidence.observationDeadline) {
-					stop.retire("Owned group absent and direct child reaped");
-					break;
+					if (captureComplete && nativePid === entry.nativePid && nativeLstart === entry.nativeLstart &&
+						helperLstart === entry.helperLstart) {
+						stop.retire("Owned group absent and direct child reaped");
+						groupRetired = true;
+						break;
+					}
+					// Accepted frames can still add an identity after transport EOF.
+					// Retain escalation until a fresh sample accounts for that identity.
+					entry.closure = { kind: "unknown", pgid: entry.pgid, checkedAtMonotonicMs: observed.checkedAtMonotonicMs,
+						reason: "Helper identity evidence pending during observation" };
+					await capturing;
+					freshAfter = performance.now();
+					continue;
 				}
 				if (evidence.noKillReason === "Teardown omitted by sensitivity control" ||
-					(entry.closure.kind === "unknown" && entry.closure.reason.startsWith("Identity changed"))) break;
+					(observed.kind === "unknown" && observed.reason.startsWith("Identity changed"))) break;
 				await sleepMs(25);
 			} while (performance.now() + 25 < evidence.observationDeadline);
 		}
 		evidence.observationCompletedAt = performance.now();
 		const reaped = await byDeadline(stop.reaped, evidence.observationDeadline);
-		const closed = reaped.kind === "completed" && (!entry.child?.pid ||
-			(entry.closure?.kind === "gone" && evidence.observationCompletedAt <= evidence.observationDeadline));
+		const closed = reaped.kind === "completed" && (!entry.child?.pid || groupRetired);
 		entry.state = closed ? "Closed" : "Unknown";
 		await draining;
 	}
@@ -450,8 +490,8 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		const reportEnded = Promise.withResolvers<number>();
 		const aborted = Promise.withResolvers<void>();
 		let firstChunk = true;
-		const stdout: Buffer[] = [];
-		const stderr: Buffer[] = [];
+		const stdout = Buffer.alloc(UNIT1_LIMITS.nativeStdoutBytes);
+		const stderr = Buffer.alloc(UNIT1_LIMITS.nativeStderrBytes);
 		const fail = (reason: string): void => {
 			outcome = { ...failed(reason), nativeStarted };
 			params.onFatal(reason);
@@ -550,19 +590,19 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 							return fail("Unexpected native chunk");
 						}
 						const sink = rec.stream === "stdout" ? entry.stdoutSink : entry.stderrSink;
-						const chunks = rec.stream === "stdout" ? stdout : stderr;
-						const cap = rec.stream === "stdout" ? UNIT1_LIMITS.nativeStdoutBytes : UNIT1_LIMITS.nativeStderrBytes;
+						const output = rec.stream === "stdout" ? stdout : stderr;
+						const offset = sink.bytesWritten;
 						const byteLength = rec.dataBase64.length / 4 * 3 - (rec.dataBase64.endsWith("==") ? 2 : rec.dataBase64.endsWith("=") ? 1 : 0);
-						const prefixLength = Math.min(byteLength, cap - sink.bytesWritten);
+						const prefixLength = Math.min(byteLength, output.length - offset);
 						const boundedBase64 = rec.dataBase64.slice(0, Math.ceil(prefixLength / 3) * 4);
-						const raw = Buffer.from(boundedBase64, "base64").subarray(0, prefixLength);
+						const raw = output.subarray(offset, offset + prefixLength);
+						raw.write(boundedBase64, 0, prefixLength, "base64");
 						const chunkRecord = Buffer.from(`${JSON.stringify({ stream: rec.stream, bytes: byteLength, monotonicMs: nowMs() })}\n`);
 						if (byteLength > prefixLength) params.onOverflow(`${params.leaseId}:${rec.stream}`, sink.bytesWritten + byteLength);
 						if (firstChunk) {
 							firstChunk = false;
 							params.onNativeFirstChunk?.();
 						}
-						chunks.push(raw);
 						await Promise.all([entry.chunksSink.writeChunk(chunkRecord), sink.writeChunk(raw)]);
 						if (byteLength > prefixLength) reader.stop();
 						break;
@@ -573,7 +613,8 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 						await commit("native_exited", { exitCode: rec.exitCode, signal: rec.signal });
 						outcome = {
 							ok: rec.exitCode === 0, exitCode: rec.exitCode, signal: rec.signal,
-							stdoutText: Buffer.concat(stdout).toString("utf8"), stderrText: Buffer.concat(stderr).toString("utf8"),
+							stdoutText: stdout.toString("utf8", 0, entry.stdoutSink.bytesWritten),
+							stderrText: stderr.toString("utf8", 0, entry.stderrSink.bytesWritten),
 							errorMessage: rec.exitCode === 0 ? null : `Native exited code=${rec.exitCode} signal=${rec.signal}`,
 							nativeStarted,
 						};

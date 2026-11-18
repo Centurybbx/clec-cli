@@ -14,7 +14,7 @@ import {
 	scheduleDeadline,
 	writeBoundedFrame,
 	writeExclusiveFile,
-	writeExclusiveFileAsync,
+	publishExclusiveIndex,
 } from "./framing.ts";
 import {
 	buildScrubbedChildEnv,
@@ -218,23 +218,7 @@ export async function runUnit1Proof(
 			"emergency",
 		);
 		await collisionJournal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		writeExclusiveFile(
-			indexEntryPath,
-			JSON.stringify(
-				{
-					certificateNotice: UNIT1_LIMITS.certificateNotice,
-					runId,
-					attemptId,
-					caseLabel: request.caseLabel,
-					status: "PreWorkInfrastructureFailed",
-					reason: `Exclusive resource collision: ${msg}`,
-					closureBeforeSha256: closureBefore.closureDigest,
-				},
-				null,
-				2,
-			),
-		);
-		return {
+		return publishAttemptIndex({
 			certificateNotice: UNIT1_LIMITS.certificateNotice,
 			toolProfile: UNIT1_LIMITS.toolProfile,
 			runId,
@@ -259,7 +243,7 @@ export async function runUnit1Proof(
 			rawArtifacts: { journalPath, piStdoutPath, piStderrPath },
 			closureBeforeSha256: closureBefore.closureDigest,
 			closureAfterSha256: null,
-		};
+		});
 	}
 
 	let uncertified = false;
@@ -328,23 +312,7 @@ export async function runUnit1Proof(
 		await piStdoutSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		await piStderrSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		await journal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		writeExclusiveFile(
-			indexEntryPath,
-			JSON.stringify(
-				{
-					certificateNotice: UNIT1_LIMITS.certificateNotice,
-					runId,
-					attemptId,
-					caseLabel: request.caseLabel,
-					status,
-					reason: failureReason,
-					closureBeforeSha256: closureBefore.closureDigest,
-				},
-				null,
-				2,
-			),
-		);
-		return {
+		return publishAttemptIndex({
 			certificateNotice: UNIT1_LIMITS.certificateNotice,
 			toolProfile: UNIT1_LIMITS.toolProfile,
 			runId,
@@ -369,7 +337,7 @@ export async function runUnit1Proof(
 			rawArtifacts: { journalPath, piStdoutPath, piStderrPath },
 			closureBeforeSha256: closureBefore.closureDigest,
 			closureAfterSha256: closureBefore.closureDigest,
-		};
+		});
 	}
 
 	writeExclusiveFile(
@@ -569,11 +537,7 @@ export async function runUnit1Proof(
 		await piStdoutSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		await piStderrSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		await journal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		writeExclusiveFile(
-			indexEntryPath,
-			JSON.stringify({ certificateNotice: UNIT1_LIMITS.certificateNotice, runId, attemptId, status, reason: failureReason }, null, 2),
-		);
-		return {
+		return publishAttemptIndex({
 			certificateNotice: UNIT1_LIMITS.certificateNotice,
 			toolProfile: UNIT1_LIMITS.toolProfile,
 			runId,
@@ -598,7 +562,7 @@ export async function runUnit1Proof(
 			rawArtifacts: { journalPath, piStdoutPath, piStderrPath },
 			closureBeforeSha256: closureBefore.closureDigest,
 			closureAfterSha256: null,
-		};
+		});
 	}
 
 	const pi = piChild;
@@ -648,7 +612,7 @@ export async function runUnit1Proof(
 		maxFrameBytes: UNIT1_LIMITS.controlFrameBytes,
 		maxAggregateBytes: UNIT1_LIMITS.controlAggregateBytes,
 		label: "pi_rpc_stdout",
-		onRawChunk: async (chunk) => { await piStdoutSink.writeChunk(chunk); },
+		rawSink: piStdoutSink,
 		onError: (err) => {
 			uncertified = true;
 			terminatePiAndGroups(`Pi RPC stdout framing error: ${err.message}`, "InvalidEvidence");
@@ -1476,7 +1440,7 @@ export async function runUnit1Proof(
 				uncertified = true;
 			}
 		}
-		if (uncertified && status === "Answered") status = "InvalidEvidence";
+		if (uncertified) status = invalidateAnswer(status);
 		const recordCleanup = async (): Promise<boolean> => {
 			const record = async (kind: ProofJournalRecord["kind"], body: Record<string, unknown>): Promise<boolean> => {
 				if (performance.now() >= evidence.drainDeadline) return false;
@@ -1500,7 +1464,7 @@ export async function runUnit1Proof(
 			: journalDrain;
 		if (captureDrain.kind === "incomplete" || journal.hasFailed) {
 			uncertified = true;
-			if (status === "Answered") status = "InvalidEvidence";
+			status = invalidateAnswer(status);
 		}
 	}
 
@@ -1552,18 +1516,23 @@ export async function runUnit1Proof(
 		closureAfterSha256: closureAfter?.closureDigest ?? null,
 	};
 
-	const publication = await byDeadline(
-		writeExclusiveFileAsync(indexEntryPath, JSON.stringify(result, null, 2)).then(
-			() => null,
-			(err: unknown) => err instanceof Error ? err.message : String(err),
-		),
-		performance.now() + UNIT1_LIMITS.killGraceMs,
-	);
-	if (publication.kind === "completed" && publication.value === null) return result;
-	return {
-		...result, status: "InvalidEvidence", uncertified: true,
-		indexPublicationError: publication.kind === "timeout" ? "Index publication deadline" : publication.value ?? undefined,
-	};
+	return publishAttemptIndex(result);
+}
+
+async function publishAttemptIndex(result: ProofRunResult): Promise<ProofRunResult> {
+	try {
+		await publishExclusiveIndex(result.indexEntryPath, JSON.stringify(result, null, 2));
+		return result;
+	} catch (err) {
+		return {
+			...result, status: "InvalidEvidence", uncertified: true,
+			indexPublicationError: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
+function invalidateAnswer(status: AttemptStatus): AttemptStatus {
+	return status === "Answered" ? "InvalidEvidence" : status;
 }
 
 function sleepMs(ms: number): Promise<void> {

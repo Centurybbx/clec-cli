@@ -38,12 +38,45 @@ test("unsafe process identities never establish absence", async () => {
 });
 
 test("complete valid process observations distinguish alive and gone", async () => {
-  await withProcessTable(valid, async () => {
-    assert.equal((await observeGroupInProcessTable({ pgid: 123, knownIdentities: [], monotonicMs: 0 })).kind, "alive");
-    assert.equal((await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicMs: 0 })).kind, "gone");
-  });
+  const kill = process.kill;
+  try {
+    process.kill = (pid, signal) => {
+      assert.equal(pid, -456);
+      assert.equal(signal, 0);
+      throw Object.assign(new Error("Group absent"), { code: "ESRCH" });
+    };
+    await withProcessTable(valid, async () => {
+      assert.equal((await observeGroupInProcessTable({ pgid: 123, knownIdentities: [], monotonicMs: 0 })).kind, "alive");
+      assert.equal((await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicMs: 0 })).kind, "gone");
+    });
+  } finally {
+    process.kill = kill;
+  }
 });
 
+test("kernel presence and indeterminate probe failures cannot establish absence", async () => {
+  const kill = process.kill;
+  try {
+    for (const [code, reason] of [[null, /still reports/], ["EPERM", /denied access/], ["EINVAL", /probe failed/]]) {
+      let probes = 0;
+      process.kill = (pid, signal) => {
+        assert.equal(pid, -456);
+        assert.equal(signal, 0);
+        probes++;
+        if (code) throw Object.assign(new Error(code), { code });
+        return true;
+      };
+      await withProcessTable(valid, async () => {
+        const result = await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicMs: 0 });
+        assert.equal(probes, 1);
+        assert.equal(result.kind, "unknown");
+        assert.match(result.reason, reason);
+      });
+    }
+  } finally {
+    process.kill = kill;
+  }
+});
 
 test("truncated rows and permission failure stay unknown", async () => {
   for (const raw of [valid.slice(0, -1), new Error("EACCES")]) {

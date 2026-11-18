@@ -1,5 +1,5 @@
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, writeSync } from "node:fs";
-import { lstat, open, type FileHandle } from "node:fs/promises";
+import { link, lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import type { Readable, Writable } from "node:stream";
 import { dirname } from "node:path";
 import { sha256Buffer } from "./pins.ts";
@@ -142,86 +142,161 @@ export type DrainResult = { kind: "drained" } | { kind: "incomplete"; reason: st
 export type WriteResult = { kind: "written" } | { kind: "overflow" } | { kind: "failed"; reason: string };
 const errorText = (err: unknown): string => err instanceof Error ? err.message : String(err);
 
+// One native read plus one default Node pipe high water mark.
+const maxPipeChunkBytes = 2 * UNIT1_LIMITS.maxPendingSinkBytes;
+
 export function attachBoundedJsonlReader<T>(params: {
 	readonly stream: Readable;
 	readonly maxFrameBytes: number;
 	readonly maxAggregateBytes?: number;
 	readonly label: string;
 	readonly onRecord: (record: T) => Promise<void>;
-	readonly onRawChunk?: (chunk: Buffer) => Promise<void>;
+	readonly rawSink?: BoundedRawSink;
 	readonly onError: (err: Error) => void;
 	readonly onEnd?: () => void;
 }): { done: Promise<DrainResult>; stop: () => void } {
-	let stopped = false;
-	let ended = false;
+	const queue: Buffer[] = [];
+	let queuedBytes = 0;
+	let wake: (() => void) | undefined;
+	let terminal: { kind: "end" } | { kind: "fault"; reason: string } | undefined;
+	let aggregate = 0;
+	let wireFrameBytes = 0;
+
+	const stopWith = (reason: string, error?: Error): void => {
+		if (!error || !params.rawSink) queue.length = 0;
+		if (terminal?.kind === "fault") return;
+		terminal = { kind: "fault", reason };
+		params.stream.destroy();
+		if (error) params.onError(error);
+		wake?.();
+	};
+	const onError = (err: Error): void => stopWith(err.message, err);
 	const onEnd = (): void => {
-		ended = true;
-		if (!stopped) params.onEnd?.();
+		if (terminal) return;
+		if (wireFrameBytes !== 0) {
+			onError(new Error(`${params.label} stopped with incomplete framing`));
+			return;
+		}
+		terminal = { kind: "end" };
+		params.onEnd?.();
+		wake?.();
 	};
-	const onError = (err: Error): void => {
-		if (!stopped) params.onError(err);
+	const onClose = (): void => {
+		if (!terminal) onError(new Error(`${params.label} closed before EOF`));
 	};
+	const ingest = (chunk: Buffer): void => {
+		if (terminal) return;
+		try {
+			checkPipeChunk(chunk);
+			if (queue.length >= UNIT1_LIMITS.maxQueuedPipeChunks || queuedBytes + chunk.length > params.maxFrameBytes) {
+				throw new Error(`${params.label} ingress queue exceeded its byte or chunk limit`);
+			}
+			// Queue bytes count the full backing, including small slices of Node's pool.
+			const owned = Buffer.allocUnsafeSlow(chunk.length);
+			chunk.copy(owned);
+			queue.push(owned);
+			queuedBytes += owned.buffer.byteLength;
+			aggregate += chunk.length;
+			if (params.maxAggregateBytes !== undefined && aggregate > params.maxAggregateBytes) {
+				throw new FrameCapExceededError(params.maxAggregateBytes, aggregate, params.label);
+			}
+			for (let offset = 0; offset < chunk.length;) {
+				const newline = chunk.indexOf(10, offset);
+				const end = newline < 0 ? chunk.length : newline;
+				wireFrameBytes += end - offset;
+				if (wireFrameBytes + 1 > params.maxFrameBytes) {
+					throw new FrameCapExceededError(params.maxFrameBytes, wireFrameBytes + 1, params.label);
+				}
+				if (newline < 0) break;
+				wireFrameBytes = 0;
+				offset = newline + 1;
+			}
+			wake?.();
+		} catch (err) {
+			onError(err instanceof Error ? err : new Error(String(err)));
+		}
+	};
+
 	params.stream.once("end", onEnd);
+	params.stream.once("close", onClose);
 	params.stream.on("error", onError);
+	params.stream.on("data", ingest);
+	if (params.stream.readableEnded) onEnd();
+	else if (params.stream.destroyed) onClose();
 
 	const done = (async (): Promise<DrainResult> => {
-		let pieces: Buffer[] = [];
+		const decoder = new TextDecoder("utf-8", { fatal: true });
+		let partial = Buffer.alloc(0);
 		let frameBytes = 0;
-		let aggregate = 0;
-			const decoder = new TextDecoder("utf-8", { fatal: true });
+		const faulted = () => terminal?.kind === "fault";
 		try {
-			for await (const chunk of params.stream.iterator({ destroyOnReturn: false })) {
-				if (stopped) break;
-				await params.onRawChunk?.(chunk);
-				if (stopped) break;
-				aggregate += chunk.length;
-				if (params.maxAggregateBytes !== undefined && aggregate > params.maxAggregateBytes) {
-					throw new FrameCapExceededError(params.maxAggregateBytes, aggregate, params.label);
+			for (;;) {
+				const chunk = queue.shift();
+				if (!chunk) {
+					if (terminal?.kind === "end") return { kind: "drained" };
+					if (terminal?.kind === "fault") return { kind: "incomplete", reason: terminal.reason };
+					await new Promise<void>((resolve) => { wake = resolve; });
+					wake = undefined;
+					continue;
 				}
-				let offset = 0;
-				while (offset < chunk.length && !stopped) {
+				queuedBytes -= chunk.buffer.byteLength;
+				if (params.rawSink) {
+					const written = await writeRawChunks(params.rawSink, chunk);
+					if (written.kind !== "written") {
+						const reason = written.kind === "failed" ? written.reason : "Raw capture overflow";
+						stopWith(reason);
+						return { kind: "incomplete", reason };
+					}
+				}
+				for (let offset = 0; offset < chunk.length && !faulted();) {
 					const newline = chunk.indexOf(10, offset);
 					const end = newline < 0 ? chunk.length : newline;
-					const length = end - offset;
-					if (frameBytes + length + 1 > params.maxFrameBytes) {
-						throw new FrameCapExceededError(params.maxFrameBytes, frameBytes + length + 1, params.label);
-					}
-					if (newline < 0) {
-						pieces.push(Buffer.from(chunk.subarray(offset, end)));
-						frameBytes += length;
-						break;
-					}
 					const tail = chunk.subarray(offset, end);
-					const line = pieces.length === 0 ? tail : Buffer.concat([...pieces, tail], frameBytes + length);
-					pieces = [];
-					frameBytes = 0;
-					if (line.length > 0) {
-						await params.onRecord(JSON.parse(decoder.decode(line)) as T);
+					if (newline < 0 || frameBytes > 0) {
+						const needed = frameBytes + tail.length;
+						if (needed > partial.length) {
+							const grown = Buffer.allocUnsafeSlow(Math.min(params.maxFrameBytes, Math.max(needed, partial.length * 2)));
+							partial.copy(grown, 0, 0, frameBytes);
+							partial = grown;
+						}
+						tail.copy(partial, frameBytes);
+						frameBytes = needed;
+						if (newline < 0) break;
 					}
+					const line = frameBytes === 0 ? tail : partial.subarray(0, frameBytes);
+					frameBytes = 0;
+					partial = Buffer.alloc(0);
 					offset = end + 1;
+					if (line.length > 0) await params.onRecord(JSON.parse(decoder.decode(line)) as T);
 				}
 			}
-			if (!ended || frameBytes > 0) {
-				throw new Error(`${params.label} stopped with incomplete framing`);
-			}
-			return { kind: "drained" };
 		} catch (err) {
-			const reason = errorText(err);
-			onError(new Error(reason));
-			return { kind: "incomplete", reason };
+			onError(err instanceof Error ? err : new Error(String(err)));
+			return { kind: "incomplete", reason: errorText(err) };
 		} finally {
-			stopped = true;
+			queue.length = 0;
+			// Leave the error listener through close if destroy has queued a stream error.
+			params.stream.off("data", ingest);
 			params.stream.off("end", onEnd);
-			params.stream.off("error", onError);
+			if (params.stream.closed) params.stream.off("error", onError);
+			else params.stream.once("close", () => params.stream.off("error", onError));
 		}
 	})();
-	return {
-		done,
-		stop: () => {
-			stopped = true;
-			if (!ended) params.stream.destroy();
-		},
-	};
+	return { done, stop: () => stopWith(`${params.label} stopped`) };
+}
+
+function checkPipeChunk(chunk: Buffer): void {
+	if (!Buffer.isBuffer(chunk) || chunk.buffer.byteLength > maxPipeChunkBytes) {
+		throw new Error(`Pipe input exceeded its ${maxPipeChunkBytes}-byte backing limit`);
+	}
+}
+
+async function writeRawChunks(sink: BoundedRawSink, chunk: Buffer): Promise<WriteResult> {
+	for (let offset = 0; offset < chunk.length; offset += UNIT1_LIMITS.maxPendingSinkBytes) {
+		const result = await sink.writeChunk(chunk.subarray(offset, offset + UNIT1_LIMITS.maxPendingSinkBytes));
+		if (result.kind !== "written") return result;
+	}
+	return { kind: "written" };
 }
 
 export async function captureRawStream(
@@ -232,11 +307,13 @@ export async function captureRawStream(
 	stream.on("error", onError);
 	try {
 		for await (const chunk of stream.iterator({ destroyOnReturn: false })) {
-			const result = await sink.writeChunk(chunk);
+			checkPipeChunk(chunk);
+			const result = await writeRawChunks(sink, chunk);
 			if (result.kind !== "written") return { kind: "incomplete", reason: result.kind };
 		}
 		return { kind: "drained" };
 	} catch (err) {
+		onError(err instanceof Error ? err : new Error(String(err)));
 		return { kind: "incomplete", reason: errorText(err) };
 	} finally {
 		stream.off("error", onError);
@@ -291,37 +368,34 @@ export class BoundedRawSink {
 	get bytesWritten(): number { return this.written; }
 	get maxPendingObserved(): number { return this.pendingPeak; }
 
-	async writeChunk(chunk: Buffer): Promise<WriteResult> {
+	writeChunk(chunk: Buffer): Promise<WriteResult> {
 		if (this.closing || this.pending || this.failure) {
-			return this.fail(new Error(this.failure ?? "Raw sink is closing or already has a pending write"));
+			return Promise.resolve(this.fail(new Error(this.failure ?? "Raw sink is closing or already has a pending write")));
 		}
-		if (this.overflowed) return { kind: "overflow" };
+		if (chunk.length > UNIT1_LIMITS.maxPendingSinkBytes) {
+			return Promise.resolve(this.fail(new Error("Raw sink input exceeds its pending write limit")));
+		}
+		if (this.overflowed) return Promise.resolve({ kind: "overflow" });
 		const remaining = this.params.maxBytes - this.written;
 		const length = Math.min(remaining, chunk.length);
 		this.overflowed = chunk.length > remaining;
-		const work = this.writePrefix(chunk, length);
+		const payload = Buffer.allocUnsafeSlow(length);
+		chunk.copy(payload, 0, 0, length);
+		this.pendingPeak = Math.max(this.pendingPeak, payload.buffer.byteLength);
+		const work = this.writePayload(payload).finally(() => { this.pending = undefined; });
 		this.pending = work;
 		if (this.overflowed) this.params.onOverflow?.(this.written + chunk.length);
-		try {
-			return await work;
-		} finally {
-			this.pending = undefined;
-		}
+		return work;
 	}
 
-	private async writePrefix(chunk: Buffer, length: number): Promise<WriteResult> {
+	private async writePayload(payload: Buffer): Promise<WriteResult> {
 		try {
 			const file = await this.file;
 			if (file === null) return { kind: "failed", reason: this.failure ?? "Open failed" };
-			for (let offset = 0; offset < length;) {
-				const end = Math.min(length, offset + UNIT1_LIMITS.maxPendingSinkBytes);
-				const payload = Buffer.allocUnsafeSlow(end - offset);
-				chunk.copy(payload, 0, offset, end);
-				this.pendingPeak = Math.max(this.pendingPeak, payload.buffer.byteLength);
-				if (this.params.stallMs) await new Promise<void>((resolve) => setTimeout(resolve, this.params.stallMs));
-				await writeExact(file, payload, (bytes) => { this.written += bytes; });
-				offset = end;
+			if (payload.length > 0 && this.params.stallMs) {
+				await new Promise<void>((resolve) => setTimeout(resolve, this.params.stallMs));
 			}
+			await writeExact(file, payload, (bytes) => { this.written += bytes; });
 			return { kind: this.overflowed ? "overflow" : "written" };
 		} catch (err) {
 			return this.fail(err);
@@ -446,12 +520,20 @@ export class BoundedJournalWriter {
 	}
 }
 
-export async function writeExclusiveFileAsync(path: string, content: string): Promise<void> {
-	const file = await openExclusive(path);
+export async function publishExclusiveIndex(path: string, content: string): Promise<void> {
+	const stagingPath = `${path}.pending`;
+	const file = await openExclusive(stagingPath);
 	try {
-		await writeExact(file, Buffer.from(content));
+		try {
+			await writeExact(file, Buffer.from(content));
+			await file.sync();
+		} finally {
+			await file.close();
+		}
+		await link(stagingPath, path);
 	} finally {
-		await file.close();
+		// The link decides publication. An unlink error can leave a private staging file.
+		await unlink(stagingPath).catch(() => {});
 	}
 }
 

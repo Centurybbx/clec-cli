@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Socket } from "node:net";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const MAX_CONTROL_FRAME_BYTES = 16 * 1024 * 1024;
@@ -244,7 +244,7 @@ export default function clecUnit1Adapter(pi: ExtensionAPI): void {
 		),
 		executionMode: "sequential",
 		execute(toolCallId, params) {
-			return new Promise((resolve) => {
+			return new Promise<AgentToolResult<unknown>>((resolve) => {
 				try {
 					const seq = ++outboundSeq;
 					pendingToolResults.set(seq, (res) => {

@@ -62,6 +62,7 @@ export const UNIT1_LIMITS = {
 	journalEmergencyReserveBytes: 1024 * 1024,
 	killGraceMs: 2_000,
 	maxPendingSinkBytes: 65_536,
+	maxQueuedPipeChunks: 1024,
 	promptPrefix: "CLEC public question follows.\n",
 	startupTimeoutMs: 15_000,
 	toolProfile: "unit1-narrow-status-only",
