@@ -1,15 +1,20 @@
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import {
 	attachBoundedJsonlReader,
+	byDeadline,
+	captureRawStream,
+	type DrainResult,
 	BoundedJournalWriter,
 	BoundedRawSink,
 	createExclusiveDir,
+	scheduleDeadline,
 	writeBoundedFrame,
 	writeExclusiveFile,
+	writeExclusiveFileAsync,
 } from "./framing.ts";
 import {
 	buildScrubbedChildEnv,
@@ -17,12 +22,15 @@ import {
 	type ExecutionClosure,
 	PI_BUNDLE_ENTRY,
 	sha256Buffer,
+	verifyFilePin,
 } from "./pins.ts";
 import {
-	observeGroupInProcessTable,
+	armStop,
+	type ArmedStop,
 	ProcessGroupRegistry,
 	readOsProcessTable,
 	runRegisteredNativeGroup,
+	resolveDefaultHelperPath,
 } from "./process-group.ts";
 import type {
 	AttemptId,
@@ -149,11 +157,18 @@ export async function runUnit1Proof(
 ): Promise<ProofRunResult> {
 	const monotonicStartMs = performance.now();
 	const nowMs = (): number => Math.round(performance.now() - monotonicStartMs);
+	const endpoint = new URL(request.mockBaseUrl);
+	if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" ||
+		!endpoint.port || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+		throw new Error("Unit 1 requires a private IPv4 loopback mock endpoint");
+	}
 
 	const runId = makeRunId(`u1-${Date.now()}-${randomBytes(4).toString("hex")}`);
 	const attemptId = request.faults?.duplicateAttemptIdCollision ?? makeAttemptId(`${runId}-a1`);
 
 	const closureBefore = options?.cachedClosure ?? captureExecutionClosure();
+	const helperPin = closureBefore.unit1Files.find((file) => file.logicalPath === resolveDefaultHelperPath());
+	if (!helperPin) throw new Error("Missing pinned native helper");
 
 	const bundleDir = join(request.evidenceParentDir, runId);
 	const attemptDir = join(request.evidenceParentDir, "attempts", attemptId);
@@ -192,7 +207,7 @@ export async function runUnit1Proof(
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		const collisionJournal = new BoundedJournalWriter({ path: join(bundleDir, "collision.journal.jsonl") });
-		collisionJournal.append(
+		await collisionJournal.append(
 			{
 				runId,
 				attemptId,
@@ -200,9 +215,9 @@ export async function runUnit1Proof(
 				body: { status: "PreWorkInfrastructureFailed", reason: `Exclusive resource collision: ${msg}` },
 			},
 			nowMs(),
-			true,
+			"emergency",
 		);
-		collisionJournal.close();
+		await collisionJournal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		writeExclusiveFile(
 			indexEntryPath,
 			JSON.stringify(
@@ -247,67 +262,27 @@ export async function runUnit1Proof(
 		};
 	}
 
-	const journal = new BoundedJournalWriter({
-		path: journalPath,
-		failNextKind: request.faults?.injectJournalFailOnKind,
-	});
-
 	let uncertified = false;
-	let piOverflowed = false;
-	const piStdoutSink = new BoundedRawSink({
-		path: piStdoutPath,
-		maxBytes: UNIT1_LIMITS.piStdoutBytes,
-		stallMs: request.faults?.simulatedSinkStallMs,
-		onOverflow: (observedBytes) => {
-			piOverflowed = true;
-			uncertified = true;
-			journal.append(
-				{
-					runId,
-					attemptId,
-					kind: "overflow_uncertified",
-					body: { stream: "pi_stdout", limit: UNIT1_LIMITS.piStdoutBytes, observedBytes },
-				},
-				nowMs(),
-				true,
-			);
-		},
-		onWriteFailure: (err) => {
-			uncertified = true;
-			journal.append(
-				{ runId, attemptId, kind: "journal_fault", body: { stream: "pi_stdout", error: err.message } },
-				nowMs(),
-				true,
-			);
-		},
+	let overflow: { stream: string; observedBytes: number } | undefined;
+	let stopOnIoFailure: ((reason: string) => void) | undefined;
+	const ioFailure = (reason: string): void => {
+		uncertified = true;
+		stopOnIoFailure?.(reason);
+	};
+	const journal = new BoundedJournalWriter({
+		path: journalPath, failNextKind: request.faults?.injectJournalFailOnKind,
+		onFailure: ioFailure,
 	});
-	const piStderrSink = new BoundedRawSink({
-		path: piStderrPath,
-		maxBytes: UNIT1_LIMITS.piStderrBytes,
-		stallMs: request.faults?.simulatedSinkStallMs,
-		onOverflow: (observedBytes) => {
-			piOverflowed = true;
-			uncertified = true;
-			journal.append(
-				{
-					runId,
-					attemptId,
-					kind: "overflow_uncertified",
-					body: { stream: "pi_stderr", limit: UNIT1_LIMITS.piStderrBytes, observedBytes },
-				},
-				nowMs(),
-				true,
-			);
+	const piSink = (stream: string, path: string, maxBytes: number): BoundedRawSink => new BoundedRawSink({
+		path, maxBytes, stallMs: request.faults?.simulatedSinkStallMs,
+		onOverflow: (bytes) => {
+			ioFailure(`${stream} overflow: ${bytes} > ${maxBytes}`);
+			overflow = { stream, observedBytes: bytes };
 		},
-		onWriteFailure: (err) => {
-			uncertified = true;
-			journal.append(
-				{ runId, attemptId, kind: "journal_fault", body: { stream: "pi_stderr", error: err.message } },
-				nowMs(),
-				true,
-			);
-		},
+		onWriteFailure: (err) => ioFailure(`${stream}: ${err.message}`),
 	});
+	const piStdoutSink = piSink("pi_stdout", piStdoutPath, UNIT1_LIMITS.piStdoutBytes);
+	const piStderrSink = piSink("pi_stderr", piStderrPath, UNIT1_LIMITS.piStderrBytes);
 
 	const providerId = request.providerId ?? "mock-openai";
 	const modelId = request.modelId ?? "mock-gpt";
@@ -345,14 +320,14 @@ export async function runUnit1Proof(
 	if (!precheck.ok) {
 		uncertified = true;
 		failureReason = precheck.reason;
-		journal.append(
+		await journal.append(
 			{ runId, attemptId, kind: "attempt_closed", body: { status, reason: precheck.reason } },
 			nowMs(),
-			true,
+			"emergency",
 		);
-		piStdoutSink.close();
-		piStderrSink.close();
-		journal.close();
+		await piStdoutSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await piStderrSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await journal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		writeExclusiveFile(
 			indexEntryPath,
 			JSON.stringify(
@@ -445,7 +420,7 @@ export async function runUnit1Proof(
 		),
 	);
 
-	journal.append(
+	await journal.append(
 		{
 			runId,
 			attemptId,
@@ -460,7 +435,7 @@ export async function runUnit1Proof(
 		},
 		nowMs(),
 	);
-	journal.append(
+	await journal.append(
 		{
 			runId,
 			attemptId,
@@ -477,6 +452,12 @@ export async function runUnit1Proof(
 		},
 		nowMs(),
 	);
+
+	if (!(await piStdoutSink.ready) || !(await piStderrSink.ready) || journal.hasFailed) {
+		const deadline = performance.now() + UNIT1_LIMITS.killGraceMs;
+		await Promise.all([piStdoutSink.close(deadline), piStderrSink.close(deadline), journal.close(deadline)]);
+		throw new Error("Pre-launch capture or journal allocation failed");
+	}
 
 	const adapterPath = request.faults?.adapterPathOverride ?? resolveDefaultAdapterPath();
 	const piArgs = [
@@ -512,65 +493,62 @@ export async function runUnit1Proof(
 	});
 
 	let piChild: ChildProcess | null = null;
-	let piLstart: string | null = null;
+
 	const nativeAbort = new AbortController();
 	let admissionClosed = false;
 	let attemptOrdinal = 0;
 	let expectedOuterWatermark = 0;
 	let lastPermitAck: Extract<PipeOuterToChild, { kind: "provider_permit" }> | null = null;
-	let nativeQueue: Promise<void> = Promise.resolve();
 	let stopTerminationStarted = false;
-	let terminationPromise: Promise<void> | null = null;
+	const terminated = Promise.withResolvers<void>();
+	let stopTicket: ArmedStop | undefined;
+	let groupCleanup: Promise<void> | undefined;
+	let cleanPiEof = false;
+	let resolveStartupWait: ((ok: boolean, reason?: string) => void) | null = null;
+	let boundReadySeen = false;
+	let pendingGetStateResolve: ((res: Record<string, unknown> | null) => void) | null = null;
+	let pendingIdleGetStateResolve: ((res: Record<string, unknown> | null) => void) | null = null;
+	let promptPreflightSeen = false;
+	let promptPreflightDisposition: string | null = null;
+	let terminalAssistantStopReason: string | null = null;
+	let agentSettledSeen = false;
+	let settledResolve: (() => void) | null = null;
+	let piExited = false;
+	let piExitResolve: (() => void) | null = null;
+	let captureDrain: DrainResult = { kind: "drained" };
 
-	const terminatePiAndGroups = (reason: string, finalStatus: AttemptStatus): Promise<void> => {
-		if (terminationPromise !== null) return terminationPromise;
-		stopTerminationStarted = true;
+	const beginStop = (at = performance.now()): ArmedStop => {
+		if (stopTicket) return stopTicket;
 		admissionClosed = true;
-		if (failureReason === null) failureReason = reason;
-		status = finalStatus;
+		const trigger = { at, detectedAt: performance.now() };
+		stopTicket = armStop({ trigger, child: piChild, graceMs: 350 });
+		registry.beginStop(trigger, request.faults?.injectOmitNativeTeardown === true);
 		nativeAbort.abort();
-		terminationPromise = (async () => {
-			if (piChild && piChild.exitCode === null && piChild.signalCode === null && typeof piChild.pid === "number") {
-				const killStart = performance.now();
-				try {
-					piChild.kill("SIGTERM");
-				} catch {
-					// Ignore
-				}
-				const termWait = new Promise<void>((res) => {
-					const onEx = () => res();
-					piChild!.once("exit", onEx);
-					setTimeout(() => {
-						piChild!.off("exit", onEx);
-						res();
-					}, 350);
-				});
-				await termWait;
-				if (piChild.exitCode === null && piChild.signalCode === null) {
-					try {
-						piChild.kill("SIGKILL");
-					} catch {
-						// Ignore
-					}
-					await new Promise<void>((res) => {
-						const onEx = () => res();
-						piChild!.once("exit", onEx);
-						setTimeout(() => {
-							piChild!.off("exit", onEx);
-							res();
-						}, Math.max(200, UNIT1_LIMITS.killGraceMs - Math.round(performance.now() - killStart)));
-					});
-				}
-			}
-			await registry.stopAll({
-				journal,
-				runId,
-				attemptId,
-				injectPsFailure: request.faults?.injectPsFailure,
-				omitTeardownForTesting: request.faults?.injectOmitNativeTeardown,
-			});
-		})();
-		return terminationPromise;
+		resolveStartupWait?.(false, failureReason ?? "Startup stopped");
+		pendingGetStateResolve?.(null);
+		pendingIdleGetStateResolve?.(null);
+		settledResolve?.();
+		piExitResolve?.();
+		groupCleanup = registry.finishStop(request.faults?.injectPsFailure);
+		return stopTicket;
+	};
+	const terminatePiAndGroups = (reason: string, finalStatus: AttemptStatus, at?: number): void => {
+		if (!stopTicket) {
+			stopTerminationStarted = true;
+			failureReason = reason;
+			status = finalStatus;
+		}
+		beginStop(at);
+		terminated.resolve();
+	};
+	stopOnIoFailure = (reason) => terminatePiAndGroups(reason, "InvalidEvidence");
+	const caseDeadlineMs = request.faults?.caseDeadlineMsOverride ?? UNIT1_LIMITS.caseDeadlineMs;
+	const caseDeadline = performance.now() + caseDeadlineMs;
+	const caseTimeout = (): void => terminatePiAndGroups(`Case deadline ${caseDeadlineMs} ms exceeded`, "DeniedAndTerminated", caseDeadline);
+	const cancelCaseTimer = scheduleDeadline(caseDeadline, caseTimeout);
+	const releaseAllowed = (): boolean => {
+		if (performance.now() >= caseDeadline) caseTimeout();
+		return !nativeAbort.signal.aborted && !admissionClosed;
 	};
 
 	try {
@@ -582,13 +560,15 @@ export async function runUnit1Proof(
 			stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
 		});
 	} catch (err) {
+		cancelCaseTimer();
+		stopOnIoFailure = undefined;
 		failureReason = `Failed to spawn Pi: ${err instanceof Error ? err.message : String(err)}`;
 		status = "PreWorkInfrastructureFailed";
 		uncertified = true;
-		journal.append({ runId, attemptId, kind: "attempt_closed", body: { status, reason: failureReason } }, nowMs(), true);
-		piStdoutSink.close();
-		piStderrSink.close();
-		journal.close();
+		await journal.append({ runId, attemptId, kind: "attempt_closed", body: { status, reason: failureReason } }, nowMs(), "emergency");
+		await piStdoutSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await piStderrSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await journal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 		writeExclusiveFile(
 			indexEntryPath,
 			JSON.stringify({ certificateNotice: UNIT1_LIMITS.certificateNotice, runId, attemptId, status, reason: failureReason }, null, 2),
@@ -621,87 +601,63 @@ export async function runUnit1Proof(
 		};
 	}
 
-	const rpcIn = piChild.stdin as Writable;
+	const pi = piChild;
+	const rpcIn = pi.stdin as Writable;
 	const rpcOut = piChild.stdout as Readable;
 	const rpcErr = piChild.stderr as Readable;
 	const pipeToAdapter = piChild.stdio[3] as Writable;
 	const pipeFromAdapter = piChild.stdio[4] as Readable;
 
-	if (typeof piChild.pid === "number") {
-		const t = readOsProcessTable();
-		const entry = t.ok ? t.entries.find((e) => e.pid === piChild!.pid) : undefined;
-		piLstart = entry?.lstart ?? null;
-	}
-
-	journal.append(
-		{
-			runId,
-			attemptId,
-			kind: "pi_spawned",
-			body: { pid: piChild.pid ?? null, lstart: piLstart, adapterPath },
-		},
-		nowMs(),
-	);
-
-	let resolveStartupWait: ((ok: boolean, reason?: string) => void) | null = null;
-	let boundReadySeen = false;
-	let pendingGetStateResolve: ((res: Record<string, unknown>) => void) | null = null;
-	let pendingIdleGetStateResolve: ((res: Record<string, unknown>) => void) | null = null;
-	let promptPreflightSeen = false;
-	let promptPreflightDisposition: string | null = null;
-	let terminalAssistantStopReason: string | null = null;
-	let agentSettledSeen = false;
-	let settledResolve: (() => void) | null = null;
-	let piExited = false;
-	let piExitResolve: (() => void) | null = null;
-
 	piChild.on("exit", (code, sig) => {
 		piExited = true;
 		piExitCode = code;
 		piSignal = sig;
-		nativeAbort.abort();
-		journal.append(
-			{
-				runId,
-				attemptId,
-				kind: "pi_exited",
-				body: { code, signal: sig },
-			},
-			nowMs(),
-			true,
-		);
-		resolveStartupWait?.(false, `Pi exited early (code=${String(code)}, sig=${String(sig)})`);
-		settledResolve?.();
+		if (cleanPiEof && code === 0) beginStop();
+		else terminatePiAndGroups(`Pi exited unexpectedly (code=${code}, signal=${sig})`, "DeniedAndTerminated");
 		piExitResolve?.();
 	});
+	piChild.on("error", (err) => terminatePiAndGroups(err.message, "PreWorkInfrastructureFailed"));
+	for (const stream of [rpcIn, pipeToAdapter]) {
+		stream.on("error", (err) => {
+			if (!cleanPiEof) terminatePiAndGroups(err.message, "InvalidEvidence");
+		});
+	}
+	const spawned = (async () => {
+		const deadline = Math.min(caseDeadline, performance.now() + 3_000);
+		const freshAfter = performance.now();
+		let detail = "Pi PID absent from process table";
+		do {
+			const table = await readOsProcessTable(deadline, freshAfter);
+			if (nativeAbort.signal.aborted) return;
+			const row = table.ok ? table.entries.find((entry) => entry.pid === piChild?.pid && entry.ppid === process.pid) : undefined;
+			if (row) {
+				await journal.append({
+					runId, attemptId, kind: "pi_spawned", body: { pid: row.pid, lstart: row.lstart, adapterPath },
+				}, nowMs());
+				return;
+			}
+			if (!table.ok) detail = table.reason;
+			await sleepMs(25);
+		} while (!nativeAbort.signal.aborted && performance.now() < deadline);
+		terminatePiAndGroups(`Could not verify Pi process identity: ${detail}`, "PreWorkInfrastructureFailed");
+	})();
+	const stderrCaptured = captureRawStream(rpcErr, piStderrSink, (err) => ioFailure(err.message));
 
-	rpcErr.on("data", (chunk: Buffer) => {
-		const ok = piStderrSink.writeChunk(chunk, () => rpcErr.pause(), () => rpcErr.resume());
-		if (!ok && piStderrSink.hasOverflowed) {
-			void terminatePiAndGroups("Pi stderr exceeded 65536 bytes", "InvalidEvidence");
-		}
-	});
-
-	const detachRpcReader = attachBoundedJsonlReader<Record<string, unknown>>({
+	const rpcReader = attachBoundedJsonlReader<Record<string, unknown>>({
 		stream: rpcOut,
 		maxFrameBytes: UNIT1_LIMITS.controlFrameBytes,
 		maxAggregateBytes: UNIT1_LIMITS.controlAggregateBytes,
 		label: "pi_rpc_stdout",
-		onRawChunk: (chunk) => {
-			const ok = piStdoutSink.writeChunk(chunk, () => rpcOut.pause(), () => rpcOut.resume());
-			if (!ok && piStdoutSink.hasOverflowed) {
-				void terminatePiAndGroups("Pi stdout exceeded 16 MiB cap", "InvalidEvidence");
-			}
-		},
+		onRawChunk: async (chunk) => { await piStdoutSink.writeChunk(chunk); },
 		onError: (err) => {
 			uncertified = true;
-			void terminatePiAndGroups(`Pi RPC stdout framing error: ${err.message}`, "InvalidEvidence");
+			terminatePiAndGroups(`Pi RPC stdout framing error: ${err.message}`, "InvalidEvidence");
 		},
 		onEnd: () => {
-			resolveStartupWait?.(false, "Pi RPC stdout EOF before startup completed");
-			settledResolve?.();
+			if (!cleanPiEof) terminatePiAndGroups("Pi RPC stdout EOF", "DeniedAndTerminated");
 		},
-		onRecord: (rec) => {
+		onRecord: async (rec) => {
+			await spawned;
 			if (rec.type === "response") {
 				if (rec.id === "state-1" && rec.command === "get_state") {
 					pendingGetStateResolve?.(rec);
@@ -718,7 +674,7 @@ export async function runUnit1Proof(
 						const data = rec.data as Record<string, unknown> | undefined;
 						promptPreflightSeen = true;
 						promptPreflightDisposition = typeof data?.disposition === "string" ? data.disposition : null;
-						journal.append(
+						await journal.append(
 							{
 								runId,
 								attemptId,
@@ -728,14 +684,14 @@ export async function runUnit1Proof(
 							nowMs(),
 						);
 					} else {
-						void terminatePiAndGroups(`Prompt command failed: ${String(rec.error)}`, "TaskFailed");
+						terminatePiAndGroups(`Prompt command failed: ${String(rec.error)}`, "TaskFailed");
 					}
 					return;
 				}
 			}
 
 			if (rec.type === "extension_error") {
-				journal.append(
+				await journal.append(
 					{
 						runId,
 						attemptId,
@@ -743,7 +699,7 @@ export async function runUnit1Proof(
 						body: { extensionError: rec },
 					},
 					nowMs(),
-					true,
+					"emergency",
 				);
 			}
 
@@ -761,7 +717,11 @@ export async function runUnit1Proof(
 							batchCalls.push({ id, name });
 							if (id.length === 0 || seenDeclaredCallIds.has(id)) {
 								declaredToolCalls.push({ id, name, ordinal: null });
-								journal.append(
+								terminatePiAndGroups(
+									id.length === 0 ? "Empty toolCall.id detected" : `Duplicate toolCall.id detected: ${id}`,
+									"DeniedAndTerminated",
+								);
+								await journal.append(
 									{
 										runId,
 										attemptId,
@@ -769,10 +729,6 @@ export async function runUnit1Proof(
 										body: { reason: id.length === 0 ? "Empty toolCall.id" : "Duplicate toolCall.id", callId: id, name },
 									},
 									nowMs(),
-								);
-								void terminatePiAndGroups(
-									id.length === 0 ? "Empty toolCall.id detected" : `Duplicate toolCall.id detected: ${id}`,
-									"DeniedAndTerminated",
 								);
 							} else {
 								seenDeclaredCallIds.add(id);
@@ -787,7 +743,7 @@ export async function runUnit1Proof(
 						}
 					}
 					if (batchCalls.length > 0) {
-						const batchCommit = journal.append(
+						const batchCommit = await journal.append(
 							{
 								runId,
 								attemptId,
@@ -798,7 +754,7 @@ export async function runUnit1Proof(
 						);
 						if (!batchCommit.ok) {
 							uncertified = true;
-							void terminatePiAndGroups(`tool_declared_batch journal failed: ${batchCommit.error}`, "InvalidEvidence");
+							terminatePiAndGroups(`tool_declared_batch journal failed: ${batchCommit.error}`, "InvalidEvidence");
 						}
 					}
 					const stopReason = typeof msg.stopReason === "string" ? msg.stopReason : null;
@@ -807,7 +763,7 @@ export async function runUnit1Proof(
 						const joined = textParts.join("");
 						if (Buffer.byteLength(joined, "utf8") > UNIT1_LIMITS.answerBytes) {
 							uncertified = true;
-							void terminatePiAndGroups(`Answer text exceeded ${UNIT1_LIMITS.answerBytes} bytes`, "InvalidEvidence");
+							terminatePiAndGroups(`Answer text exceeded ${UNIT1_LIMITS.answerBytes} bytes`, "InvalidEvidence");
 						} else if (joined.length > 0) {
 							answerText = joined;
 						}
@@ -817,7 +773,7 @@ export async function runUnit1Proof(
 
 			if (rec.type === "agent_settled") {
 				agentSettledSeen = true;
-				journal.append(
+				await journal.append(
 					{
 						runId,
 						attemptId,
@@ -831,28 +787,31 @@ export async function runUnit1Proof(
 		},
 	});
 
-	const detachAdapterReader = attachBoundedJsonlReader<PipeChildToOuter>({
+	const adapterReader = attachBoundedJsonlReader<PipeChildToOuter>({
 		stream: pipeFromAdapter,
 		maxFrameBytes: UNIT1_LIMITS.controlFrameBytes,
 		maxAggregateBytes: UNIT1_LIMITS.controlAggregateBytes,
 		label: "adapter_private_pipe",
 		onError: (err) => {
 			uncertified = true;
-			void terminatePiAndGroups(`Adapter pipe framing error: ${err.message}`, "InvalidEvidence");
+			terminatePiAndGroups(`Adapter pipe framing error: ${err.message}`, "InvalidEvidence");
 		},
 		onEnd: () => {
-			if (!stopTerminationStarted && !agentSettledSeen) {
+			if (!stopTicket && !cleanPiEof) {
 				resolveStartupWait?.(false, "Adapter private pipe closed (EOF)");
-				void terminatePiAndGroups(
+				terminatePiAndGroups(
 					"Adapter private pipe EOF",
 					boundReadySeen ? "DeniedAndTerminated" : "PreWorkInfrastructureFailed",
 				);
 			}
 		},
-		onRecord: (msg) => {
+		onRecord: async (msg) => {
+			await spawned;
+			if (!releaseAllowed()) return;
 			switch (msg.kind) {
 				case "adapter_fault_note": {
-					journal.append(
+					terminatePiAndGroups(`Adapter fault (${msg.stage}): ${msg.detail}`, "DeniedAndTerminated");
+					await journal.append(
 						{
 							runId,
 							attemptId,
@@ -860,14 +819,13 @@ export async function runUnit1Proof(
 							body: { stage: msg.stage, detail: msg.detail },
 						},
 						nowMs(),
-						true,
+						"emergency",
 					);
-					void terminatePiAndGroups(`Adapter fault (${msg.stage}): ${msg.detail}`, "DeniedAndTerminated");
 					break;
 				}
 				case "bound_ready": {
 					if (boundReadySeen) {
-						void terminatePiAndGroups("Duplicate bound_ready", "DeniedAndTerminated");
+						terminatePiAndGroups("Duplicate bound_ready", "DeniedAndTerminated");
 						return;
 					}
 					const validTools =
@@ -881,13 +839,13 @@ export async function runUnit1Proof(
 						msg.model?.provider === providerId &&
 						msg.model?.id === modelId;
 					if (!validTools) {
-						void terminatePiAndGroups(
+						terminatePiAndGroups(
 							`BoundReady inventory/model mismatch: active=${JSON.stringify(msg.activeTools)} model=${JSON.stringify(msg.model)}`,
 							"PreWorkInfrastructureFailed",
 						);
 						return;
 					}
-					const commitReady = journal.append(
+					const commitReady = await journal.append(
 						{
 							runId,
 							attemptId,
@@ -903,7 +861,7 @@ export async function runUnit1Proof(
 						nowMs(),
 					);
 					if (!commitReady.ok) {
-						void terminatePiAndGroups(`BoundReady commit failed: ${commitReady.error}`, "PreWorkInfrastructureFailed");
+						terminatePiAndGroups(`BoundReady commit failed: ${commitReady.error}`, "PreWorkInfrastructureFailed");
 						return;
 					}
 					const ack: PipeOuterToChild = {
@@ -911,14 +869,15 @@ export async function runUnit1Proof(
 						seq: msg.seq,
 						attemptId,
 					};
-					const commitAck = journal.append(
+					const commitAck = await journal.append(
 						{ runId, attemptId, kind: "bound_ready_ack", body: { seq: msg.seq } },
-						nowMs(),
+						nowMs(), "durable",
 					);
 					if (!commitAck.ok) {
-						void terminatePiAndGroups(`BoundReadyAck commit failed: ${commitAck.error}`, "PreWorkInfrastructureFailed");
+						terminatePiAndGroups(`BoundReadyAck commit failed: ${commitAck.error}`, "PreWorkInfrastructureFailed");
 						return;
 					}
+					if (!releaseAllowed()) return;
 					expectedOuterWatermark = msg.seq;
 					boundReadySeen = true;
 					writeBoundedFrame(pipeToAdapter, ack, UNIT1_LIMITS.controlFrameBytes);
@@ -928,26 +887,27 @@ export async function runUnit1Proof(
 				case "provider_candidate": {
 					if (admissionClosed) {
 						providerRequestsDenied += 1;
-						journal.append(
+						terminatePiAndGroups("Provider request attempted after admission closed", "DeniedAndTerminated");
+						await journal.append(
 							{ runId, attemptId, kind: "provider_denied", body: { reason: "admissionClosed", seq: msg.seq } },
 							nowMs(),
 						);
-						void terminatePiAndGroups("Provider request attempted after admission closed", "DeniedAndTerminated");
 						return;
 					}
 					const actualDigest = sha256Buffer(Buffer.from(msg.payloadJson, "utf8"));
 					if (actualDigest !== msg.payloadDigest) {
 						providerRequestsDenied += 1;
-						journal.append(
+						terminatePiAndGroups("Provider payload digest mismatch", "DeniedAndTerminated");
+						await journal.append(
 							{ runId, attemptId, kind: "provider_denied", body: { reason: "digestMismatch", seq: msg.seq } },
 							nowMs(),
 						);
-						void terminatePiAndGroups("Provider payload digest mismatch", "DeniedAndTerminated");
 						return;
 					}
 					if (msg.watermark !== expectedOuterWatermark) {
 						providerRequestsDenied += 1;
-						journal.append(
+						terminatePiAndGroups("Provider watermark mismatch", "DeniedAndTerminated");
+						await journal.append(
 							{
 								runId,
 								attemptId,
@@ -956,7 +916,6 @@ export async function runUnit1Proof(
 							},
 							nowMs(),
 						);
-						void terminatePiAndGroups("Provider watermark mismatch", "DeniedAndTerminated");
 						return;
 					}
 					const payloadValidation = validateProviderPayload({
@@ -966,7 +925,8 @@ export async function runUnit1Proof(
 					});
 					if (!payloadValidation.ok) {
 						providerRequestsDenied += 1;
-						journal.append(
+						terminatePiAndGroups(payloadValidation.reason, "DeniedAndTerminated");
+						await journal.append(
 							{
 								runId,
 								attemptId,
@@ -975,11 +935,10 @@ export async function runUnit1Proof(
 							},
 							nowMs(),
 						);
-						void terminatePiAndGroups(payloadValidation.reason, "DeniedAndTerminated");
 						return;
 					}
 
-					const candCommit = journal.append(
+					const candCommit = await journal.append(
 						{
 							runId,
 							attemptId,
@@ -996,11 +955,11 @@ export async function runUnit1Proof(
 					if (!candCommit.ok) {
 						providerRequestsDenied += 1;
 						uncertified = true;
-						void terminatePiAndGroups(`ProviderCandidate journal failed: ${candCommit.error}`, "InvalidEvidence");
+						terminatePiAndGroups(`ProviderCandidate journal failed: ${candCommit.error}`, "InvalidEvidence");
 						return;
 					}
 
-					const grantCommit = journal.append(
+					const grantCommit = await journal.append(
 						{
 							runId,
 							attemptId,
@@ -1012,12 +971,12 @@ export async function runUnit1Proof(
 								attemptsUsedSoFar: attemptOrdinal,
 							},
 						},
-						nowMs(),
+						nowMs(), "durable",
 					);
 					if (!grantCommit.ok) {
 						providerRequestsDenied += 1;
 						uncertified = true;
-						void terminatePiAndGroups(`ProviderGrant journal failed before ACK: ${grantCommit.error}`, "InvalidEvidence");
+						terminatePiAndGroups(`ProviderGrant journal failed before ACK: ${grantCommit.error}`, "InvalidEvidence");
 						return;
 					}
 
@@ -1029,11 +988,13 @@ export async function runUnit1Proof(
 						payloadDigest: msg.payloadDigest,
 					};
 
+					if (!releaseAllowed()) return;
+
 					if (request.faults?.injectMalformedPermitAck) {
 						providerRequestsDenied += 1;
 						pipeToAdapter.write('{"kind":"provider_permit","seq":999999,"bad":true}\n', "utf8");
 						setTimeout(() => {
-							void terminatePiAndGroups("Injected malformed permit ACK", "DeniedAndTerminated");
+							terminatePiAndGroups("Injected malformed permit ACK", "DeniedAndTerminated");
 						}, 80);
 						return;
 					}
@@ -1041,12 +1002,13 @@ export async function runUnit1Proof(
 						providerRequestsDenied += 1;
 						writeBoundedFrame(pipeToAdapter, lastPermitAck, UNIT1_LIMITS.controlFrameBytes);
 						setTimeout(() => {
-							void terminatePiAndGroups("Injected replayed permit ACK", "DeniedAndTerminated");
+							terminatePiAndGroups("Injected replayed permit ACK", "DeniedAndTerminated");
 						}, 80);
 						return;
 					}
 
 					lastPermitAck = permit;
+					if (!releaseAllowed()) return;
 					expectedOuterWatermark = msg.seq;
 					providerRequestsGranted += 1;
 					writeBoundedFrame(pipeToAdapter, permit, UNIT1_LIMITS.controlFrameBytes);
@@ -1054,7 +1016,7 @@ export async function runUnit1Proof(
 					if (request.faults?.injectJournalFailAfterGrant) {
 						journal.setFailOnKind("tool_declared_batch");
 					}
-					const permitSentCommit = journal.append(
+					const permitSentCommit = await journal.append(
 						{
 							runId,
 							attemptId,
@@ -1065,32 +1027,35 @@ export async function runUnit1Proof(
 					);
 					if (!permitSentCommit.ok) {
 						uncertified = true;
-						void terminatePiAndGroups(`Journal failed after grant: ${permitSentCommit.error}`, "InvalidEvidence");
+						terminatePiAndGroups(`Journal failed after grant: ${permitSentCommit.error}`, "InvalidEvidence");
 					}
 					break;
 				}
 				case "tool_start_observe": {
 					if (admissionClosed) {
-						journal.append(
+						terminatePiAndGroups("Tool start after admission closed", "DeniedAndTerminated");
+						await journal.append(
 							{ runId, attemptId, kind: "tool_start_denied", body: { reason: "admissionClosed", callId: msg.callId } },
 							nowMs(),
 						);
-						void terminatePiAndGroups("Tool start after admission closed", "DeniedAndTerminated");
 						return;
 					}
 					if (seenStartedCallIds.has(msg.callId)) {
-						journal.append(
+						terminatePiAndGroups(`Duplicate tool callId at start: ${msg.callId}`, "DeniedAndTerminated");
+						await journal.append(
 							{ runId, attemptId, kind: "tool_start_denied", body: { reason: "duplicateCallId", callId: msg.callId } },
 							nowMs(),
 						);
-						void terminatePiAndGroups(`Duplicate tool callId at start: ${msg.callId}`, "DeniedAndTerminated");
 						return;
 					}
 					seenStartedCallIds.add(msg.callId);
 					attemptOrdinal += 1;
 					if (attemptOrdinal > UNIT1_LIMITS.maxAttempts) {
-						admissionClosed = true;
-						journal.append(
+						terminatePiAndGroups(
+							`Attempt budget exceeded at ordinal ${attemptOrdinal} (${msg.toolName})`,
+							"DeniedAndTerminated",
+						);
+						await journal.append(
 							{
 								runId,
 								attemptId,
@@ -1109,10 +1074,6 @@ export async function runUnit1Proof(
 						if (existingDeclared) {
 							(existingDeclared as { ordinal: number | null }).ordinal = attemptOrdinal;
 						}
-						void terminatePiAndGroups(
-							`Attempt budget exceeded at ordinal ${attemptOrdinal} (${msg.toolName})`,
-							"DeniedAndTerminated",
-						);
 						return;
 					}
 					reservedCallOrdinals.set(msg.callId, attemptOrdinal);
@@ -1120,20 +1081,21 @@ export async function runUnit1Proof(
 					if (existingDeclared) {
 						(existingDeclared as { ordinal: number | null }).ordinal = attemptOrdinal;
 					}
-					const reserveCommit = journal.append(
+					const reserveCommit = await journal.append(
 						{
 							runId,
 							attemptId,
 							kind: "tool_start_reserved",
 							body: { ordinal: attemptOrdinal, callId: msg.callId, toolName: msg.toolName },
 						},
-						nowMs(),
+						nowMs(), "durable",
 					);
 					if (!reserveCommit.ok) {
 						uncertified = true;
-						void terminatePiAndGroups(`Tool start reserve failed: ${reserveCommit.error}`, "InvalidEvidence");
+						terminatePiAndGroups(`Tool start reserve failed: ${reserveCommit.error}`, "InvalidEvidence");
 						return;
 					}
+					if (!releaseAllowed()) return;
 					expectedOuterWatermark = msg.seq;
 					writeBoundedFrame(
 						pipeToAdapter,
@@ -1151,144 +1113,124 @@ export async function runUnit1Proof(
 				case "tool_execute": {
 					const ordinal = reservedCallOrdinals.get(msg.callId);
 					if (ordinal === undefined || ordinal > UNIT1_LIMITS.maxAttempts || admissionClosed) {
-						void terminatePiAndGroups(`Unauthorized tool_execute for callId=${msg.callId}`, "DeniedAndTerminated");
+						terminatePiAndGroups(`Unauthorized tool_execute for callId=${msg.callId}`, "DeniedAndTerminated");
 						return;
 					}
-					nativeQueue = nativeQueue.then(async () => {
-						if (admissionClosed || nativeAbort.signal.aborted) return;
-						const leaseId = makeGroupLeaseId(`lease-${ordinal}`);
-						const execPath = request.faults?.nativeExecOverride ?? closureBefore.nativePin.canonicalPath;
-						const argv = request.faults?.nativeArgsOverride
-							? request.faults.nativeArgsOverride.map((arg) =>
-									arg === "__PI_PID__" ? String(piChild?.pid ?? -1) : arg,
-							  )
-							: ["--data-dir", dataDir, "--offline", "--json", "status"];
+					const leaseId = makeGroupLeaseId(`lease-${ordinal}`);
+					const execPath = request.faults?.nativeExecOverride ?? closureBefore.nativePin.canonicalPath;
+					const argv = request.faults?.nativeArgsOverride
+						? request.faults.nativeArgsOverride.map((arg) =>
+								arg === "__PI_PID__" ? String(piChild?.pid ?? -1) : arg,
+						  )
+						: ["--data-dir", dataDir, "--offline", "--json", "status"];
 
-						const outcome = await runRegisteredNativeGroup({
-							registry,
-							leaseId,
+					const outcome = await runRegisteredNativeGroup({
+						registry,
+						leaseId,
+						runId,
+						attemptId,
+						captureDir,
+						dataDir,
+						cwd,
+						execPath,
+						argv,
+						helperPath: request.faults?.helperPathOverride,
+						verifyLaunch: async () => {
+							await verifyFilePin(closureBefore.nodePin);
+							if (!request.faults?.helperPathOverride) await verifyFilePin(helperPin);
+							if (!request.faults?.nativeExecOverride) await verifyFilePin(closureBefore.nativePin);
+						},
+						nativeSentinelPath: request.faults?.nativeSentinelPath,
+						journal,
+						monotonicStartMs,
+						deadlineMs: request.faults?.nativeDeadlineMsOverride ?? UNIT1_LIMITS.nativeDeadlineMs,
+						abortSignal: nativeAbort.signal,
+						skipGoAndCloseHelper: request.faults?.injectSkipGoAndCloseHelper,
+						onKillPiBetweenRegAndGo: request.faults?.injectKillPiBetweenRegAndGo
+							? async () => {
+									if (piChild && typeof piChild.pid === "number") {
+										try {
+											process.kill(piChild.pid, "SIGKILL");
+										} catch {
+											// Ignore
+										}
+										await sleepMs(60);
+									}
+							  }
+							: undefined,
+						onNativeFirstChunk: request.faults?.injectKillPiDuringNativeOutput
+							? () => {
+									if (piChild && typeof piChild.pid === "number") {
+										try {
+											process.kill(piChild.pid, "SIGKILL");
+										} catch {
+											// Ignore
+										}
+									}
+							  }
+							: undefined,
+						onOverflow: (stream, bytes) => {
+							ioFailure(`${stream} overflow: ${bytes}`);
+							overflow = { stream, observedBytes: bytes };
+						},
+						onSinkFailure: (stream, err) => ioFailure(`${stream}: ${err.message}`),
+						sinkStallMs: request.faults?.simulatedSinkStallMs,
+						onFatal: (reason, at) => terminatePiAndGroups(reason, "DeniedAndTerminated", at),
+					});
+					if (!releaseAllowed()) return;
+					const entry = registry.entries.get(leaseId);
+					if (!entry) throw new Error("Native lease was not reserved");
+					const at = performance.now();
+					registry.beginOne(entry, { at, detectedAt: at });
+					await registry.finishOne(entry, request.faults?.injectPsFailure);
+					if (!releaseAllowed()) return;
+					if (entry.state !== "Closed" || entry.stop?.evidence.drain?.kind !== "drained") {
+						ioFailure("Native closure or drain is incomplete");
+						return;
+					}
+
+					const toolResultText = outcome.ok
+						? outcome.stdoutText
+						: JSON.stringify({ ok: false, error: outcome.errorMessage ?? outcome.stderrText });
+
+					await journal.append(
+						{
 							runId,
 							attemptId,
-							captureDir,
-							dataDir,
-							cwd,
-							execPath,
-							argv,
-							helperPath: request.faults?.helperPathOverride,
-							nativeSentinelPath: request.faults?.nativeSentinelPath,
-							journal,
-							monotonicStartMs,
-							deadlineMs: request.faults?.nativeDeadlineMsOverride ?? UNIT1_LIMITS.nativeDeadlineMs,
-							abortSignal: nativeAbort.signal,
-							skipGoAndCloseHelper: request.faults?.injectSkipGoAndCloseHelper,
-							onKillPiBetweenRegAndGo: request.faults?.injectKillPiBetweenRegAndGo
-								? async () => {
-										if (piChild && typeof piChild.pid === "number") {
-											try {
-												process.kill(piChild.pid, "SIGKILL");
-											} catch {
-												// Ignore
-											}
-											await sleepMs(60);
-										}
-								  }
-								: undefined,
-							onNativeFirstChunk: request.faults?.injectKillPiDuringNativeOutput
-								? () => {
-										if (piChild && typeof piChild.pid === "number") {
-											try {
-												process.kill(piChild.pid, "SIGKILL");
-											} catch {
-												// Ignore
-											}
-										}
-								  }
-								: undefined,
-							onOverflow: (stream, observedBytes) => {
-								uncertified = true;
-								journal.append(
-									{
-										runId,
-										attemptId,
-										kind: "overflow_uncertified",
-										body: { stream, observedBytes },
-									},
-									nowMs(),
-									true,
-								);
-							},
-							onSinkFailure: (stream, err) => {
-								uncertified = true;
-								journal.append(
-									{
-										runId,
-										attemptId,
-										kind: "journal_fault",
-										body: { stream, error: err.message },
-									},
-									nowMs(),
-									true,
-								);
-							},
-							sinkStallMs: request.faults?.simulatedSinkStallMs,
-							injectPsFailure: request.faults?.injectPsFailure,
-						});
-						if (outcome.nativeStarted) {
-							nativeStarts += 1;
-						}
-
-						if (admissionClosed || piExited) {
-							return;
-						}
-
-						const toolResultText = outcome.ok
-							? outcome.stdoutText
-							: JSON.stringify({ ok: false, error: outcome.errorMessage ?? outcome.stderrText });
-
-						journal.append(
-							{
-								runId,
-								attemptId,
-								kind: "tool_result_delivered",
-								body: {
-									leaseId,
-									callId: msg.callId,
-									isError: !outcome.ok,
-									stdoutBytes: Buffer.byteLength(outcome.stdoutText, "utf8"),
-									stderrBytes: Buffer.byteLength(outcome.stderrText, "utf8"),
-								},
-							},
-							nowMs(),
-						);
-
-						writeBoundedFrame(
-							pipeToAdapter,
-							{
-								kind: "tool_result",
-								seq: msg.seq,
+							kind: "tool_result_delivered",
+							body: {
+								leaseId,
 								callId: msg.callId,
 								isError: !outcome.ok,
-								text: toolResultText,
-							} satisfies PipeOuterToChild,
-							UNIT1_LIMITS.controlFrameBytes,
-						);
-					});
+								stdoutBytes: Buffer.byteLength(outcome.stdoutText, "utf8"),
+								stderrBytes: Buffer.byteLength(outcome.stderrText, "utf8"),
+							},
+						},
+						nowMs(),
+					);
+
+					if (!releaseAllowed()) return;
+					writeBoundedFrame(
+						pipeToAdapter,
+						{
+							kind: "tool_result",
+							seq: msg.seq,
+							callId: msg.callId,
+							isError: !outcome.ok,
+							text: toolResultText,
+						} satisfies PipeOuterToChild,
+						UNIT1_LIMITS.controlFrameBytes,
+					);
 					break;
 				}
 			}
 		},
 	});
 
-	const caseDeadlineMs = request.faults?.caseDeadlineMsOverride ?? UNIT1_LIMITS.caseDeadlineMs;
-	const caseTimer = setTimeout(() => {
-		void terminatePiAndGroups(`Case deadline ${caseDeadlineMs} ms exceeded`, "DeniedAndTerminated");
-	}, caseDeadlineMs);
-	caseTimer.unref();
-
-	try {
-		if (request.faults?.injectKillPiBeforeReady && typeof piChild.pid === "number") {
+	const driveRpc = async (): Promise<void> => {
+		if (request.faults?.injectKillPiBeforeReady && typeof pi.pid === "number") {
 			try {
-				process.kill(piChild.pid, "SIGKILL");
+				process.kill(pi.pid, "SIGKILL");
 			} catch {
 				// Ignore
 			}
@@ -1310,14 +1252,14 @@ export async function runUnit1Proof(
 					clearTimeout(timer);
 					resolveStartupWait = null;
 					res({ ok: true });
-				} else if (piExited) {
+				} else if (stopTicket || piExited) {
 					clearTimeout(timer);
 					resolveStartupWait = null;
 					res({ ok: false, reason: `Pi exited before BoundReady (code=${String(piExitCode)})` });
 				}
 			});
 			if (!readyOk.ok) {
-				await terminatePiAndGroups(readyOk.reason ?? "Startup readiness failed", "PreWorkInfrastructureFailed");
+				terminatePiAndGroups(readyOk.reason ?? "Startup readiness failed", "PreWorkInfrastructureFailed");
 				throw new Error(readyOk.reason ?? "Startup readiness failed");
 			}
 		} else {
@@ -1334,7 +1276,7 @@ export async function runUnit1Proof(
 				clearTimeout(timer);
 				res(r);
 			};
-			if (piExited) {
+			if (!releaseAllowed() || piExited) {
 				clearTimeout(timer);
 				pendingGetStateResolve = null;
 				res(null);
@@ -1345,7 +1287,7 @@ export async function runUnit1Proof(
 
 		if (!getStateRes || getStateRes.success !== true) {
 			const reason = `get_state failed or timed out: ${JSON.stringify(getStateRes)}`;
-			await terminatePiAndGroups(reason, "PreWorkInfrastructureFailed");
+			terminatePiAndGroups(reason, "PreWorkInfrastructureFailed");
 			throw new Error(reason);
 		}
 
@@ -1364,11 +1306,11 @@ export async function runUnit1Proof(
 
 		if (!stateValid) {
 			const reason = `get_state invariant violation: ${JSON.stringify(stateData)}`;
-			await terminatePiAndGroups(reason, "PreWorkInfrastructureFailed");
+			terminatePiAndGroups(reason, "PreWorkInfrastructureFailed");
 			throw new Error(reason);
 		}
 
-		const stateCommit = journal.append(
+		const stateCommit = await journal.append(
 			{
 				runId,
 				attemptId,
@@ -1384,11 +1326,11 @@ export async function runUnit1Proof(
 		);
 		if (!stateCommit.ok) {
 			uncertified = true;
-			await terminatePiAndGroups(`get_state journal failed: ${stateCommit.error}`, "InvalidEvidence");
+			terminatePiAndGroups(`get_state journal failed: ${stateCommit.error}`, "InvalidEvidence");
 			throw new Error(stateCommit.error);
 		}
 
-		const promptEncodeCommit = journal.append(
+		const promptEncodeCommit = await journal.append(
 			{
 				runId,
 				attemptId,
@@ -1403,12 +1345,13 @@ export async function runUnit1Proof(
 		);
 		if (!promptEncodeCommit.ok) {
 			uncertified = true;
-			await terminatePiAndGroups(`prompt_encoded journal failed: ${promptEncodeCommit.error}`, "InvalidEvidence");
+			terminatePiAndGroups(`prompt_encoded journal failed: ${promptEncodeCommit.error}`, "InvalidEvidence");
 			throw new Error(promptEncodeCommit.error);
 		}
 
+		const promptCommit = await journal.append({ runId, attemptId, kind: "prompt_sent", body: { id: "prompt-1" } }, nowMs(), "durable");
+		if (!promptCommit.ok || !releaseAllowed()) throw new Error("Prompt release closed");
 		promptReceived = true;
-		journal.append({ runId, attemptId, kind: "prompt_sent", body: { id: "prompt-1" } }, nowMs());
 		writeBoundedFrame(
 			rpcIn,
 			{ id: "prompt-1", type: "prompt", message: encodedPromptText },
@@ -1445,9 +1388,12 @@ export async function runUnit1Proof(
 				idleData.isCompacting === false &&
 				idleData.pendingMessageCount === 0;
 
-			rpcIn.end();
+			if (releaseAllowed()) {
+				cleanPiEof = isIdle;
+				rpcIn.end();
+			}
 			await new Promise<void>((res) => {
-				if (piExited) {
+				if (piExited || stopTicket) {
 					res();
 					return;
 				}
@@ -1463,8 +1409,9 @@ export async function runUnit1Proof(
 			});
 
 			if (!piExited) {
-				await terminatePiAndGroups("Pi did not exit cleanly after RPC stdin EOF", "TaskFailed");
+				terminatePiAndGroups("Pi did not exit cleanly after RPC stdin EOF", "TaskFailed");
 			} else if (
+				!stopTerminationStarted &&
 				promptPreflightSeen &&
 				promptPreflightDisposition === "started" &&
 				isIdle &&
@@ -1472,7 +1419,6 @@ export async function runUnit1Proof(
 				answerText !== null &&
 				answerText.length > 0 &&
 				!uncertified &&
-				!piOverflowed &&
 				!journal.hasFailed
 			) {
 				status = "Answered";
@@ -1484,56 +1430,83 @@ export async function runUnit1Proof(
 					`Incomplete answer criteria: preflight=${String(promptPreflightDisposition)} idle=${String(isIdle)} stop=${String(terminalAssistantStopReason)} answer=${String(answerText !== null)}`;
 			}
 		} else if (!stopTerminationStarted) {
-			await terminatePiAndGroups("Pi exited unexpectedly before agent_settled", "DeniedAndTerminated");
+			terminatePiAndGroups("Pi exited unexpectedly before agent_settled", "DeniedAndTerminated");
 		}
+	};
+
+	try {
+		await Promise.race([driveRpc(), terminated.promise]);
 	} catch (err) {
 		if (!stopTerminationStarted) {
-			await terminatePiAndGroups(err instanceof Error ? err.message : String(err), status);
+			terminatePiAndGroups(err instanceof Error ? err.message : String(err), status);
 		}
 	} finally {
-		clearTimeout(caseTimer);
-		if (terminationPromise !== null) {
-			await terminationPromise;
-		} else {
-			await registry.stopAll({
-				journal,
-				runId,
-				attemptId,
-				injectPsFailure: request.faults?.injectPsFailure,
-				omitTeardownForTesting: request.faults?.injectOmitNativeTeardown,
-			});
-		}
-		if (piChild && typeof piChild.pid === "number" && !piExited) {
-			await terminatePiAndGroups(failureReason ?? "Cleanup at end", status);
-		}
-		detachRpcReader();
-		detachAdapterReader();
-		piStdoutSink.close();
-		piStderrSink.close();
-
-		if (request.faults?.bypassReadyCheck || !boundReadySeen || piOverflowed || journal.hasFailed) {
+		cancelCaseTimer();
+		const ticket = beginStop();
+		const { evidence } = ticket;
+		const capture = async (): Promise<DrainResult> => {
+			const streams = await byDeadline(Promise.all([rpcReader.done, stderrCaptured]), evidence.drainDeadline);
+			if (streams.kind === "timeout") {
+				rpcReader.stop();
+				rpcErr.destroy();
+			}
+			const files = await Promise.all([piStdoutSink.close(evidence.drainDeadline), piStderrSink.close(evidence.drainDeadline)]);
+			return streams.kind === "timeout"
+				? { kind: "incomplete", reason: "Pi raw stream deadline" }
+				: [...streams.value, ...files].find((result) => result.kind === "incomplete") ?? { kind: "drained" };
+		};
+		const [reaped, drained] = await Promise.all([
+			byDeadline(ticket.reaped, evidence.observationDeadline),
+			capture(),
+			groupCleanup,
+		]);
+		evidence.observationCompletedAt = evidence.reapedAt;
+		evidence.drain = drained;
+		adapterReader.stop();
+		if (reaped.kind === "timeout" || (evidence.reapedAt ?? Infinity) > evidence.observationDeadline ||
+			drained.kind === "incomplete" || !boundReadySeen || request.faults?.bypassReadyCheck || journal.hasFailed) {
 			uncertified = true;
 		}
+		const missedSignal = (e: ArmedStop["evidence"]): boolean => e.killAttemptAt !== null && e.killAttemptAt > e.signalDeadline;
+		if (missedSignal(evidence)) uncertified = true;
+		nativeStarts = [...registry.entries.values()].filter((g) => g.nativePid !== null).length;
 		for (const g of registry.entries.values()) {
-			if (g.state === "Unknown" || g.closure?.kind === "unknown" || g.closure?.kind === "alive") {
+			const stop = g.stop?.evidence;
+			if (g.state !== "Closed" || (stop && (stop.drain?.kind !== "drained" || missedSignal(stop)))) {
 				uncertified = true;
 			}
 		}
-
-		journal.append(
-			{
-				runId,
-				attemptId,
-				kind: "attempt_closed",
-				body: { status, failureReason, uncertified, nativeStarts, providerRequestsGranted, providerRequestsDenied },
-			},
-			nowMs(),
-			true,
-		);
-		journal.close();
+		if (uncertified && status === "Answered") status = "InvalidEvidence";
+		const recordCleanup = async (): Promise<boolean> => {
+			const record = async (kind: ProofJournalRecord["kind"], body: Record<string, unknown>): Promise<boolean> => {
+				if (performance.now() >= evidence.drainDeadline) return false;
+				return (await journal.append({ runId, attemptId, kind, body }, nowMs(), "emergency")).ok;
+			};
+			if (overflow && !await record("overflow_uncertified", overflow)) return false;
+			if (!await record("pi_exited", { code: piExitCode, signal: piSignal, stop: evidence })) return false;
+			for (const g of registry.entries.values()) {
+				if (!await record("group_closure_observed", { leaseId: g.leaseId, observation: g.closure, stop: g.stop?.evidence })) {
+					return false;
+				}
+			}
+			return record("attempt_closed", {
+				status, failureReason, uncertified, nativeStarts, providerRequestsGranted, providerRequestsDenied,
+			});
+		};
+		const recorded = await byDeadline(recordCleanup(), evidence.drainDeadline);
+		const journalDrain = await journal.close(evidence.drainDeadline);
+		captureDrain = drained.kind === "incomplete" ? drained
+			: recorded.kind === "timeout" || !recorded.value ? { kind: "incomplete", reason: "Final journal records incomplete" }
+			: journalDrain;
+		if (captureDrain.kind === "incomplete" || journal.hasFailed) {
+			uncertified = true;
+			if (status === "Answered") status = "InvalidEvidence";
+		}
 	}
 
-	const closureAfter = options?.cachedClosure ? closureBefore : captureExecutionClosure();
+	// Unknown ownership can outlive the proof. Skip synchronous final pin work on that path.
+	const targetsClosed = piExited && [...registry.entries.values()].every((g) => g.state === "Closed");
+	const closureAfter = targetsClosed && !options?.cachedClosure ? captureExecutionClosure() : null;
 
 	const groupObservations = Array.from(registry.entries.values()).map((entry) => ({
 		leaseId: entry.leaseId,
@@ -1543,7 +1516,9 @@ export async function runUnit1Proof(
 		nativePid: entry.nativePid,
 		registeredBeforeGo: entry.registeredBeforeGo,
 		sentinelAbsentAtRegistration: entry.sentinelAbsentAtRegistration,
-		killEscalationMs: entry.killEscalationMs,
+		stop: entry.stop?.evidence ?? null,
+		killEscalationMs: entry.stop?.evidence.killAttemptAt == null ? null
+			: entry.stop.evidence.killAttemptAt - entry.stop.evidence.triggerAt,
 		closure: entry.closure,
 	}));
 
@@ -1566,16 +1541,29 @@ export async function runUnit1Proof(
 		nativeStarts,
 		groupObservations,
 		answerText,
+		piPid: piChild.pid ?? null,
 		piExitCode,
 		piSignal,
+		piStop: stopTicket?.evidence,
+		captureDrain,
 		uncertified,
 		rawArtifacts: { journalPath, piStdoutPath, piStderrPath },
 		closureBeforeSha256: closureBefore.closureDigest,
-		closureAfterSha256: closureAfter.closureDigest,
+		closureAfterSha256: closureAfter?.closureDigest ?? null,
 	};
 
-	writeExclusiveFile(indexEntryPath, JSON.stringify(result, null, 2));
-	return result;
+	const publication = await byDeadline(
+		writeExclusiveFileAsync(indexEntryPath, JSON.stringify(result, null, 2)).then(
+			() => null,
+			(err: unknown) => err instanceof Error ? err.message : String(err),
+		),
+		performance.now() + UNIT1_LIMITS.killGraceMs,
+	);
+	if (publication.kind === "completed" && publication.value === null) return result;
+	return {
+		...result, status: "InvalidEvidence", uncertified: true,
+		indexPublicationError: publication.kind === "timeout" ? "Index publication deadline" : publication.value ?? undefined,
+	};
 }
 
 function sleepMs(ms: number): Promise<void> {

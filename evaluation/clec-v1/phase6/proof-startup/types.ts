@@ -70,6 +70,8 @@ export const UNIT1_LIMITS = {
 
 export type GroupState =
 	| "Reserved"
+	| "WaitingForRegistration"
+	| "Stopping"
 	| "RegisteredWaiting"
 	| "Released"
 	| "Closed"
@@ -306,6 +308,7 @@ export interface ProofRunResult {
 	readonly attemptId: AttemptId;
 	readonly bundleDir: string;
 	readonly indexEntryPath: string;
+	readonly indexPublicationError?: string;
 	readonly status: AttemptStatus;
 	readonly failureReason: string | null;
 	readonly promptReceived: boolean;
@@ -329,11 +332,15 @@ export interface ProofRunResult {
 		readonly registeredBeforeGo: boolean;
 		readonly sentinelAbsentAtRegistration: boolean | null;
 		readonly killEscalationMs: number | null;
+		readonly stop: import("./process-group.ts").SignalEvidence | null;
 		readonly closure: ProcessObservation | null;
 	}>;
 	readonly answerText: string | null;
+	readonly piPid?: number | null;
 	readonly piExitCode: number | null;
 	readonly piSignal: string | null;
+	readonly piStop?: import("./process-group.ts").SignalEvidence;
+	readonly captureDrain?: import("./framing.ts").DrainResult;
 	readonly uncertified: boolean;
 	readonly rawArtifacts: {
 		readonly journalPath: string;

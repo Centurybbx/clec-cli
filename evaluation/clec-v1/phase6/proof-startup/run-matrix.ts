@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { runUnit1Proof } from "./controller.ts";
 import {
@@ -976,7 +976,7 @@ setInterval(() => {}, 1000);`;
 			assert(g !== undefined && g.state === "Closed", `expected group Closed, got ${g?.state}`);
 			assert(g.closure?.kind === "gone", `expected closure gone, got ${g.closure?.kind}`);
 			assert(g.killEscalationMs !== null && g.killEscalationMs <= UNIT1_LIMITS.killGraceMs, `kill escalation took ${g.killEscalationMs}ms > 2000ms`);
-			const directObs = observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicMs: 0 });
+			const directObs = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicMs: 0 });
 			assert(directObs.kind === "gone", `direct ps verification failed: ${JSON.stringify(directObs)}`);
 			return {
 				detail: `Native killed explicit Pi PID & ignored SIGTERM; outer SIGKILLed PGID ${g.pgid} in ${g.killEscalationMs}ms; ps confirmed gone`,
@@ -1032,7 +1032,7 @@ setInterval(() => {}, 1000);`;
 				}
 				const deadline = performance.now() + 2_000;
 				while (performance.now() < deadline) {
-					const obs = observeGroupInProcessTable({ pgid: leakedPgid, knownIdentities: [], monotonicMs: 0 });
+					const obs = await observeGroupInProcessTable({ pgid: leakedPgid, knownIdentities: [], monotonicMs: 0 });
 					if (obs.kind === "gone") break;
 					await new Promise((r) => setTimeout(r, 30));
 				}
@@ -1132,7 +1132,7 @@ setInterval(() => {
 			);
 			const g = res.groupObservations[0];
 			assert(g?.closure?.kind === "gone", "recorded closure must be gone");
-			const direct = observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicMs: 0 });
+			const direct = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicMs: 0 });
 			assert(direct.kind === "gone", "direct ps check must agree with recorded closure");
 			return { detail: `Direct ps agrees with recorded closure for PGID ${g.pgid}`, result: res, serverRequests: srv.requests };
 		} finally {
@@ -1293,7 +1293,7 @@ process.exit(0);`,
 			const bigBody = { pad: "Z".repeat(512 * 1024) };
 			let normalCount = 0;
 			for (let i = 0; i < 150; i++) {
-				const res = jWriter.append(
+				const res = await jWriter.append(
 					{ runId: makeRunId("jcap"), attemptId: makeAttemptId("jcap-a1"), kind: "pi_spawned", body: bigBody },
 					i,
 				);
@@ -1301,12 +1301,12 @@ process.exit(0);`,
 				normalCount += 1;
 			}
 			assert(jWriter.hasFailed, "normal journal writes must stop at 63 MiB normal cap");
-			const emergRes = jWriter.append(
+			const emergRes = await jWriter.append(
 				{ runId: makeRunId("jcap"), attemptId: makeAttemptId("jcap-a1"), kind: "attempt_closed", body: { emergency: true } },
 				999,
-				true,
+				"emergency",
 			);
-			jWriter.close();
+			await jWriter.close(performance.now() + UNIT1_LIMITS.killGraceMs);
 			assert(emergRes.ok, "1 MiB emergency reserve must accept final attempt_closed after normal cap hit");
 
 			const tStall0 = performance.now();
@@ -1316,7 +1316,7 @@ process.exit(0);`,
 					evidenceParentDir,
 					question: "Stalled sink deadline.",
 					mockBaseUrl: srv.baseUrl,
-					faults: { simulatedSinkStallMs: 120, caseDeadlineMsOverride: 900 },
+					faults: { simulatedSinkStallMs: 1_500, caseDeadlineMsOverride: 900 },
 				},
 				{ cachedClosure: closureBefore },
 			);
@@ -1342,6 +1342,7 @@ process.exit(0);`,
 		process.stdout.write(`[${tag}] ${out.id} (${out.elapsedMs}ms) -> ${out.detail}\n`);
 	}
 
+	const directOwnership = inspectMatrixOwnership(evidenceParentDir);
 	const closureAfter = captureExecutionClosure();
 	assert(
 		closureBefore.closureDigest === closureAfter.closureDigest,
@@ -1359,6 +1360,7 @@ process.exit(0);`,
 		gitDirtyPathsCount: gitMeta.dirtyStatus.length,
 		closureBefore,
 		closureAfter,
+		directOwnership,
 		passedCount,
 		failedCount,
 		totalCount: outcomes.length,
@@ -1368,9 +1370,38 @@ process.exit(0);`,
 	const receiptPath = join(matrixDir, "matrix-receipt.json");
 	writeExclusiveFile(receiptPath, JSON.stringify(summary, null, 2));
 	process.stdout.write(`\nMatrix complete: ${passedCount}/${outcomes.length} passed. Receipt: ${receiptPath}\n`);
-	if (failedCount > 0) {
+	if (directOwnership.survivors.length > 0) {
+		process.stderr.write(`Unexpected owned survivors: ${JSON.stringify(directOwnership.survivors)}\n`);
+	}
+	if (failedCount > 0 || directOwnership.survivors.length > 0) {
 		process.exitCode = 1;
 	}
+}
+
+function inspectMatrixOwnership(evidenceParentDir: string) {
+	const index = join(evidenceParentDir, "_index");
+	const pids = new Set<number>();
+	const pgids = new Set<number>();
+	for (const file of readdirSync(index)) {
+		const result = JSON.parse(readFileSync(join(index, file), "utf8")) as Partial<ProofRunResult>;
+		if (result.piPid) pids.add(result.piPid);
+		for (const group of result.groupObservations ?? []) {
+			if (group.pgid) pgids.add(group.pgid);
+			if (group.helperPid) pids.add(group.helperPid);
+			if (group.nativePid) pids.add(group.nativePid);
+		}
+	}
+	const ps = execFileSync("/bin/ps", ["-axo", "pid=,pgid=,stat="], {
+		encoding: "utf8", timeout: 2_000, maxBuffer: 1024 * 1024, env: { LC_ALL: "C", LANG: "C" },
+	});
+	const survivors: string[] = [];
+	const rows = ps.trim().split("\n");
+	for (const row of rows) {
+		const match = /^\s*(\d+)\s+(\d+)\s+\S+\s*$/.exec(row);
+		assert(match !== null, "Independent process-table row is malformed");
+		if (match && (pids.has(Number(match[1])) || pgids.has(Number(match[2])))) survivors.push(row);
+	}
+	return { directPsUtc: new Date().toISOString(), pids: [...pids], pgids: [...pgids], survivors };
 }
 
 void main();

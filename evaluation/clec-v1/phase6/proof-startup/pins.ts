@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 import { asSha256Hex, type Sha256Hex } from "./types.ts";
@@ -18,15 +19,19 @@ export const EXPECTED_CLEC_SKILL_SHA256 = asSha256Hex(
 	"EXPECTED_CLEC_SKILL_SHA256",
 );
 
-export const FALLBACK_CLEC_BIN =
-	"/Users/century/.t3/worktrees/clec/t3-96b3a6cc-bd4b50657d0a15ca/.cache/stage6a-v2/target-msrv/release/clec";
-
 export const PI_RELEASE_ROOT = "/Users/century/.pi/agent/install/releases/1.5.2";
 export const PI_BUNDLE_ENTRY =
 	"/Users/century/.pi/agent/install/releases/1.5.2/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
 export const EXPECTED_PI_ENTRY_SHA256 = asSha256Hex(
 	"e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774",
 	"EXPECTED_PI_ENTRY_SHA256",
+);
+
+const EXPECTED_NODE_SHA256 = asSha256Hex(
+	"67252740eb6dadeff855b991ec85d7a7cf1d5d70ba7e68adf8d73b17df8a4b95", "Node 25.7.0",
+);
+const EXPECTED_PI_TREE_SHA256 = asSha256Hex(
+	"8f37ccfd783605fb5390d8c17d861fe28657ccfd5899a6938e685131f4095baf", "Pi 1.5.2 tree",
 );
 
 export interface FilePin {
@@ -42,11 +47,12 @@ export interface ExecutionClosure {
 	readonly arch: string;
 	readonly nodeVersion: string;
 	readonly nodePin: FilePin;
-	readonly nativeSourceOrigin: "installed_temp_package" | "fallback_stage6a_v2";
+	readonly nativeSourceOrigin: "installed_temp_package";
 	readonly nativePin: FilePin;
-	readonly skillSourceOrigin: "installed_temp_package" | "fallback_repo_cli_skill";
+	readonly skillSourceOrigin: "installed_temp_package";
 	readonly skillPin: FilePin;
 	readonly piEntryPin: FilePin;
+	readonly observerPin: FilePin;
 	readonly piReleaseRoot: string;
 	readonly piTreeFileCount: number;
 	readonly piTreeByteCount: number;
@@ -188,43 +194,34 @@ export function resolveUnit1RootDir(): string {
 	return realpathSync(import.meta.dirname);
 }
 
-export function resolveRepoSkillFallbackPath(): string {
-	return resolve(import.meta.dirname, "../../../../cli/skills/clec/SKILL.md");
+export async function verifyFilePin(pin: FilePin): Promise<void> {
+	const file = await open(pin.canonicalPath, "r");
+	try {
+		const stat = await file.stat();
+		if (!stat.isFile() || stat.size !== pin.sizeBytes) throw new Error(`Size or file type changed: ${pin.logicalPath}`);
+		const hash = createHash("sha256");
+		const chunk = Buffer.allocUnsafe(65_536);
+		for (let offset = 0; offset < pin.sizeBytes;) {
+			const { bytesRead } = await file.read(chunk, 0, Math.min(chunk.length, pin.sizeBytes - offset), offset);
+			if (bytesRead === 0) throw new Error(`File truncated: ${pin.logicalPath}`);
+			hash.update(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		if (hash.digest("hex") !== pin.sha256) throw new Error(`File pin changed: ${pin.logicalPath}`);
+	} finally {
+		await file.close();
+	}
 }
 
-export function captureExecutionClosure(options?: {
-	readonly cachedPiTree?: {
-		readonly canonicalRoot: string;
-		readonly fileCount: number;
-		readonly byteCount: number;
-		readonly treeSha256: Sha256Hex;
-	};
-}): ExecutionClosure {
+export function captureExecutionClosure(): ExecutionClosure {
 	const unit1Dir = resolveUnit1RootDir();
-	const nodePin = pinRegularFile(process.execPath);
-
-	let nativeSourceOrigin: ExecutionClosure["nativeSourceOrigin"];
-	let nativePin: FilePin;
-	if (existsSync(PRIMARY_CLEC_BIN)) {
-		nativeSourceOrigin = "installed_temp_package";
-		nativePin = pinRegularFile(PRIMARY_CLEC_BIN, EXPECTED_CLEC_BIN_SHA256);
-	} else {
-		nativeSourceOrigin = "fallback_stage6a_v2";
-		nativePin = pinRegularFile(FALLBACK_CLEC_BIN, EXPECTED_CLEC_BIN_SHA256);
-	}
-
-	let skillSourceOrigin: ExecutionClosure["skillSourceOrigin"];
-	let skillPin: FilePin;
-	if (existsSync(PRIMARY_CLEC_SKILL)) {
-		skillSourceOrigin = "installed_temp_package";
-		skillPin = pinRegularFile(PRIMARY_CLEC_SKILL, EXPECTED_CLEC_SKILL_SHA256);
-	} else {
-		skillSourceOrigin = "fallback_repo_cli_skill";
-		skillPin = pinRegularFile(resolveRepoSkillFallbackPath(), EXPECTED_CLEC_SKILL_SHA256);
-	}
-
+	const nodePin = pinRegularFile(process.execPath, EXPECTED_NODE_SHA256);
+	const nativePin = pinRegularFile(PRIMARY_CLEC_BIN, EXPECTED_CLEC_BIN_SHA256);
+	const skillPin = pinRegularFile(PRIMARY_CLEC_SKILL, EXPECTED_CLEC_SKILL_SHA256);
 	const piEntryPin = pinRegularFile(PI_BUNDLE_ENTRY, EXPECTED_PI_ENTRY_SHA256);
-	const piTree = options?.cachedPiTree ?? hashBoundedDirectoryTree(PI_RELEASE_ROOT);
+	const observerPin = pinRegularFile("/bin/ps");
+	const piTree = hashBoundedDirectoryTree(PI_RELEASE_ROOT);
+	if (piTree.treeSha256 !== EXPECTED_PI_TREE_SHA256) throw new Error("Pinned Pi release tree has changed");
 
 	const unit1Names = [
 		"PROTOCOL.md",
@@ -238,13 +235,13 @@ export function captureExecutionClosure(options?: {
 		"controller.ts",
 		"fixtures.ts",
 		"run-matrix.ts",
+		"process-observation.test.mjs",
+		"deadline-controls.mjs",
 	];
 	const unit1Files: FilePin[] = [];
 	for (const name of unit1Names) {
 		const candidate = join(unit1Dir, name);
-		if (existsSync(candidate)) {
-			unit1Files.push(pinRegularFile(candidate));
-		}
+		unit1Files.push(pinRegularFile(candidate));
 	}
 
 	const dynamicLibDeps = {
@@ -261,6 +258,7 @@ export function captureExecutionClosure(options?: {
 			nativeSha: nativePin.sha256,
 			skillSha: skillPin.sha256,
 			piEntrySha: piEntryPin.sha256,
+			observerSha: observerPin.sha256,
 			piTreeSha: piTree.treeSha256,
 			unit1Files: unit1Files.map((f) => ({ path: f.logicalPath, sha: f.sha256 })),
 			dynamicLibDeps,
@@ -273,11 +271,12 @@ export function captureExecutionClosure(options?: {
 		arch: process.arch,
 		nodeVersion: process.version,
 		nodePin,
-		nativeSourceOrigin,
+		nativeSourceOrigin: "installed_temp_package",
 		nativePin,
-		skillSourceOrigin,
+		skillSourceOrigin: "installed_temp_package",
 		skillPin,
 		piEntryPin,
+		observerPin,
 		piReleaseRoot: piTree.canonicalRoot,
 		piTreeFileCount: piTree.fileCount,
 		piTreeByteCount: piTree.byteCount,
@@ -301,8 +300,4 @@ export function buildScrubbedChildEnv(overrides: Readonly<Record<string, string>
 		...overrides,
 	};
 	return scrubbed;
-}
-
-export function verifyPinnedSkillExists(path: string): Sha256Hex {
-	return asSha256Hex(sha256Buffer(readFileSync(path)), path);
 }
