@@ -1,6 +1,8 @@
 # Stage 6B Unit 1 feasibility proof report
 
-Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. The latest tested source is `9c37a076bb46ec2ee6df0e377a303a665e65a6eb`. Fresh independent acceptance is pending before integration or work on Units 2 through 4.
+Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. The latest tested source is `9c37a076bb46ec2ee6df0e377a303a665e65a6eb`. Independent review `9fa147d9` accepted candidate `61364f0999adbc5e8fa3c8bc3c754117ead407ea` for the status-only Unit 1 scope on pinned macOS ARM64 with synthetic loopback traffic. The coordinator integrated that candidate. Unit 2 can proceed.
+
+The focused recheck confirmed the late-reap and duplicate-attempt fixes, zero TypeScript diagnostics, and no survivors across its four Pi PIDs. The unchanged transport and process-control paths retain the coverage from independent review `96f07581`. [Focused independent acceptance](/tmp/clec-review613.EenajE/review.md) · [Preceding independent review](/tmp/clec-review097.IN960a/review.md)
 
 ## Finalization follow-up
 
@@ -165,7 +167,7 @@ The deadline correction resolved event-loop stalls from process enumeration and 
 
 The proof observes the tested macOS arm64 runtime and owned inherited groups. An OS scheduling delay or uninterruptible syscall can defeat timing or closure. PID/PGID reuse and second-resolution start times limit identification. An incomplete write, unknown observation, or missing artifact leaves the proof uncertified.
 
-- **Pending Unit 1 gate.** Independent fresh review and rerun of Unit 1.
+- **Accepted Unit 1 scope.** The focused independent recheck and preceding broader review are recorded above.
 - **Pending implementation units.** Unit 2 (canonical `PublicRunPlan`, external commitments, and unified `Prefix`/`Closed` parser/reducer in `validate`, plus mutation replay), Unit 3 (full bounded capture, split UTF-8 and binary stderr retention, and closure tamper checks), and Unit 4 (one-wave host migration and six-action `ClecRequest` integration).
 - **Unchanged open product and evaluation gates.** Real external provider profiles and entitlements, Google Vertex wire behavior, production bootstrap, package/rights, cross-OS support, live Jev behavior, actual-host quality, Stage 3 (`FAILED`, consumed holdout `CLOSED`), Stage 5 (`mock accepted` unchanged), default manifest `None`, `providerVerified: false`, and the 24 `DRAFT` fresh cases.
 
