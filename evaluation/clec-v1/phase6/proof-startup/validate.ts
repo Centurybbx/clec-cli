@@ -8,6 +8,7 @@ import { anchorFor, digest, extractUserContentText, initialAttempt, parsePlan, p
 import type { ExecutionClosure } from "./pins.ts";
 import { isDeepStrictEqual } from "node:util";
 import { object, PROOF_MODEL } from "./contract.ts";
+import { STOP_GRACE_MS } from "./process-group.ts";
 import { makeCallId, type CallId, UNIT1_LIMITS } from "./types.ts";
 
 export type Mode = "Prefix" | "Closed";
@@ -26,6 +27,7 @@ export function equal(actual: unknown, expected: unknown, invariant: string): vo
 }
 
 type CallResult = Readonly<{ text: string; isError: boolean }>;
+type Answer = Readonly<{ text: string; stop: string; error: unknown }>;
 type Call = {
 	readonly id: CallId;
 	readonly name: string;
@@ -56,10 +58,15 @@ export class PiProjection {
 		| { kind: "open"; type: string; deltas: string[]; identity: { id: CallId; name: string } | null }
 		| { kind: "closed"; block: unknown }>();
 	private batch: Call[] = [];
-	private readonly completedBatches: Call[][] = [];
+	private readonly turns: { start: number; response: number; answer: Answer; calls: Call[] }[] = [];
 	private worked = false;
-	private turns = 0;
-	private answer: { text: string; stop: string; error: unknown } | null = null;
+	private frameIndex = -1;
+	private turnStart = -1;
+	private responseStart = -1;
+	private answer: Answer | null = null;
+	private bootstrap: { frame: number; sessionId: string; baseUrl: string; model: Record<string, unknown> } | null = null;
+	private promptFrame: number | null = null;
+	private idleFrame: number | null = null;
 
 	private readonly prompt: string;
 	private readonly cwd: string | undefined;
@@ -68,8 +75,6 @@ export class PiProjection {
 		this.prompt = prompt;
 		this.cwd = cwd;
 	}
-
-	get turnCount(): number { return this.turns; }
 
 	get progress() {
 		return { stage: this.stage, workObserved: this.worked, calls: this.calls.size };
@@ -90,14 +95,16 @@ export class PiProjection {
 				requireFact([...this.calls.values()].every(call => call.state === "recorded"), "missing_tool_result");
 			}
 		}
-		return { ...this.progress, answer: this.answer };
-	}
-
-	historyFor(turn: number): readonly Call[] {
-		return this.completedBatches.slice(0, turn).flat();
+		return {
+			...this.progress, answer: this.answer, bootstrap: this.bootstrap, promptFrame: this.promptFrame, idleFrame: this.idleFrame,
+			turns: this.turns.map(turn => ({
+				...turn, calls: turn.calls.map(({ id, name, args, result }) => ({ id, name, args, result: result ?? null })),
+			})),
+		};
 	}
 
 	accept(value: unknown): void {
+		this.frameIndex++;
 		const event = record(value, "pi_event_shape");
 		switch (event.type) {
 			case "response": {
@@ -105,18 +112,25 @@ export class PiProjection {
 				requireFact(event.success === true, "rpc_response");
 				if (event.id === "prompt-1") {
 					requireFact(this.stage === "prompt" && event.command === "prompt" && data.disposition === "started", "rpc_prompt");
+					this.promptFrame = this.frameIndex;
 					this.stage = "agent";
 					return;
 				}
 				const model = record(data.model, "rpc_model");
 				requireFact(event.command === "get_state" && model.provider === PROOF_MODEL.provider && model.id === PROOF_MODEL.model &&
+					model.api === "openai-completions" && typeof model.baseUrl === "string" &&
+					typeof data.sessionId === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(data.sessionId) &&
 					data.thinkingLevel === PROOF_MODEL.thinking && data.isStreaming === false && data.isCompacting === false &&
 					data.pendingMessageCount === 0 && data.sessionFile === undefined && data.autoCompactionEnabled === false, "rpc_state");
 				if (event.id === "state-1") {
 					requireFact(this.stage === "bootstrap" && data.messageCount === 0, "rpc_bootstrap");
+					this.bootstrap = { frame: this.frameIndex, sessionId: data.sessionId, baseUrl: model.baseUrl, model };
 					this.stage = "prompt";
 				} else {
 					requireFact(event.id === "state-end" && this.stage === "settled" && data.messageCount === this.messages.length, "rpc_idle");
+					requireFact(data.sessionId === this.bootstrap?.sessionId, "rpc_session");
+					equal(model, this.bootstrap.model, "rpc_model_identity");
+					this.idleFrame = this.frameIndex;
 					this.stage = "idle";
 				}
 				return;
@@ -128,7 +142,7 @@ export class PiProjection {
 			case "turn_start":
 				requireFact(this.stage === "between" && (!this.answer || this.answer.stop === "toolUse"), "turn_start_order");
 				this.stage = "turn";
-				this.turns++;
+				this.turnStart = this.frameIndex;
 				this.assistant = undefined;
 				this.batch = [];
 				this.blocks.clear();
@@ -151,6 +165,7 @@ export class PiProjection {
 					case "assistant":
 						requireFact(this.messages.length >= 2 && !this.assistant && (message.stopReason === "pending" || message.stopReason === "error"), "assistant_start_order");
 						requireFact(Array.isArray(message.content), "assistant_content");
+						this.responseStart = this.frameIndex;
 						if (message.content.length > 0) this.worked = true;
 						break;
 					case "toolResult": {
@@ -193,7 +208,6 @@ export class PiProjection {
 				equal(event.message, this.assistant, "turn_assistant_mismatch");
 				requireFact(Array.isArray(event.toolResults), "turn_tool_results");
 				equal(event.toolResults.map(digest), this.messages.slice(this.turnAssistantIndex + 1), "turn_tool_results");
-				this.completedBatches.push(this.batch);
 				this.stage = "between";
 				return;
 			case "agent_end":
@@ -294,6 +308,7 @@ export class PiProjection {
 			const joined = text.join("");
 			requireFact(Buffer.byteLength(joined) <= UNIT1_LIMITS.answerBytes && Buffer.from(joined).toString("utf8") === joined, "assistant_answer_bytes");
 			this.answer = { text: joined, stop: message.stopReason, error: message.errorMessage ?? null };
+			this.turns.push({ start: this.turnStart, response: this.responseStart, answer: this.answer, calls: this.batch });
 		} else {
 			equal(message, this.open, "message_end_mismatch");
 			if (message.role === "toolResult") this.callFor(message).state = "recorded";
@@ -322,21 +337,35 @@ function finite(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-function checkStop(value: unknown): void {
+function checkStop(value: unknown, origin: number, target: keyof typeof STOP_GRACE_MS, first: number, last: number) {
 	const stop = record(value, "process_closure");
-	const drain = record(stop.drain, "process_drain");
-	requireFact(drain.kind === "drained" && finite(stop.triggerAt) && finite(stop.reapedAt) &&
-		finite(stop.observationCompletedAt) && finite(stop.drainDeadline) && finite(stop.observationDeadline) &&
-		stop.drainDeadline <= stop.triggerAt + UNIT1_LIMITS.killGraceMs &&
-		stop.observationDeadline <= stop.triggerAt + UNIT1_LIMITS.killGraceMs &&
-		stop.reapedAt <= stop.observationDeadline && stop.observationCompletedAt <= stop.observationDeadline &&
-		(stop.killAttemptAt === null || (finite(stop.killAttemptAt) && stop.killAttemptAt >= stop.triggerAt &&
-			stop.killAttemptAt <= stop.triggerAt + UNIT1_LIMITS.killGraceMs)) && stop.killError === null, "process_closure");
+	const { triggerAt, detectedAt, reapedAt, observationCompletedAt, drainCompletedAt, termAttemptAt, killAttemptAt } = stop;
+	requireFact(finite(triggerAt) && finite(detectedAt) && finite(reapedAt) && finite(observationCompletedAt) &&
+		finite(drainCompletedAt) && (termAttemptAt === null || finite(termAttemptAt)) &&
+		(killAttemptAt === null || finite(killAttemptAt)) && stop.termError === null && stop.killError === null, "process_closure");
+	const cutoff = triggerAt + UNIT1_LIMITS.killGraceMs;
+	const scheduledKillAt = triggerAt + STOP_GRACE_MS[target];
+	const within = (at: number) => at >= detectedAt && at <= cutoff && at - origin <= last;
+	requireFact(triggerAt - origin >= first && triggerAt <= detectedAt &&
+		stop.scheduledKillAt === scheduledKillAt && stop.signalDeadline === cutoff && stop.observationDeadline === cutoff &&
+		stop.drainDeadline === cutoff && within(reapedAt) && within(observationCompletedAt) &&
+		reapedAt <= observationCompletedAt && within(drainCompletedAt), "process_closure");
+	const retired = target === "pi" ? "Direct child reaped" : "Owned group absent and direct child reaped";
+	requireFact((killAttemptAt === null && stop.noKillReason === retired) ||
+		(killAttemptAt !== null && stop.noKillReason === null && killAttemptAt >= scheduledKillAt &&
+			within(killAttemptAt) && killAttemptAt <= observationCompletedAt && termAttemptAt !== null &&
+			termAttemptAt <= killAttemptAt), "process_closure");
+	requireFact(termAttemptAt === null ? target === "pi" : within(termAttemptAt) && termAttemptAt <= observationCompletedAt,
+		"process_closure");
+	equal(stop.drain, { kind: "drained" }, "process_drain");
+	return { trigger: triggerAt - origin, reap: reapedAt - origin, observed: observationCompletedAt - origin,
+		drained: drainCompletedAt - origin, cutoff: cutoff - origin,
+		term: termAttemptAt === null ? null : termAttemptAt - origin, kill: killAttemptAt === null ? null : killAttemptAt - origin };
 }
 
 function attemptPaths(identity: AttemptIdentity) {
 	const attempt = `attempts/${identity.attemptId}`;
-	return { attempt, capture: `${attempt}/capture`, settings: `${attempt}/agent/settings.json` };
+	return { attempt, capture: `${attempt}/capture`, settings: `${attempt}/agent/settings.json`, index: `_index/${identity.attemptId}.json` };
 }
 
 const baseArtifacts = [
@@ -353,10 +382,11 @@ const nativeArtifacts = [
 ] as const;
 
 export function snapshotArtifacts(root: string, identity: AttemptIdentity) {
-	const { capture, settings } = attemptPaths(identity);
+	const { capture, settings, index } = attemptPaths(identity);
 	const assets: [string, string, number][] = [
 		...baseArtifacts.map(([file, role, cap]): [string, string, number] => [`${capture}/${file}`, role, cap]),
 		[settings, "settings", UNIT1_LIMITS.controlFrameBytes],
+		[index, "final_index", UNIT1_LIMITS.controlFrameBytes],
 	];
 	for (const name of readdirSync(join(root, capture)).sort()) {
 		for (const [suffix, role, cap] of nativeArtifacts) {
@@ -395,7 +425,7 @@ class ObservedArtifacts {
 }
 
 type Body = Record<string, unknown>;
-type JournalEvent = Record<string, unknown> & { kind: string; body: Body };
+type JournalEvent = Record<string, unknown> & { kind: string; body: Body; monotonicMs: number; seq: number };
 
 function attemptRecords(bytes: Buffer, anchor: ExpectedCommitments, id: AttemptIdentity): JournalEvent[] {
 	const events: JournalEvent[] = [];
@@ -406,7 +436,7 @@ function attemptRecords(bytes: Buffer, anchor: ExpectedCommitments, id: AttemptI
 			event.seq === events.length + 1 && typeof event.kind === "string" && finite(event.monotonicMs) &&
 			event.monotonicMs >= time && typeof event.utcIso === "string" && !Number.isNaN(Date.parse(event.utcIso)), "journal_envelope");
 		time = event.monotonicMs;
-		events.push({ ...event, kind: event.kind, body: record(event.body, "journal_body") });
+		events.push({ ...event, kind: event.kind, seq: event.seq, monotonicMs: event.monotonicMs, body: record(event.body, "journal_body") });
 	}
 	return events;
 }
@@ -436,8 +466,9 @@ const groupKinds = ["group_reserved", "group_registered", "group_go_sent", "nati
 
 function checkGroup(input: {
 	events: JournalEvent[]; call: Call; ordinal: number; artifacts: ObservedArtifacts; capture: string; nativePath: string; originalRoot: string;
+	origin: number; piStopAt: number;
 }): Readonly<{ nativePid: number; pgid: number }> {
-	const { events, call, ordinal, artifacts, capture, nativePath, originalRoot } = input;
+	const { events, call, ordinal, artifacts, capture, nativePath, originalRoot, origin, piStopAt } = input;
 	const lease = `lease-${ordinal}`;
 	requireFact(events.length === groupKinds.length, "native_lifecycle");
 	const bodies = events.map((event, i) => {
@@ -460,7 +491,10 @@ function checkGroup(input: {
 	const observation = record(closure.observation, "native_observation");
 	requireFact(observation.kind === "gone" && observation.pgid === pgid && finite(observation.checkedAtMonotonicMs), "native_observation");
 	equal(observation.pidsChecked, [pgid, nativePid], "native_observation");
-	checkStop(closure.stop);
+	const stop = checkStop(closure.stop, origin, "native", events[2].monotonicMs, events[5].monotonicMs);
+	requireFact(observation.checkedAtMonotonicMs >= Math.max(stop.reap, stop.term ?? 0, stop.kill ?? 0) &&
+		observation.checkedAtMonotonicMs <= stop.observed && events[4].monotonicMs <= stop.drained &&
+		events[5].monotonicMs <= piStopAt, "native_observation");
 	const [stdout, stderr, chunks] = nativeArtifacts.map(([file, role, cap]) =>
 		artifacts.take(`${capture}/${lease}.native.${file}`, role, cap));
 	checkChunks(chunks, stdout, stderr, events[3], events[4]);
@@ -481,75 +515,154 @@ function checkGroup(input: {
 	return { nativePid, pgid };
 }
 
-function providerRequests(events: JournalEvent[], prompt: string, cwd: string, seen: unknown, pi: PiProjection) {
+type PiFacts = ReturnType<PiProjection["finish"]>;
+type PiTurn = PiFacts["turns"][number];
+
+function wireCalls(value: unknown, invariant: string) {
+	requireFact(Array.isArray(value), invariant);
+	return value.map((item: unknown) => {
+		const call = record(item, invariant);
+		const fn = record(call.function, invariant);
+		requireFact(call.type === "function" && typeof fn.arguments === "string", invariant);
+		let args: unknown;
+		try { args = JSON.parse(fn.arguments); }
+		catch { throw new Error(invariant); }
+		return { id: call.id, name: fn.name, args };
+	});
+}
+
+function callDeclarations(turn: PiTurn) {
+	return turn.calls.map(({ id, name, args }) => ({ id, name, args }));
+}
+
+function checkProviderHistory(value: unknown, previous: readonly PiTurn[]): void {
+	requireFact(Array.isArray(value), "provider_messages");
+	const messages = value.slice(2);
+	let i = 0;
+	for (const turn of previous) {
+		const assistant = record(messages[i++], "provider_tool_history");
+		requireFact(assistant.role === "assistant" && assistant.content === null, "provider_tool_history");
+		equal(wireCalls(assistant.tool_calls, "provider_tool_history"), callDeclarations(turn), "provider_tool_history");
+		for (const call of turn.calls) {
+			const tool = record(messages[i++], "provider_tool_history");
+			requireFact(tool.role === "tool" && tool.tool_call_id === call.id, "provider_tool_history");
+			requireFact(call.result && extractUserContentText(tool.content) === call.result.text, "provider_tool_result");
+		}
+	}
+	requireFact(i === messages.length, "provider_tool_history");
+}
+
+function checkProviderOutcome(value: unknown, turn: PiTurn) {
+	const outcome = record(value, "provider_outcome");
+	const { kind } = outcome;
+	const { answer, calls } = turn;
+	switch (kind) {
+		case "tool_calls":
+			requireFact(answer.stop === "toolUse" && answer.text === "" && answer.error === null && calls.length > 0, "provider_outcome");
+			equal(wireCalls(outcome.calls, "provider_outcome"), callDeclarations(turn), "provider_outcome");
+			break;
+		case "text": {
+			const finish = outcome.finishReason;
+			requireFact(finish === "stop" || finish === "length" || finish === "content_filter", "provider_outcome");
+			equal(answer, finish === "content_filter"
+				? { text: outcome.text, stop: "error", error: "Provider finish_reason: content_filter" }
+				: { text: outcome.text, stop: finish, error: null }, "provider_outcome");
+			break;
+		}
+		case "transport_reset":
+			requireFact(answer.stop === "error" && answer.text === "" && typeof answer.error === "string" &&
+				answer.error.startsWith("Connection error.") && answer.error.endsWith("(UND_ERR_SOCKET)"), "provider_outcome");
+			break;
+		case "http_error": {
+			requireFact(unsigned(outcome.status) && outcome.status >= 400 && outcome.status <= 599 && typeof outcome.body === "string" &&
+				answer.stop === "error" && answer.text === "" && typeof answer.error === "string", "provider_outcome");
+			const body = record(JSON.parse(outcome.body), "provider_outcome");
+			const error = record(body.error, "provider_outcome");
+			requireFact(typeof error.message === "string" && error.message.length > 0 &&
+				(answer.error.startsWith(`${outcome.status} `) || answer.error.startsWith(`${outcome.status}: `)) &&
+				answer.error.includes(error.message), "provider_outcome");
+			break;
+		}
+		default: throw new Error("provider_outcome");
+	}
+	return kind;
+}
+
+function providerRequests(input: {
+	events: JournalEvent[]; rawRefs: JournalEvent[]; prompt: string; cwd: string; seen: unknown; pi: PiFacts;
+	preflight: JournalEvent; terminal: JournalEvent; stopAt: number; origin: number; baseUrl: string;
+}) {
+	const { events, rawRefs, prompt, cwd, seen, pi, preflight, terminal, stopAt, origin, baseUrl } = input;
 	requireFact(Array.isArray(seen), "loopback_capture");
-	let pending: { candidate: Body; granted: boolean } | null = null;
+	let authorization: { kind: "candidate" | "granted"; candidate: Body } | null = null;
 	let used = 0;
 	let seq = 1;
 	let watermark = 1;
-	const outcomes: string[] = [];
+	const outcomes: ReturnType<typeof checkProviderOutcome>[] = [];
 
-	for (const { kind, body } of events) {
+	for (const event of events) {
+		const { kind, body } = event;
+		if (kind === "tool_start_reserved") {
+			requireFact(!authorization && unsigned(body.bridgeSeq) && body.bridgeSeq > seq, "bridge_sequence");
+			used++;
+			seq = watermark = body.bridgeSeq;
+			continue;
+		}
+		if (kind !== "provider_candidate" && kind !== "provider_grant" && kind !== "provider_permit_sent") continue;
+		const turn = pi.turns[outcomes.length];
+		const start = turn && rawRefs[turn.start];
+		const response = turn && rawRefs[turn.response];
+		requireFact(start && response && start.seq > preflight.seq && event.seq > start.seq &&
+			event.seq < response.seq && event.seq < terminal.seq && event.monotonicMs <= stopAt, "provider_lifecycle");
 		switch (kind) {
-			case "tool_start_reserved":
-				requireFact(!pending && unsigned(body.bridgeSeq) && body.bridgeSeq > seq, "bridge_sequence");
-				used++;
-				seq = watermark = body.bridgeSeq;
-				break;
 			case "provider_candidate": {
 				const { payloadJson } = body;
-				requireFact(!pending && unsigned(body.seq) && body.seq > seq && body.watermark === watermark &&
+				requireFact(!authorization && unsigned(body.seq) && body.seq > seq && body.watermark === watermark &&
 					typeof payloadJson === "string" && body.payloadDigest === sha256Buffer(payloadJson) &&
 					body.payloadByteLength === Buffer.byteLength(payloadJson), "provider_candidate");
 				requireFact(validateProviderPayload({ payloadJson, expectedModelId: PROOF_MODEL.model, expectedEncodedPrompt: prompt, expectedSystemPrompt: systemPrompt(cwd) }).ok, "provider_profile");
-				pending = { candidate: body, granted: false };
+				authorization = { kind: "candidate", candidate: body };
 				seq = body.seq;
 				break;
 			}
 			case "provider_grant":
-				requireFact(pending && !pending.granted && body.seq === pending.candidate.seq &&
-					body.watermark === pending.candidate.watermark && body.payloadDigest === pending.candidate.payloadDigest &&
+				requireFact(authorization?.kind === "candidate" && body.seq === authorization.candidate.seq &&
+					body.watermark === authorization.candidate.watermark && body.payloadDigest === authorization.candidate.payloadDigest &&
 					body.attemptsUsedSoFar === used && used <= UNIT1_LIMITS.maxAttempts, "provider_grant");
-				pending.granted = true;
+				authorization = { kind: "granted", candidate: authorization.candidate };
 				break;
 			case "provider_permit_sent": {
-				requireFact(pending?.granted && body.seq === pending.candidate.seq &&
-					body.payloadDigest === pending.candidate.payloadDigest, "provider_permit");
+				requireFact(authorization?.kind === "granted" && body.seq === authorization.candidate.seq &&
+					body.payloadDigest === authorization.candidate.payloadDigest, "provider_permit");
 				const wire = record(seen[outcomes.length], "missing_loopback_request");
-				requireFact(wire.seq === outcomes.length + 1 && wire.method === "POST" &&
-					wire.url === "/v1/chat/completions" && typeof wire.bodyText === "string" &&
-					["text", "tool_calls", "transport_reset", "http_error"].some(kind => kind === wire.outcome) &&
-					typeof wire.outcome === "string" && typeof pending.candidate.payloadJson === "string", "loopback_capture");
-				const payload = record(JSON.parse(pending.candidate.payloadJson), "provider_candidate");
+				requireFact(wire.seq === outcomes.length + 1 && wire.method === "POST" && wire.url === "/v1/chat/completions" &&
+					typeof wire.bodyText === "string" && typeof authorization.candidate.payloadJson === "string" &&
+					finite(wire.receivedAt), "loopback_capture");
+				equal(wire.baseUrl, baseUrl, "loopback_endpoint");
+				const receivedAt = wire.receivedAt - origin;
+				requireFact(receivedAt >= event.monotonicMs && receivedAt <= response.monotonicMs && receivedAt <= stopAt,
+					"provider_lifecycle");
+				const payload = record(JSON.parse(authorization.candidate.payloadJson), "provider_candidate");
 				equal(JSON.parse(wire.bodyText), payload, "wire_payload");
-				requireFact(Array.isArray(payload.messages), "provider_messages");
-				const resultIds: CallId[] = [];
-				for (const value of payload.messages) {
-					const message = record(value, "provider_messages");
-					if (message.role === "tool") {
-						const call = pi.calls.get(idOf(message.tool_call_id));
-						requireFact(call?.result && extractUserContentText(message.content) === call.result.text, "provider_tool_result");
-						resultIds.push(call.id);
-					}
-				}
-				equal(resultIds, pi.historyFor(outcomes.length).map(call => call.id), "provider_tool_history");
-				outcomes.push(wire.outcome);
-				pending = null;
+				checkProviderHistory(payload.messages, pi.turns.slice(0, outcomes.length));
+				outcomes.push(checkProviderOutcome(wire.outcome, turn));
+				authorization = null;
 				break;
 			}
 		}
 	}
-	requireFact(!pending && seen.length === outcomes.length && outcomes.length > 0, "provider_request_coverage");
-	requireFact(outcomes.length === pi.turnCount, "provider_turn_coverage");
+	requireFact(!authorization && seen.length === outcomes.length && outcomes.length > 0, "provider_request_coverage");
+	requireFact(outcomes.length === pi.turns.length, "provider_turn_coverage");
 	return outcomes;
 }
 
 function validateAttempt(params: {
 	root: string; originalRoot: string; anchor: ExpectedCommitments; plan: PublicRunPlan; closure: Body; adapterPath: string;
 	identity: AttemptIdentity; artifacts: unknown; question: PublicRunPlan["cases"][number];
+	live?: PiFacts;
 }) {
 	const { root, originalRoot, anchor, plan, closure, identity, question } = params;
-	const { attempt, capture, settings } = attemptPaths(identity);
+	const { attempt, capture, settings, index } = attemptPaths(identity);
 	const cwd = join(originalRoot, attempt, "cwd");
 	const artifacts = new ObservedArtifacts(root, params.artifacts);
 	const [journal, stdout, , questionBytes, wire] = baseArtifacts.map(([file, role, cap]) =>
@@ -594,6 +707,9 @@ function validateAttempt(params: {
 		!events.slice(events.indexOf(denials[0]) + 1).some(event => event.kind === "provider_permit_sent"), "budget_denial");
 	const piClosed = pi.finish("Closed", denial && { id: denial.callId, name: denial.toolName, ordinal: deniedOrdinal });
 	requireFact(frameCount === rawRefs.length && piClosed.answer, "pi_frame_coverage");
+	if (params.live) equal(params.live, piClosed, "live_closed_pi");
+	const bootstrap = piClosed.bootstrap;
+	requireFact(bootstrap, "rpc_bootstrap");
 
 	const ready = one("bound_ready").body;
 	equal(ready, {
@@ -601,14 +717,21 @@ function validateAttempt(params: {
 		model: { provider: PROOF_MODEL.provider, id: PROOF_MODEL.model }, thinkingLevel: PROOF_MODEL.thinking,
 	}, "bound_ready");
 	equal(one("bound_ready_ack").body, { seq: 1 }, "bound_ready_ack");
-	equal(one("get_state_ok").body, {
+	const state = one("get_state_ok");
+	equal(state.body, {
 		modelProvider: PROOF_MODEL.provider, modelId: PROOF_MODEL.model, thinkingLevel: PROOF_MODEL.thinking, autoCompactionEnabled: false,
-	}, "initial_state");
+		sessionId: bootstrap.sessionId, baseUrl: bootstrap.baseUrl,
+	}, "rpc_bootstrap_identity");
+	requireFact(rawRefs[bootstrap.frame].seq > one("bound_ready_ack").seq && rawRefs[bootstrap.frame].seq < state.seq, "rpc_bootstrap_order");
 	equal(one("prompt_encoded").body, {
 		originalQuestionSha256: question.questionSha256, encodedPromptSha256: sha256Buffer(prompt), encodedByteLength: Buffer.byteLength(prompt),
 	}, "prompt_encoded");
-	equal(one("prompt_sent").body, { id: "prompt-1", message: prompt }, "prompt_sent");
-	equal(one("prompt_preflight").body, { disposition: "started" }, "prompt_preflight");
+	const promptCommit = one("prompt_sent");
+	equal(promptCommit.body, { id: "prompt-1", message: prompt }, "prompt_sent");
+	const preflight = one("prompt_preflight");
+	equal(preflight.body, { disposition: "started" }, "prompt_preflight");
+	const promptResponse = piClosed.promptFrame === null ? null : rawRefs[piClosed.promptFrame];
+	requireFact(promptResponse && promptCommit.seq < promptResponse.seq && promptResponse.seq < preflight.seq, "rpc_prompt_order");
 	if (!denial) equal(one("agent_settled").body, { aborted: false }, "agent_settled");
 	const lifecycle = ["plan_committed", "closure_verified", "pi_spawned", "bound_ready", "bound_ready_ack", "get_state_ok",
 		"prompt_encoded", "prompt_sent", "prompt_preflight", ...(denial ? ["tool_start_denied"] : ["agent_settled"]),
@@ -618,15 +741,39 @@ function validateAttempt(params: {
 	const supported = new Set([...lifecycle, ...groupKinds, "pi_frame", "provider_candidate", "provider_grant",
 		"provider_permit_sent", "tool_declared_batch", "tool_start_reserved"]);
 	requireFact(events.every(event => supported.has(event.kind)), "journal_invalid_evidence");
-	const spawned = one("pi_spawned").body;
+	const launch = one("pi_spawned");
+	const spawned = launch.body;
 	requireFact(unsigned(spawned.pid) && spawned.pid > 0 && typeof spawned.lstart === "string" && spawned.adapterPath === params.adapterPath, "pi_pid");
-	const exited = one("pi_exited").body;
+	const origin = spawned.monotonicStartMs;
+	const baseUrl = spawned.baseUrl;
+	requireFact(finite(origin), "attempt_clock");
+	requireFact(typeof baseUrl === "string" && /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/v1$/.test(baseUrl) &&
+		baseUrl === bootstrap.baseUrl, "loopback_endpoint");
+	const exitEvent = one("pi_exited");
+	const exited = exitEvent.body;
 	const piStop = record(exited.stop, "pi_exit");
+	const terminal = denials[0] ?? one("agent_settled");
+	requireFact(finite(piStop.triggerAt), "process_closure");
+	const outcomes = providerRequests({ events, rawRefs, prompt, cwd, seen: parseRawJson(wire), pi: piClosed,
+		preflight, terminal, stopAt: piStop.triggerAt - origin, origin, baseUrl });
 	requireFact(denial
 		? exited.code === null && (exited.signal === "SIGKILL" ? finite(piStop.killAttemptAt)
 			: exited.signal === "SIGTERM" && finite(piStop.termAttemptAt))
 		: exited.code === 0 && exited.signal === null, "pi_exit");
-	checkStop(piStop);
+	const idle = piClosed.idleFrame === null ? null : rawRefs[piClosed.idleFrame];
+	const stopped = checkStop(piStop, origin, "pi", (idle ?? preflight).monotonicMs, exitEvent.monotonicMs);
+	const exitObserved = exited.observedAtMonotonicMs;
+	const lastFrame = rawRefs.at(-1);
+	requireFact(finite(exitObserved) && exitObserved <= stopped.reap && stopped.reap === stopped.observed &&
+		lastFrame && lastFrame.seq < exitEvent.seq, "pi_exit_chronology");
+	if (denial) {
+		const signalAt = exited.signal === "SIGKILL" ? stopped.kill : stopped.term;
+		requireFact(signalAt !== null && signalAt <= exitObserved && stopped.trigger <= terminal.monotonicMs &&
+			terminal.monotonicMs <= exitObserved, "pi_exit_chronology");
+	} else {
+		requireFact(idle && terminal.seq < idle.seq && idle.monotonicMs <= exitObserved && exitObserved <= stopped.trigger &&
+			stopped.term === null && stopped.kill === null, "pi_exit_chronology");
+	}
 
 	const reservations = byKind("tool_start_reserved");
 	const declared = byKind("tool_declared_batch").flatMap(({ body }) => {
@@ -641,6 +788,7 @@ function validateAttempt(params: {
 	for (const event of events.filter(event => groupKinds.includes(event.kind))) {
 		const { leaseId } = event.body;
 		requireFact(typeof leaseId === "string", "native_lease");
+		if (event.kind === "group_closure_observed") requireFact(event.seq > exitEvent.seq, "native_closure_order");
 		const group = groups.get(leaseId) ?? [];
 		group.push(event);
 		groups.set(leaseId, group);
@@ -660,21 +808,17 @@ function validateAttempt(params: {
 		const executable = call.name === "clec" && object(call.args) && Object.keys(call.args).length === 1 && call.args.action === "status";
 		const native = executable ? checkGroup({
 			events: group ?? [], call, ordinal, artifacts, capture,
-			nativePath: String(nativePath), originalRoot,
+			nativePath: String(nativePath), originalRoot, origin, piStopAt: stopped.trigger,
 		}) : null;
 		if (executable) requireFact(Number(group?.[0]?.seq) > Number(reservation.seq), "native_reservation_order");
 		else requireFact(!group && call.result?.isError === true, "invalid_tool_rejection");
 		return { id: call.id, name: call.name, ordinal, result: call.result, native };
 	});
 	requireFact(groups.size === 0, "unpaired_native");
-	artifacts.finish();
 
-	const outcomes = providerRequests(events, prompt, cwd, parseRawJson(wire), pi);
 	const answer = piClosed.answer;
 	const transport = outcomes.length === 1 && outcomes[0] === "transport_reset";
-	const eligible = transport && !piClosed.workObserved && calls.length === 0 && answer.stop === "error" &&
-		answer.text.length === 0 && typeof answer.error === "string" && answer.error.includes("UND_ERR_SOCKET");
-	requireFact(!transport || eligible, "transport_witness");
+	const eligible = transport && !piClosed.workObserved && calls.length === 0;
 	const status = denial ? "DeniedAndTerminated" : answer.stop === "stop" && answer.text.trim().length > 0 ? "Answered"
 		: eligible ? "PreWorkInfrastructureFailed" : "TaskFailed";
 	const rawClosed = one("attempt_closed");
@@ -683,6 +827,44 @@ function validateAttempt(params: {
 	equal(rawClosed.body.nativeStarts, callSummary.filter(call => call.native).length, "native_count");
 	equal(rawClosed.body.providerRequestsGranted, outcomes.length, "provider_count");
 	equal(rawClosed.body.providerRequestsDenied, 0, "provider_denied_count");
+	const owner = record(parseRawJson(artifacts.take(index, "final_index", UNIT1_LIMITS.controlFrameBytes)), "final_owner");
+	requireFact(owner.runId === anchor.runId && owner.attemptId === identity.attemptId &&
+		owner.indexEntryPath === join(originalRoot, index) && owner.piPid === spawned.pid &&
+		owner.closureBeforeSha256 === closure.closureDigest, "final_owner_identity");
+	requireFact(owner.uncertified === false && owner.indexPublicationError === undefined, "final_owner_drain");
+	equal(owner.captureDrain, { kind: "drained" }, "final_owner_drain");
+	const finalCapture = record(owner.finalCapture, "final_owner_drain");
+	requireFact(finite(finalCapture.closedAtMonotonicMs) && finalCapture.closedAtMonotonicMs >= rawClosed.monotonicMs &&
+		finalCapture.closedAtMonotonicMs <= stopped.cutoff && finalCapture.journalSeq === rawClosed.seq &&
+		finalCapture.journalBytes === journal.length, "final_owner_drain");
+	equal(owner.rawArtifacts, {
+		journalPath: join(originalRoot, capture, "journal.jsonl"),
+		piStdoutPath: join(originalRoot, capture, "pi.stdout.jsonl"),
+		piStderrPath: join(originalRoot, capture, "pi.stderr.bin"),
+	}, "final_owner_identity");
+	equal(owner.piStop, piStop, "final_owner_process");
+	equal(owner.piExitCode, exited.code, "final_owner_process");
+	equal(owner.piSignal, exited.signal, "final_owner_process");
+	requireFact(Array.isArray(owner.groupObservations), "final_owner_process");
+	const closedGroups = byKind("group_closure_observed");
+	requireFact(owner.groupObservations.length === closedGroups.length, "final_owner_process");
+	for (const [i, value] of owner.groupObservations.entries()) {
+		const group = record(value, "final_owner_process");
+		const closure = closedGroups[i].body;
+		const native = callSummary.find(call => `lease-${call.ordinal}` === closure.leaseId)?.native;
+		requireFact(native && group.state === "Closed" && group.registeredBeforeGo === true &&
+			group.pgid === native.pgid && group.helperPid === native.pgid && group.nativePid === native.nativePid,
+			"final_owner_process");
+		equal({ leaseId: group.leaseId, observation: group.closure, stop: group.stop }, closure, "final_owner_process");
+	}
+	requireFact(owner.status === rawClosed.body.status && owner.failureReason === rawClosed.body.failureReason &&
+		owner.nativeStarts === rawClosed.body.nativeStarts && owner.providerRequestsGranted === outcomes.length &&
+		owner.providerRequestsDenied === 0 && owner.promptReceived === true &&
+		owner.originalQuestionBytesSha256 === question.questionSha256 && owner.encodedPromptText === prompt &&
+		owner.encodedPromptBytesSha256 === sha256Buffer(prompt) &&
+		owner.answerText === (piClosed.turns.findLast(turn => turn.answer.text !== "")?.answer.text ?? null),
+		"final_owner_outcome");
+	artifacts.finish();
 	return { identity, status, answer, workObserved: piClosed.workObserved, providerRequests: outcomes.length, calls: callSummary, piPid: spawned.pid };
 }
 
@@ -703,7 +885,9 @@ export function runtimeWitness(closure: ExecutionClosure): RuntimeWitness {
 	return { profile: publicProfile(closure), inventory: runtimeInventory(closure) };
 }
 
-function validateRun(root: string, expected: ExpectedCommitments, mode: Mode): Validation {
+type LiveAttempt = Readonly<{ identity: AttemptIdentity; projection: PiFacts }>;
+
+function validateRun(root: string, expected: ExpectedCommitments, mode: Mode, live?: LiveAttempt): Validation {
 	const planBytes = readEvidence(root, "plan.json", UNIT1_LIMITS.controlFrameBytes);
 	const planInput = parseRawJson(planBytes);
 	const stream = readEvidence(root, "run.jsonl", UNIT1_LIMITS.journalTotalBytes);
@@ -740,13 +924,21 @@ function validateRun(root: string, expected: ExpectedCommitments, mode: Mode): V
 	let next: AttemptIdentity | null = initialAttempt(expected.runId, plan.cases[0].id);
 	const attempts: AttemptSummary[] = [];
 	let terminal = false;
+	let active = false;
 	for (const frame of entries) {
 		const entry = record(frame.value, "run_record");
 		requireFact(!terminal && entry.seq === ++seq && entry.plan === expected.plan && entry.runId === expected.runId, "run_lifecycle");
 		if (entry.kind === "run_closed") {
 			requireFact(next === null && caseIndex === plan.cases.length, attempts.length ? "scheduled_case_missing" : "empty_attempts");
+			requireFact(!active, "attempt_incomplete");
 			equal(entry.witness, witness, "closure_postcheck");
 			terminal = true;
+			continue;
+		}
+		if (entry.kind === "attempt_started") {
+			requireFact(!active && next, "attempt_start");
+			equal(entry.identity, next, "attempt_start");
+			active = true;
 			continue;
 		}
 		requireFact(entry.kind === "attempt", "run_record_kind");
@@ -757,13 +949,15 @@ function validateRun(root: string, expected: ExpectedCommitments, mode: Mode): V
 		requireFact(next, "unscheduled_attempt");
 		requireFact(id.predecessor === next.predecessor, "replacement_predecessor");
 		equal(id, next, "case_order");
+		requireFact(active, "attempt_start");
 		equal(entry.witness, witness, "closure_postcheck");
 		equal(entry.corpusAfter, STATUS_CORPUS, "corpus_postcheck");
 		const result = validateAttempt({
 			root, originalRoot: expected.originalRoot, anchor: expected, plan,
 			identity: next, question: plan.cases[caseIndex], closure, adapterPath: adapter.logicalPath,
-			artifacts: entry.artifacts,
+			artifacts: entry.artifacts, live: live?.identity.attemptId === next.attemptId ? live.projection : undefined,
 		});
+		active = false;
 		attempts.push(result);
 		if (next.ordinal === 2) replacements++;
 		if (next.ordinal === 1 && replacements === 0 && result.status === "PreWorkInfrastructureFailed") {
@@ -773,6 +967,7 @@ function validateRun(root: string, expected: ExpectedCommitments, mode: Mode): V
 			next = upcoming ? initialAttempt(expected.runId, upcoming.id) : null;
 		}
 	}
+	if (active) return { kind: "Incomplete", attempts, next: null, invariant: "attempt_incomplete" };
 	if (mode === "Prefix") return { kind: "Incomplete", attempts, next, invariant: next ? "schedule_pending" : "seal_pending" };
 	if (!terminal) return { kind: "Incomplete", attempts, next, invariant: attempts.length === 0 ? "empty_attempts" : next ? "scheduled_case_missing" : "run_not_closed" };
 	const summary: RunSummary = {
@@ -783,8 +978,8 @@ function validateRun(root: string, expected: ExpectedCommitments, mode: Mode): V
 	return { kind: "Complete", summary };
 }
 
-export function reconcile(root: string, expected: ExpectedCommitments, mode: Mode): Validation {
-	try { return validateRun(root, expected, mode); }
+export function reconcile(root: string, expected: ExpectedCommitments, mode: Mode, live?: LiveAttempt): Validation {
+	try { return validateRun(root, expected, mode, live); }
 	catch (err) { return { kind: "Invalid", invariant: err instanceof Error ? err.message : String(err) }; }
 }
 

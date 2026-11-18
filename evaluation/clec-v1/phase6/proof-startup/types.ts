@@ -343,6 +343,11 @@ export interface ProofRunResult {
 	readonly piSignal: string | null;
 	readonly piStop?: import("./process-group.ts").SignalEvidence;
 	readonly captureDrain?: import("./framing.ts").DrainResult;
+	readonly finalCapture?: {
+		readonly closedAtMonotonicMs: number;
+		readonly journalSeq: number;
+		readonly journalBytes: number;
+	};
 	readonly uncertified: boolean;
 	readonly rawArtifacts: {
 		readonly journalPath: string;

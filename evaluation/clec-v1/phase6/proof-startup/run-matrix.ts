@@ -976,7 +976,7 @@ setInterval(() => {}, 1000);`;
 			assert(g !== undefined && g.state === "Closed", `expected group Closed, got ${g?.state}`);
 			assert(g.closure?.kind === "gone", `expected closure gone, got ${g.closure?.kind}`);
 			assert(g.killEscalationMs !== null && g.killEscalationMs <= UNIT1_LIMITS.killGraceMs, `kill escalation took ${g.killEscalationMs}ms > 2000ms`);
-			const directObs = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicMs: 0 });
+			const directObs = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicStartMs: performance.now() });
 			assert(directObs.kind === "gone", `direct ps verification failed: ${JSON.stringify(directObs)}`);
 			return {
 				detail: `Native killed explicit Pi PID & ignored SIGTERM; outer SIGKILLed PGID ${g.pgid} in ${g.killEscalationMs}ms; ps confirmed gone`,
@@ -1032,7 +1032,7 @@ setInterval(() => {}, 1000);`;
 				}
 				const deadline = performance.now() + 2_000;
 				while (performance.now() < deadline) {
-					const obs = await observeGroupInProcessTable({ pgid: leakedPgid, knownIdentities: [], monotonicMs: 0 });
+					const obs = await observeGroupInProcessTable({ pgid: leakedPgid, knownIdentities: [], monotonicStartMs: performance.now() });
 					if (obs.kind === "gone") break;
 					await new Promise((r) => setTimeout(r, 30));
 				}
@@ -1132,7 +1132,7 @@ setInterval(() => {
 			);
 			const g = res.groupObservations[0];
 			assert(g?.closure?.kind === "gone", "recorded closure must be gone");
-			const direct = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicMs: 0 });
+			const direct = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicStartMs: performance.now() });
 			assert(direct.kind === "gone", "direct ps check must agree with recorded closure");
 			return { detail: `Direct ps agrees with recorded closure for PGID ${g.pgid}`, result: res, serverRequests: srv.requests };
 		} finally {

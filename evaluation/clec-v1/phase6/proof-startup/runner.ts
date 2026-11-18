@@ -68,32 +68,30 @@ export async function collectRun(input: unknown, evidenceParent: string, fixture
 			const pi = new PiProjection(UNIT1_LIMITS.promptPrefix + item.question, join(root, "attempts", identity.attemptId, "cwd"));
 			const mock = await startUnit1LoopbackOpenAI(req => fixture(identity, req.seq));
 			try {
+				appendFileSync(journal, encode("attempt_started", { identity }));
 				const result = await runUnit1Proof({
 					caseLabel: item.id, evidenceParentDir: root, question: item.question, mockBaseUrl: mock.baseUrl,
 					providerId: PROOF_MODEL.provider, modelId: PROOF_MODEL.model, thinkingLevel: PROOF_MODEL.thinking,
 				}, { cachedClosure: before, evidence: { identity, anchor: expected, pi } });
-				if (result.piStop?.reapedAt == null || !result.groupObservations.every(group => group.closure?.kind === "gone")) {
-					return report({ ...progress, invariant: "ownership_incomplete" });
-				}
 				const capture = join(root, "attempts", identity.attemptId, "capture");
+				if (lstatSync(capture, { throwIfNoEntry: false }) === undefined) return report(inspectRun(root, expected));
 				writeExclusiveFile(join(capture, "question.bin"), Buffer.from(item.question));
-				writeExclusiveFile(join(capture, "loopback.json"), JSON.stringify(mock.requests.map(({ seq, method, url, bodyText }, i) =>
-					({ seq, method, url, bodyText, outcome: mock.outcomes[i] }))));
+				writeExclusiveFile(join(capture, "loopback.json"), JSON.stringify(mock.requests.map(({ seq, method, url, bodyText, baseUrl, receivedAt }, i) =>
+					({ seq, method, url, bodyText, baseUrl, receivedAt, outcome: mock.outcomes[i] }))));
+				if (!result.finalCapture || result.captureDrain?.kind !== "drained" || result.uncertified || result.indexPublicationError !== undefined) {
+					return report(inspectRun(root, expected));
+				}
 				const after = captureExecutionClosure();
 				equal(runtimeWitness(after), witness, "closure_postcheck");
 				const artifacts = snapshotArtifacts(root, identity);
 				const data = join(root, "attempts", identity.attemptId, "data");
 				const corpusAfter = readdirSync(data).length === 0 ? STATUS_CORPUS : null;
 				appendFileSync(journal, encode("attempt", { identity, artifacts, witness: runtimeWitness(after), corpusAfter }));
-				progress = reconcile(root, expected, "Prefix");
+				const projection = pi.finish("Prefix");
+				progress = reconcile(root, expected, "Prefix", { identity, projection });
 				if (progress.kind !== "Incomplete") return report(progress);
 				progression.push(progress);
-				const raw = progress.attempts.at(-1);
-				const live = pi.finish("Prefix");
-				equal(live.answer, raw?.answer, "live_closed_answer");
-				equal(live.workObserved, raw?.workObserved, "live_closed_work");
-				equal(live.calls, raw?.calls.length, "live_closed_calls");
-				attemptProjections.push(live);
+				attemptProjections.push(projection);
 			} finally {
 				await mock.close();
 			}

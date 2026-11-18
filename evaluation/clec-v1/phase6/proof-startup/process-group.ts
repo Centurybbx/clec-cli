@@ -115,16 +115,15 @@ async function collectProcessTable(output: Promise<string>, deadline: () => numb
 export async function observeGroupInProcessTable(params: {
 	readonly pgid: number;
 	readonly knownIdentities: ReadonlyArray<{ readonly pid: number; readonly lstart: string | null }>;
-	readonly monotonicMs: number;
+	readonly monotonicStartMs: number;
 	readonly deadline?: number;
 	readonly freshAfter?: number;
 	readonly injectPsFailure?: boolean;
 }): Promise<ProcessObservation> {
-	const startedAt = performance.now();
 	const table = params.injectPsFailure
 		? tableFailure("Injected OS process-list observation failure")
 		: await readOsProcessTable(params.deadline, params.freshAfter);
-	const checkedAtMonotonicMs = params.monotonicMs + performance.now() - startedAt;
+	const checkedAtMonotonicMs = performance.now() - params.monotonicStartMs;
 	const base = { pgid: params.pgid, checkedAtMonotonicMs };
 	if (!table.ok) return { ...base, kind: "unknown", reason: table.reason };
 	const known = new Map(params.knownIdentities.map(({ pid, lstart }) => [pid, lstart]));
@@ -171,6 +170,8 @@ export interface StopTrigger {
 	readonly detectedAt: number;
 }
 
+export const STOP_GRACE_MS = { pi: 350, native: 400 } as const;
+
 export interface SignalEvidence {
 	readonly triggerAt: number;
 	readonly detectedAt: number;
@@ -185,6 +186,7 @@ export interface SignalEvidence {
 	killError: string | null;
 	reapedAt: number | null;
 	observationCompletedAt: number | null;
+	drainCompletedAt: number | null;
 	drain: DrainResult | null;
 }
 
@@ -208,7 +210,7 @@ export function armStop(params: {
 		triggerAt: at, detectedAt, scheduledKillAt: at + params.graceMs,
 		signalDeadline: deadline, observationDeadline: deadline, drainDeadline: deadline,
 		termAttemptAt: null, killAttemptAt: null, noKillReason: null,
-		termError: null, killError: null, reapedAt: null, observationCompletedAt: null, drain: null,
+		termError: null, killError: null, reapedAt: null, observationCompletedAt: null, drainCompletedAt: null, drain: null,
 	};
 	let cancelTimer: (() => void) | undefined;
 	let retired = false;
@@ -324,7 +326,7 @@ export class ProcessGroupRegistry {
 	beginOne(entry: GroupRegistryEntry, trigger: StopTrigger, omitSignals = false): ArmedStop {
 		if (entry.stop) return entry.stop;
 		entry.state = "Stopping";
-		entry.stop = armStop({ trigger, child: entry.child, pgid: entry.pgid ?? undefined, graceMs: 400, omitSignals });
+		entry.stop = armStop({ trigger, child: entry.child, pgid: entry.pgid ?? undefined, graceMs: STOP_GRACE_MS.native, omitSignals });
 		return entry.stop;
 	}
 
@@ -355,6 +357,7 @@ export class ProcessGroupRegistry {
 				? { kind: "incomplete", reason: "Native stream deadline" }
 				: closes.find((result) => result.kind === "incomplete")
 					?? (captured.value.kind === "drained" ? { kind: "drained" } : captured.value);
+			evidence.drainCompletedAt = performance.now();
 		};
 		const draining = capture();
 		let groupRetired = false;
@@ -366,7 +369,7 @@ export class ProcessGroupRegistry {
 				if (helperPid !== null) knownIdentities.push({ pid: helperPid, lstart: helperLstart });
 				if (nativePid !== null) knownIdentities.push({ pid: nativePid, lstart: nativeLstart });
 				const observed = await observeGroupInProcessTable({
-					pgid: entry.pgid, knownIdentities, monotonicMs: performance.now() - this.monotonicStartMs,
+					pgid: entry.pgid, knownIdentities, monotonicStartMs: this.monotonicStartMs,
 					deadline: evidence.observationDeadline, freshAfter, injectPsFailure,
 				});
 				entry.closure = observed;

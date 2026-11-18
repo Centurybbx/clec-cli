@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import {
-	cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+	cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { artifactRef, frames } from "./artifacts.ts";
 import { digest, publicProfile } from "./contract.ts";
-import { writeExclusiveFile } from "./framing.ts";
+import { BoundedJournalWriter, writeExclusiveFile } from "./framing.ts";
 import { captureExecutionClosure, sha256Buffer } from "./pins.ts";
 import { collectRun, inspectRun, sealRun } from "./runner.ts";
 import { PiProjection } from "./validate.ts";
@@ -68,6 +70,13 @@ async function baseline(name, ids, fixture, expectedStatus, replacements, status
 function readJson(path) { return JSON.parse(readFileSync(path, "utf8")); }
 function readLines(path) { return readFileSync(path, "utf8").trim().split("\n").map(JSON.parse); }
 function lines(records) { return Buffer.from(records.map(item => JSON.stringify(item) + "\n").join("")); }
+function recordedAttempts(run) { return run.filter(entry => entry.kind === "attempt"); }
+
+function omitAttempt(run, ordinal) {
+	const { identity } = recordedAttempts(run)[ordinal];
+	const kept = run.filter(entry => entry.identity?.attemptId !== identity.attemptId);
+	run.splice(0, run.length, ...kept);
+}
 
 await baseline("one", ["alpha"], (_, seq) => seq < 3 ? native(seq) : answer, "Answered", 0, ["Answered"]);
 await baseline("two", ["alpha", "beta"], ordinary, "Answered", 0, ["Answered", "Answered"]);
@@ -112,7 +121,11 @@ async function mutate(name, expectedInvariant, change, baselineName = "one") {
 	}
 	function journal(transform) {
 		const entries = transform(readLines(join(root, refFor("journal").path)));
-		set("journal", lines(entries.map((event, i) => ({ ...event, seq: i + 1 }))));
+		const bytes = lines(entries.map((event, i) => ({ ...event, seq: i + 1 })));
+		set("journal", bytes);
+		const owner = readJson(join(root, refFor("final_index").path));
+		Object.assign(owner.finalCapture, { journalSeq: entries.length, journalBytes: bytes.length });
+		set("final_index", Buffer.from(JSON.stringify(owner)));
 	}
 	function raw(transform) {
 		const rawRecords = readFileSync(join(root, refFor("pi_stdout").path), "utf8").trimEnd().split("\n");
@@ -138,7 +151,8 @@ async function mutate(name, expectedInvariant, change, baselineName = "one") {
 		});
 	}
 	const expected = structuredClone(readJson(baseline.anchorPath));
-	change({ root, run, attempt, expected, refFor, set, journal, raw });
+	change({ root, run, attempt, expected, refFor, set, journal, raw,
+		read: role => readJson(join(root, refFor(role).path)) });
 	writeFileSync(runFile, lines(run.map((entry, i) => ({ ...entry, seq: i + 1 }))));
 	const sealed = await sealRun(root, expected);
 	const inspected = inspectRun(root, expected);
@@ -148,8 +162,8 @@ async function mutate(name, expectedInvariant, change, baselineName = "one") {
 	process.stdout.write(`pass mutation ${name} ${expectedInvariant}\n`);
 }
 
-await mutate("empty", "empty_attempts", ({ run }) => run.splice(1, 1));
-await mutate("duplicate_attempt", "duplicate_attempt", ({ run, attempt }) => run.splice(2, 0, structuredClone(attempt)));
+await mutate("empty", "empty_attempts", ({ run }) => omitAttempt(run, 0));
+await mutate("duplicate_attempt", "duplicate_attempt", ({ run, attempt }) => run.splice(-1, 0, structuredClone(attempt)));
 await mutate("running", "attempt_status", ({ journal }) => journal(events => events.map(event =>
 	event.kind === "attempt_closed" ? { ...event, body: { ...event.body, status: "Running" } } : event)));
 await mutate("missing_answer", "missing_answer", ({ raw }) => raw(frames => {
@@ -172,7 +186,7 @@ await mutate("count_and_pins", "derived_summary", ({ root }) => {
 	writeFileSync(path, JSON.stringify({ summary, sha256: digest(summary) }));
 });
 await mutate("runtime_pin", "runtime_witness", ({ run }) => {
-	for (const entry of run) entry.witness.inventory.nativePin.sha256 = "f".repeat(64);
+	for (const entry of run.filter(e => e.witness)) entry.witness.inventory.nativePin.sha256 = "f".repeat(64);
 });
 await mutate("agent_end_only", "agent_end_order", ({ raw }) => raw(() => lines([{ type: "agent_end" }])));
 await mutate("lost_tool_results", "missing_tool_result", ({ raw }) => raw(records => lines(records.map(JSON.parse)
@@ -186,9 +200,9 @@ await mutate("unavailable_stream", "missing_artifact", ({ root, refFor }) => rmS
 await mutate("unpaired_call", "unpaired_call", ({ raw }) => raw(records => lines(records.map(JSON.parse).map(event =>
 	event.type === "tool_execution_start" ? { ...event, toolCallId: "foreign-id" } : event))));
 await mutate("foreign_predecessor", "replacement_predecessor", ({ run }) => {
-	run[2].identity.predecessor = "foreign-case-a1";
+	recordedAttempts(run)[1].identity.predecessor = "foreign-case-a1";
 }, "replacement");
-await mutate("omitted_case", "scheduled_case_missing", ({ run }) => run.splice(2, 1), "two");
+await mutate("omitted_case", "scheduled_case_missing", ({ run }) => omitAttempt(run, 1), "two");
 await mutate("duplicate_call", "duplicate_call", ({ raw }) => raw(records =>
 	Buffer.from(records.join("\n").replaceAll("status_call_2", "status_call_1") + "\n")));
 await mutate("missing_exit", "native_lifecycle", ({ journal }) => journal(events => events.filter(event =>
@@ -199,14 +213,14 @@ await mutate("unexpected_reattempt", "unexpected_reattempt", ({ run, attempt }) 
 	replacement.identity.attemptId += "-unexpected";
 	replacement.identity.ordinal = 2;
 	replacement.identity.predecessor = attempt.identity.attemptId;
-	run.splice(2, 0, replacement);
+	run.splice(-1, 0, replacement);
 }, "refusal");
 await mutate("second_global_reattempt", "unexpected_reattempt", ({ run }) => {
-	const replacement = structuredClone(run[3]);
+	const replacement = structuredClone(recordedAttempts(run)[2]);
 	replacement.identity.attemptId += "-unexpected";
 	replacement.identity.ordinal = 2;
-	replacement.identity.predecessor = run[3].identity.attemptId;
-	run.splice(4, 0, replacement);
+	replacement.identity.predecessor = recordedAttempts(run)[2].identity.attemptId;
+	run.splice(-1, 0, replacement);
 }, "global_limit");
 await mutate("changed_anchor", "external_anchor", ({ expected }) => { expected.plan = "c".repeat(64); });
 await mutate("changed_plan", "external_anchor", ({ root }) => {
@@ -224,6 +238,219 @@ await mutate("symlink_escape", "artifact_path", ({ root, refFor }) => {
 await mutate("native_count", "native_count", ({ journal }) => journal(events => events.map(event =>
 	event.kind === "attempt_closed" ? { ...event, body: { ...event.body, nativeStarts: 0 } } : event)));
 
+const originalMutations = mutations.length;
+assert.equal(originalMutations, 27);
+
+function donorArtifact(name, ordinal, role) {
+	const { root } = runs.get(name);
+	const attempt = recordedAttempts(readLines(join(root, "run.jsonl")))[ordinal];
+	return readFileSync(join(root, attempt.artifacts.find(art => art.role === role).path));
+}
+
+function moveAuthorization(events, landmark, after) {
+	const kinds = new Set(["provider_candidate", "provider_grant", "provider_permit_sent"]);
+	const moved = events.filter(event => kinds.has(event.kind));
+	const ordered = events.filter(event => !kinds.has(event.kind));
+	ordered.splice(ordered.findIndex(event => event.kind === landmark) + Number(after), 0, ...moved);
+	return ordered.map(({ kind, body }, i) => ({ ...events[i], kind, body }));
+}
+
+await mutate("grant_after_exit", "provider_lifecycle", ({ journal }) =>
+	journal(events => moveAuthorization(events, "pi_exited", true)), "replacement");
+await mutate("grant_before_prompt", "provider_lifecycle", ({ journal }) =>
+	journal(events => moveAuthorization(events, "prompt_sent", false)), "replacement");
+await mutate("missing_grant", "provider_permit", ({ journal }) =>
+	journal(events => events.filter(e => e.kind !== "provider_grant")), "replacement");
+await mutate("foreign_chunks", "native_chunk", ({ set }) => set("native_chunks", donorArtifact("two", 0, "native_chunks")));
+await mutate("changed_profile_anchor", "external_anchor", ({ expected }) => { expected.profile = "1".repeat(64); });
+
+function mutateProviderHistory(change, mutatePayload, requestIndex = -1) {
+	const { set, read, journal } = change;
+	const loopback = read("loopback");
+	const request = loopback.at(requestIndex);
+	const wire = JSON.parse(request.bodyText);
+	mutatePayload(wire.messages);
+	request.bodyText = JSON.stringify(wire);
+	set("loopback", Buffer.from(JSON.stringify(loopback)));
+	journal(events => {
+		const candidate = events.filter(e => e.kind === "provider_candidate").at(requestIndex).body;
+		const payload = JSON.parse(candidate.payloadJson);
+		mutatePayload(payload.messages);
+		const oldDigest = candidate.payloadDigest;
+		candidate.payloadJson = JSON.stringify(payload);
+		candidate.payloadByteLength = Buffer.byteLength(candidate.payloadJson);
+		const digest = sha256Buffer(candidate.payloadJson);
+		for (const { body } of events) if (body.payloadDigest === oldDigest) body.payloadDigest = digest;
+		return events;
+	});
+}
+await mutate("foreign_provider_call", "provider_tool_history", change => mutateProviderHistory(change, messages => {
+	messages.find(m => m.role === "assistant").tool_calls[0].id = "different_call";
+}, 1));
+await mutate("foreign_provider_args", "provider_tool_history", change => mutateProviderHistory(change, messages => {
+	messages.find(m => m.role === "assistant").tool_calls[0].function.arguments = '{"action":"other"}';
+}));
+await mutate("reordered_provider_batches", "provider_tool_history", change => mutateProviderHistory(change, messages => {
+	const first = messages.splice(2, 2);
+	messages.push(...first);
+}));
+
+function changeOutcome({ read, set }, change) {
+	const loopback = read("loopback");
+	loopback.at(-1).outcome = change(loopback.at(-1).outcome);
+	set("loopback", Buffer.from(JSON.stringify(loopback)));
+}
+await mutate("contradictory_outcome", "provider_outcome", change =>
+	changeOutcome(change, () => ({ kind: "transport_reset" })));
+await mutate("refusal_claimed_as_stop", "provider_outcome", change =>
+	changeOutcome(change, outcome => ({ ...outcome, finishReason: "stop" })), "refusal");
+await mutate("truncation_claimed_as_stop", "provider_outcome", change =>
+	changeOutcome(change, outcome => ({ ...outcome, finishReason: "stop" })), "post_work");
+
+function foreignBootstrap({ raw }) {
+	const foreign = [...frames(donorArtifact("replacement", 1, "pi_stdout"))][0].value;
+	raw(records => {
+		const bootstrap = JSON.parse(records[0]);
+		assert.notEqual(bootstrap.data.sessionId, foreign.data.sessionId);
+		records[0] = JSON.stringify(foreign);
+		return Buffer.from(records.join("\n") + "\n");
+	});
+}
+await mutate("foreign_bootstrap", "rpc_session", foreignBootstrap);
+await mutate("foreign_terminated_bootstrap", "rpc_bootstrap_identity", foreignBootstrap, "budget_denial");
+await mutate("foreign_endpoint", "loopback_endpoint", ({ raw, journal }) => {
+	const donor = [...frames(donorArtifact("replacement", 1, "pi_stdout"))][0].value;
+	const baseUrl = donor.data.model.baseUrl;
+	raw(records => lines(records.map(JSON.parse).map(e => {
+		if (e.command === "get_state") e.data.model.baseUrl = baseUrl;
+		return e;
+	})));
+	journal(events => events.map(e => {
+		if (e.kind === "pi_spawned" || e.kind === "get_state_ok") e.body.baseUrl = baseUrl;
+		return e;
+	}));
+});
+
+function changeClosure({ journal, set, read }, kind, transform) {
+	let body;
+	journal(events => {
+		body = events.find(event => event.kind === kind).body;
+		transform(body);
+		return events;
+	});
+	const owner = read("final_index");
+	if (kind === "pi_exited") owner.piStop = body.stop;
+	else {
+		owner.groupObservations[0].closure = body.observation;
+		owner.groupObservations[0].stop = body.stop;
+	}
+	set("final_index", Buffer.from(JSON.stringify(owner)));
+}
+await mutate("late_group_observation", "native_observation", change =>
+	changeClosure(change, "group_closure_observed", body => { body.observation.checkedAtMonotonicMs = 86_400_000; }));
+await mutate("absent_signal_proof", "process_closure", change =>
+	changeClosure(change, "pi_exited", ({ stop }) => {
+		delete stop.termAttemptAt;
+		delete stop.noKillReason;
+		stop.drainDeadline = 0;
+	}), "replacement");
+await mutate("early_drain_cutoff", "process_closure", change =>
+	changeClosure(change, "pi_exited", ({ stop }) => { stop.drainDeadline = 0; }));
+await mutate("native_signal_error", "process_closure", change =>
+	changeClosure(change, "group_closure_observed", ({ stop }) => { stop.termError = "Synthetic signal failure"; }));
+await mutate("native_unknown", "native_observation", change =>
+	changeClosure(change, "group_closure_observed", body => { body.observation.kind = "unknown"; }));
+
+await mutate("missing_final_owner", "missing_artifact", ({ attempt }) => {
+	attempt.artifacts = attempt.artifacts.filter(ref => ref.role !== "final_index");
+}, "replacement");
+await mutate("foreign_final_owner", "final_owner_identity", ({ set }) =>
+	set("final_index", donorArtifact("replacement", 1, "final_index")));
+await mutate("incomplete_final_owner", "final_owner_drain", ({ read, set }) => {
+	const owner = read("final_index");
+	owner.captureDrain = { kind: "incomplete", reason: "Journal drain deadline" };
+	delete owner.finalCapture;
+	set("final_index", Buffer.from(JSON.stringify(owner)));
+});
+await mutate("contradictory_final_owner", "final_owner_outcome", ({ read, set }) => {
+	const owner = read("final_index");
+	owner.status = "Answered";
+	set("final_index", Buffer.from(JSON.stringify(owner)));
+}, "replacement");
+await mutate("uncommitted_journal_tail", "final_owner_drain", ({ read, set }) => {
+	const owner = read("final_index");
+	owner.finalCapture.journalSeq--;
+	set("final_index", Buffer.from(JSON.stringify(owner)));
+});
+
+const standardRuns = runs.size;
+await baseline("http_error", ["alpha"], () => ({
+	kind: "http_error", status: 400, body: JSON.stringify({ error: { message: "Synthetic HTTP failure" } }),
+}), "TaskFailed", 0, ["TaskFailed"]);
+await mutate("contradictory_http_status", "provider_outcome", change =>
+	changeOutcome(change, outcome => ({ ...outcome, status: 403 })), "http_error");
+
+const originalClose = BoundedJournalWriter.prototype.close;
+let closeInvoked = false;
+BoundedJournalWriter.prototype.close = async function (deadline) {
+	const file = await this.file;
+	const close = file.close.bind(file);
+	file.close = async () => {
+		closeInvoked = true;
+		await new Promise(resolve => setTimeout(resolve, Math.max(0, deadline - performance.now() + 150)));
+		return close();
+	};
+	return originalClose.call(this, deadline);
+};
+let late;
+try {
+	late = await collectRun({ version: 1, profile, cases: cases("alpha", "beta") }, output, () => reset);
+} finally {
+	BoundedJournalWriter.prototype.close = originalClose;
+}
+const indexDir = join(late.root, "_index");
+assert.equal(readdirSync(indexDir).length, 1);
+const lateIndex = readJson(join(indexDir, readdirSync(indexDir)[0]));
+assert(closeInvoked);
+assert.equal(lateIndex.uncertified, true);
+assert.deepEqual(lateIndex.captureDrain, { kind: "incomplete", reason: "Journal drain deadline" });
+assert.equal(lateIndex.finalCapture, undefined);
+async function checkIncomplete(run) {
+	assert.deepEqual(run.result, { kind: "Incomplete", invariant: "attempt_incomplete", attempts: [], next: null });
+	assert.deepEqual(await sealRun(run.root, run.expected), run.result);
+	assert.deepEqual(inspectRun(run.root, run.expected), run.result);
+	assert(!existsSync(join(run.root, "summary.json")));
+	assert(!existsSync(join(output, `${run.expected.runId}.final.json`)));
+	assert.deepEqual(readLines(join(run.root, "run.jsonl")).map(entry => entry.kind), ["run_open", "attempt_started"]);
+}
+await checkIncomplete(late);
+writeExclusiveFile(join(output, "late-close-reset.json"), JSON.stringify({ ...late, lateIndex }, null, 2));
+process.stdout.write("pass actual journal file-close delay prevents replacement and closure\n");
+
+const link = fsPromises.link;
+let refusedIndex = null;
+fsPromises.link = async (from, to) => {
+	if (String(to).includes("/_index/")) {
+		refusedIndex = readJson(from);
+		throw new Error("Synthetic attempt index publication refusal");
+	}
+	return link(from, to);
+};
+syncBuiltinESMExports();
+let refused;
+try {
+	refused = await collectRun({ version: 1, profile, cases: cases("alpha", "beta") }, output, () => answer);
+} finally {
+	fsPromises.link = link;
+	syncBuiltinESMExports();
+}
+assert.equal(refusedIndex.status, "Answered");
+assert.deepEqual(refusedIndex.captureDrain, { kind: "drained" });
+assert.deepEqual(readdirSync(join(refused.root, "_index")), []);
+await checkIncomplete(refused);
+writeExclusiveFile(join(output, "refused-index.json"), JSON.stringify({ ...refused, refusedIndex }, null, 2));
+process.stdout.write("pass refused owner index link prevents progression and closure\n");
+
 const pids = new Set();
 const pgids = new Set();
 for (const { result } of runs.values()) {
@@ -236,6 +463,8 @@ for (const { result } of runs.values()) {
 		}
 	}
 }
+pids.add(lateIndex.piPid);
+pids.add(refusedIndex.piPid);
 const rows = execFileSync("/bin/ps", ["-axo", "pid=,pgid=,command="], { encoding: "utf8" }).trim().split("\n");
 const survivors = rows.filter(row => {
 	const [pid, pgid] = row.trim().split(/\s+/, 3).map(Number);
@@ -245,6 +474,6 @@ assert.deepEqual(survivors, []);
 writeExclusiveFile(join(output, "receipt.json"), JSON.stringify({
 	runs: Array.from(runs, ([name, run]) => ({ name, root: run.root, anchorPath: run.anchorPath,
 		manifestSha256: sha256Buffer(readFileSync(join(run.root, "summary.json"))) })),
-	mutations, profile, closure, pids: [...pids], pgids: [...pgids], survivors,
+	standardRuns, originalMutations, mutations, profile, closure, pids: [...pids], pgids: [...pgids], survivors,
 }, null, 2));
-process.stdout.write(`pass ${runs.size} real runs, ${mutations.length} isolated mutations, ${pids.size} PIDs and ${pgids.size} PGIDs clear\n`);
+process.stdout.write(`pass ${standardRuns} standard runs, ${runs.size - standardRuns} supplemental HTTP run, ${mutations.length} isolated mutations, ${pids.size} PIDs and ${pgids.size} PGIDs clear\n`);

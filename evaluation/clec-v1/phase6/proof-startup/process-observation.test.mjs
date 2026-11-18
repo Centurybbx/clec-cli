@@ -26,7 +26,7 @@ test("malformed process rows never establish absence", async () => {
   for (const raw of ["unparseable process table row\n", valid + "broken trailing row\n", "", "\n"]) {
     await withProcessTable(raw, async () => {
       assert.equal((await readOsProcessTable()).ok, false);
-      assert.equal((await observeGroupInProcessTable({ pgid: 123, knownIdentities: [], monotonicMs: 0 })).kind, "unknown");
+      assert.equal((await observeGroupInProcessTable({ pgid: 123, knownIdentities: [], monotonicStartMs: performance.now() })).kind, "unknown");
     });
   }
 });
@@ -46,8 +46,8 @@ test("complete valid process observations distinguish alive and gone", async () 
       throw Object.assign(new Error("Group absent"), { code: "ESRCH" });
     };
     await withProcessTable(valid, async () => {
-      assert.equal((await observeGroupInProcessTable({ pgid: 123, knownIdentities: [], monotonicMs: 0 })).kind, "alive");
-      assert.equal((await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicMs: 0 })).kind, "gone");
+      assert.equal((await observeGroupInProcessTable({ pgid: 123, knownIdentities: [], monotonicStartMs: performance.now() })).kind, "alive");
+      assert.equal((await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicStartMs: performance.now() })).kind, "gone");
     });
   } finally {
     process.kill = kill;
@@ -67,7 +67,7 @@ test("kernel presence and indeterminate probe failures cannot establish absence"
         return true;
       };
       await withProcessTable(valid, async () => {
-        const result = await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicMs: 0 });
+        const result = await observeGroupInProcessTable({ pgid: 456, knownIdentities: [], monotonicStartMs: performance.now() });
         assert.equal(probes, 1);
         assert.equal(result.kind, "unknown");
         assert.match(result.reason, reason);
@@ -97,7 +97,7 @@ test("a reused known PID remains unknown even outside the owned group", async ()
     const observed = await observeGroupInProcessTable({
       pgid: 456,
       knownIdentities: [{ pid: 123, lstart: "Mon Nov 16 23:00:00 2026" }],
-      monotonicMs: 0,
+      monotonicStartMs: performance.now(),
     });
     assert.equal(observed.kind, "unknown");
     assert.match(observed.reason, /Identity changed/);

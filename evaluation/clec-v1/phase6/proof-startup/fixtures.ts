@@ -6,6 +6,8 @@ export interface RecordedLoopbackRequest {
 	readonly seq: number;
 	readonly method: string;
 	readonly url: string;
+	readonly baseUrl: string;
+	readonly receivedAt: number;
 	readonly authorizationPresent: boolean;
 	readonly bodyText: string;
 	readonly bodyJson: Record<string, unknown>;
@@ -32,10 +34,20 @@ export type MockOpenAIAction =
 			readonly body: string;
 	  };
 
+type LoopbackOutcome =
+	| { readonly kind: "text"; readonly text: string; readonly finishReason: "stop" | "length" | "content_filter" }
+	| { readonly kind: "tool_calls"; readonly calls: readonly WireToolCall[] }
+	| { readonly kind: "transport_reset" }
+	| { readonly kind: "http_error"; readonly status: number; readonly body: string };
+
+type WireToolCall = { readonly id: string; readonly type: "function"; readonly function: {
+	readonly name: string; readonly arguments: string;
+} };
+
 export interface LoopbackOpenAIServer {
 	readonly baseUrl: string;
 	readonly requests: RecordedLoopbackRequest[];
-	readonly outcomes: MockOpenAIAction["kind"][];
+	readonly outcomes: LoopbackOutcome[];
 	close(): Promise<void>;
 }
 
@@ -47,7 +59,7 @@ export async function startUnit1LoopbackOpenAI(
 	responder: (req: RecordedLoopbackRequest) => MockOpenAIAction | Promise<MockOpenAIAction>,
 ): Promise<LoopbackOpenAIServer> {
 	const requests: RecordedLoopbackRequest[] = [];
-	const outcomes: MockOpenAIAction["kind"][] = [];
+	const outcomes: LoopbackOutcome[] = [];
 	let seq = 0;
 
 	const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -65,6 +77,8 @@ export async function startUnit1LoopbackOpenAI(
 				seq: ++seq,
 				method: req.method ?? "POST",
 				url: req.url ?? "/",
+				baseUrl: `http://${req.socket.localAddress}:${req.socket.localPort}/v1`,
+				receivedAt: performance.now(),
 				authorizationPresent: typeof req.headers.authorization === "string" && req.headers.authorization.length > 0,
 				bodyText,
 				bodyJson,
@@ -72,17 +86,21 @@ export async function startUnit1LoopbackOpenAI(
 			requests.push(recorded);
 
 			const action = await responder(recorded);
-			outcomes[recorded.seq - 1] = action.kind;
 			if (action.kind === "transport_reset") {
 				req.socket.destroy();
+				if (req.socket.destroyed) outcomes[recorded.seq - 1] = { kind: "transport_reset" };
 				return;
 			}
+			const observeFinish = (outcome: LoopbackOutcome): void => {
+				res.once("finish", () => { outcomes[recorded.seq - 1] = outcome; });
+			};
 			const model = typeof bodyJson.model === "string" ? bodyJson.model : "mock-gpt";
 			const id = `chatcmpl-u1-${recorded.seq}`;
 			const created = Math.floor(Date.now() / 1000);
 
 			if (action.kind === "http_error") {
 				res.writeHead(action.status, { "content-type": "application/json" });
+				observeFinish({ kind: "http_error", status: res.statusCode, body: action.body });
 				res.end(action.body);
 				return;
 			}
@@ -94,6 +112,8 @@ export async function startUnit1LoopbackOpenAI(
 			});
 
 			if (action.kind === "text") {
+				const text = action.text;
+				const finishReason = action.finishReason ?? "stop";
 				sendSse(res, {
 					id,
 					object: "chat.completion.chunk",
@@ -106,21 +126,25 @@ export async function startUnit1LoopbackOpenAI(
 					object: "chat.completion.chunk",
 					created,
 					model,
-					choices: [{ index: 0, delta: { content: action.text }, finish_reason: null }],
+					choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
 				});
 				sendSse(res, {
 					id,
 					object: "chat.completion.chunk",
 					created,
 					model,
-					choices: [{ index: 0, delta: {}, finish_reason: action.finishReason ?? "stop" }],
+					choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
 					usage: { prompt_tokens: 40, completion_tokens: 10, total_tokens: 50 },
 				});
 				res.write("data: [DONE]\n\n");
+				observeFinish({ kind: "text", text, finishReason });
 				res.end();
 				return;
 			}
 
+			const calls = action.calls.map((call): WireToolCall => ({
+				id: call.id, type: "function", function: { name: call.name, arguments: call.rawArgumentsJson },
+			}));
 			sendSse(res, {
 				id,
 				object: "chat.completion.chunk",
@@ -131,19 +155,18 @@ export async function startUnit1LoopbackOpenAI(
 						index: 0,
 						delta: {
 							role: "assistant",
-							tool_calls: action.calls.map((c, idx) => ({
+							tool_calls: calls.map((c, idx) => ({
 								index: idx,
 								id: c.id,
-								type: "function",
-								function: { name: c.name, arguments: "" },
+								type: c.type,
+								function: { name: c.function.name, arguments: "" },
 							})),
 						},
 						finish_reason: null,
 					},
 				],
 			});
-			for (let idx = 0; idx < action.calls.length; idx++) {
-				const c = action.calls[idx];
+			for (const [idx, call] of calls.entries()) {
 				sendSse(res, {
 					id,
 					object: "chat.completion.chunk",
@@ -151,12 +174,12 @@ export async function startUnit1LoopbackOpenAI(
 					model,
 					choices: [
 						{
-							index: idx === 0 ? 0 : 0,
+							index: 0,
 							delta: {
 								tool_calls: [
 									{
 										index: idx,
-										function: { arguments: c.rawArgumentsJson },
+										function: { arguments: call.function.arguments },
 									},
 								],
 							},
@@ -174,6 +197,7 @@ export async function startUnit1LoopbackOpenAI(
 				usage: { prompt_tokens: 50, completion_tokens: 15, total_tokens: 65 },
 			});
 			res.write("data: [DONE]\n\n");
+			observeFinish({ kind: "tool_calls", calls });
 			res.end();
 		});
 	});

@@ -29,6 +29,7 @@ import {
 import {
 	armStop,
 	type ArmedStop,
+	STOP_GRACE_MS,
 	ProcessGroupRegistry,
 	readOsProcessTable,
 	runRegisteredNativeGroup,
@@ -390,14 +391,16 @@ export async function runUnit1Proof(
 	let agentSettledSeen = false;
 	let settledResolve: (() => void) | null = null;
 	let piExited = false;
+	let piExitObservedAt: number | null = null;
 	let piExitResolve: (() => void) | null = null;
 	let captureDrain: DrainResult = { kind: "drained" };
+	let finalCapture: ProofRunResult["finalCapture"];
 
 	const beginStop = (at = performance.now()): ArmedStop => {
 		if (stopTicket) return stopTicket;
 		admissionClosed = true;
 		const trigger = { at, detectedAt: performance.now() };
-		stopTicket = armStop({ trigger, child: piChild, graceMs: 350 });
+		stopTicket = armStop({ trigger, child: piChild, graceMs: STOP_GRACE_MS.pi });
 		registry.beginStop(trigger, request.faults?.injectOmitNativeTeardown === true);
 		nativeAbort.abort();
 		resolveStartupWait?.(false, failureReason ?? "Startup stopped");
@@ -481,6 +484,7 @@ export async function runUnit1Proof(
 	const pipeFromAdapter = piChild.stdio[4] as Readable;
 
 	piChild.on("exit", (code, sig) => {
+		piExitObservedAt = nowMs();
 		piExited = true;
 		piExitCode = code;
 		piSignal = sig;
@@ -504,7 +508,8 @@ export async function runUnit1Proof(
 			const row = table.ok ? table.entries.find((entry) => entry.pid === piChild?.pid && entry.ppid === process.pid) : undefined;
 			if (row) {
 				await journal.append({
-					runId, attemptId, kind: "pi_spawned", body: { pid: row.pid, lstart: row.lstart, adapterPath },
+					runId, attemptId, kind: "pi_spawned", body: { pid: row.pid, lstart: row.lstart, adapterPath,
+						...(options?.evidence && { monotonicStartMs, baseUrl: request.mockBaseUrl }) },
 				}, nowMs());
 				return;
 			}
@@ -1202,6 +1207,7 @@ export async function runUnit1Proof(
 					modelId: stateModel?.id,
 					thinkingLevel: stateData.thinkingLevel,
 					autoCompactionEnabled: stateData.autoCompactionEnabled,
+					...(options?.evidence && { sessionId: stateData.sessionId, baseUrl: stateModel?.baseUrl }),
 				},
 			},
 			nowMs(),
@@ -1333,9 +1339,11 @@ export async function runUnit1Proof(
 				rpcErr.destroy();
 			}
 			const files = await Promise.all([piStdoutSink.close(evidence.drainDeadline), piStderrSink.close(evidence.drainDeadline)]);
-			return streams.kind === "timeout"
+			const result: DrainResult = streams.kind === "timeout"
 				? { kind: "incomplete", reason: "Pi raw stream deadline" }
 				: [...streams.value, ...files].find((result) => result.kind === "incomplete") ?? { kind: "drained" };
+			evidence.drainCompletedAt = performance.now();
+			return result;
 		};
 		const [reaped, drained] = await Promise.all([
 			byDeadline(ticket.reaped, evidence.observationDeadline),
@@ -1365,7 +1373,8 @@ export async function runUnit1Proof(
 				return (await journal.append({ runId, attemptId, kind, body }, nowMs(), "emergency")).ok;
 			};
 			if (overflow && !await record("overflow_uncertified", overflow)) return false;
-			if (!await record("pi_exited", { code: piExitCode, signal: piSignal, stop: evidence })) return false;
+			if (!await record("pi_exited", { code: piExitCode, signal: piSignal, stop: evidence,
+				...(options?.evidence && { observedAtMonotonicMs: piExitObservedAt }) })) return false;
 			for (const g of registry.entries.values()) {
 				if (!await record("group_closure_observed", { leaseId: g.leaseId, observation: g.closure, stop: g.stop?.evidence })) {
 					return false;
@@ -1383,6 +1392,9 @@ export async function runUnit1Proof(
 		if (captureDrain.kind === "incomplete" || journal.hasFailed) {
 			uncertified = true;
 			status = invalidateAnswer(status);
+		}
+		if (options?.evidence && captureDrain.kind === "drained" && !journal.hasFailed) {
+			finalCapture = { closedAtMonotonicMs: nowMs(), journalSeq: journal.currentSeq, journalBytes: journal.writtenBytes };
 		}
 	}
 
@@ -1428,6 +1440,7 @@ export async function runUnit1Proof(
 		piSignal,
 		piStop: stopTicket?.evidence,
 		captureDrain,
+		...(finalCapture && { finalCapture }),
 		uncertified,
 		rawArtifacts: { journalPath, piStdoutPath, piStderrPath },
 		closureBeforeSha256: closureBefore.closureDigest,
