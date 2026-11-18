@@ -1,8 +1,55 @@
 # Stage 6B Unit 1 feasibility proof report
 
-Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. Unit 1 proved the RPC startup sequence, nonrejecting provider admission latch, outer eight-call tool budget, pre-GO detached Node group ownership, and bounded raw capture against real installed Pi 1.5.2 and pinned `clec.exe`. All 45 Unit 1 matrix checks passed on clean tested HEAD `e393d226c8cd18ca240306878ed51fdfc38ed211` against a loopback OpenAI mock. Units 2, 3, and 4 remain pending until fresh independent review accepts Unit 1.
+Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. The Stage 6B Unit 1 deadline correction is implemented and author-verified at clean source commit `cae3ac5d8d608909ffb1ef3358bef63d0ea98f1e`. Fresh independent GPT 6.2 Astra review is pending. Units 2 through 4 remain gated.
 
-Current gate is `REQUEST CHANGES` after independent review at `910e812`. The executed matrix passed, but additional observation and cleanup-deadline probes failed. The pending-work section records the findings and limited coordinator corrections. No complete lifetime guarantee is certified by the matrix result.
+## Deadline correction
+
+The outer controller now retains the Pi handle and each provisional native lease before it awaits active I/O. Stop closes the admission epoch and arms Pi and all live groups before waiting on observation, reaping, or capture. The owner gives Pi 350 ms and each native group 400 ms of TERM grace, measured from the armed or detected trigger. The timer checks the absolute deadline when it runs. The receipt records actual signal calls separately from OS observation, direct reaping, and drain.
+
+The launch path uses asynchronous exclusive opens and bounded file reads for the Node, helper, and native pin checks. The observer uses asynchronous `/bin/ps` with C locale, bounded output, a deadline, and one in-flight invocation. The raw sinks retain one write payload up to 64 KiB per sink and apply source backpressure. The ordered journal allows four outstanding records, including the active append. It commits the byte range and advances the sequence after the full write and the required `datasync`. The terminal epoch is checked again immediately before ACK, prompt, permit, tool result, or GO. The pre-send `group_go_sent` record denotes authorization intent. [Protocol](../../../evaluation/clec-v1/phase6/proof-startup/PROTOCOL.md)
+
+The active-path inventory leaves synchronous provisioning, settings writes, and the initial full closure hash before spawn. Native sink opens and closes, sentinel metadata, pin reads, process inspection, journal writes and synchronization, and final index publication are asynchronous. Full synchronous final hashing is conditional on positive target closure. When a matrix supplies its precomputed pin set, the matrix independently rehashes the full closure at the end. An attempt with Unknown ownership has no final closure digest. [Controller](../../../evaluation/clec-v1/phase6/proof-startup/controller.ts) · [Process owner](../../../evaluation/clec-v1/phase6/proof-startup/process-group.ts) · [Framing and writers](../../../evaluation/clec-v1/phase6/proof-startup/framing.ts) · [Pins](../../../evaluation/clec-v1/phase6/proof-startup/pins.ts)
+
+## Author verification at the tested commit
+
+The clean run started at `2026-11-18T00:09:08Z` and ended at `2026-11-18T00:10:30Z`. It passed all 45 original controls, six process-observation tests, and 19 deadline controls. A separate `/bin/ps` scan checked 122 recorded PID identities and 39 PGIDs at `2026-11-18T00:09:59.937Z`. It found zero survivors after the explicit cleanup for the deliberately omitted-teardown case.
+
+| Control | Actual SIGKILL after trigger (ms) | Separate observation or drain evidence |
+| --- | ---: | --- |
+| Old synchronous process list | 2258.581 | A 2.2-second process-list delay blocked the owner. Direct observation found the group empty after reaping. |
+| Async process list at cutoff | 401.808 | The observer was pending across escalation. Its child closed after 2005.917 ms. Closure stayed Unknown at the cutoff. Direct post-reap observation found no survivors. |
+| Two native groups and one Pi target | 351.966, 401.877, 401.928 | The delayed observer took 2341.043 ms. Its stale snapshot could not close either lease. Both groups closed after fresh observation and reaping. A sink close was pending across escalation. Repeated stop retained the original trigger. |
+| Old synchronous raw write | 2317.723 | The full FIFO withheld its reader for 2415.500 ms. The owner timer missed the cutoff. |
+| Async raw write | 402.770 | The full FIFO withheld its reader for 2417.526 ms. The owner signaled within the cutoff and reported Incomplete drain. |
+| Old synchronous journal write | 2318.384 | The full FIFO withheld its reader for 2417.275 ms. The owner timer missed the cutoff. |
+| Async journal write | 402.707 | The full FIFO withheld its reader for 2417.248 ms. The owner signaled within the cutoff and reported Incomplete drain. |
+
+The FIFO controls filled a private POSIX pipe to `EAGAIN` and sent real blocking writes to its descriptor. A separate reader logged when it started draining and how many bytes it read. The asynchronous controls retained a pending write beyond the two-second drain deadline. The fault driver also checked partial progress, actual write failure, journal queue saturation, retained backing bytes, and the committed watermark. The observer tests covered malformed, partial, empty, and unsafe rows, C locale, injected permission failure, own-PID visibility, and reused identity. The ownership controls rejected a reporter claiming another owned group's identity and showed that a retired lease's timer left a later lease alone.
+
+The real Pi loopback controls held or failed the provider grant, GroupRegistered, and GO authorization writes. When the driver killed Pi before releasing a held write, the provider control produced zero HTTP requests. The two native controls recorded only the already-permitted initial request, sent no GO, and created no native sentinel. Positive controls waited for actual data synchronization, then observed one provider request or one native start with byte-exact stdout and two requests. The original deliberately unprotected guard still reached loopback.
+
+- Matrix receipt, including actual requests and direct ownership scan. SHA-256 `8ca0b1184a14d3eee4b793a1748f7ddb4f555dcd60d2ea25ef5af4a99f3b3c4e`. [Matrix receipt](/tmp/clec-unit1-exact.YnKfuE/matrix-1794960548457-d7fd04d1/matrix-receipt.json)
+- Deadline receipt, including per-control UTC times, external write release, actual wire sends, and separate survivor observations. SHA-256 `3f48145449f9ad9be10c0102b3f81d336c380b68fa12c201c97565db8d5d7768`. [Deadline receipt](/tmp/clec-unit1-exact.YnKfuE/clec-deadline-controls-zqgkVw/receipt.json)
+- Parser test log. SHA-256 `7d9324b22586b60a2fae03ab0ca9f5c000e57173d2c2635273e4cb3b66eeec52`. [Parser log](/tmp/clec-unit1-exact.YnKfuE/parser.log)
+- The independent review's original signal miss was 2,287.166 ms. The first local reproduction on integrated base `9a0124487f3fca68e99376646c28ed47874d0c13` measured 2,284.576 ms. After explicit reaping, each direct final process scan was empty. [Independent receipt](/tmp/clec-review-910e-probes/run-K0WSrt/receipt.json) · [First local receipt](/tmp/clec-deadline-old.vKKglx/run-0d3yLO/receipt.json)
+
+The tested execution closure digest was `7b258050707372cdebaa1db5fc69aac060a92ec7beff6637a3c1e1a55623365a` before and after the matrix. The installed Node, Pi release tree, native executable, and Skill matched the exact runtime pins in the historical section below. The observer `/bin/ps` hashed to `1e46cdb824858eb32e4c85ca920ba31b4541a814a133980d8b3484f39942276c`. The current proof-source pins are:
+
+| File | SHA-256 |
+| --- | --- |
+| `PROTOCOL.md` | `80383a54a87ed31e457f87d9a569c2ae8511856d33939534eec417360f091a3f` |
+| `tsconfig.json` | `3911429e4968c1c0e91561bce48ba72ebbe392de9a7f3627d4ec681f2056d1db` |
+| `types.ts` | `c396467a76eaee5c942d6ae1797f53d69a99b98eaf7c796bb609593c82a09522` |
+| `pins.ts` | `446cf7b5a6968942208f156105d840ca483dcc9269adaeae359cabdcad7bf1ee` |
+| `framing.ts` | `d8da91d4fae2e4806fdd0569ae229f5f5c2192c0e36a6869748a90c900f110f7` |
+| `process-group.ts` | `68b066049f3b359e311d473ff8b6debd0c3ba5d9e20df2808f5b0cb355096025` |
+| `group-helper.mjs` | `8c45d3a934012b1b90f3f084bacfe1fe50461237db4578efbd8644387f32189e` |
+| `clec-adapter.ts` | `210f2c22c3648a0d5f4fe28c32005626bc607c278f0e05eb44428ed4cec42522` |
+| `controller.ts` | `c99b0ff88d7ae17fe62b0fcd46536d238a570c289fb480bb716d43cbb20288a3` |
+| `fixtures.ts` | `8982085157cf440d22d3010e0bb57819280052ebea437a136a05a24491337a04` |
+| `run-matrix.ts` | `b11c5be6b51fe3b02f20b09b8775a33677f28f0a7fc40d85c950306264a8f675` |
+| `process-observation.test.mjs` | `78c6e319452c42326c34699f42e9e528223f5f1871cb1b0a29de3b25dec3b6ac` |
+| `deadline-controls.mjs` | `1c79d0da8e98741a5c3b7aad98c103e640f0ec5ac3031172b857392d3596b48e` |
 
 ## Scope and narrow tool profile
 
@@ -15,7 +62,7 @@ Unit 1 delivers only the minimum feasibility artifact in `evaluation/clec-v1/pha
 - `evaluation/clec-v1/phase6/proof-startup/group-helper.mjs` and `evaluation/clec-v1/phase6/proof-startup/process-group.ts` implement the detached Node group helper, pre-GO registration, `SIGTERM` to `SIGKILL` escalation within 2 seconds, and OS `ps` closure observation.
 - `evaluation/clec-v1/phase6/proof-startup/clec-adapter.ts` implements the SDK-typed Pi extension with the narrow Unit 1 status-only `clec` tool, `BoundReady` handshake, `tool_execution_start` outer admission latch, and nonrejecting `before_provider_request` latch.
 - `evaluation/clec-v1/phase6/proof-startup/controller.ts` implements the outer supervisor `runUnit1Proof` and immutable per-run index entries.
-- `evaluation/clec-v1/phase6/proof-startup/fixtures.ts` and `evaluation/clec-v1/phase6/proof-startup/run-matrix.ts` run the loopback OpenAI mock server and the 45-case verification matrix.
+- `evaluation/clec-v1/phase6/proof-startup/fixtures.ts` and `evaluation/clec-v1/phase6/proof-startup/run-matrix.ts` run the loopback OpenAI mock server and the 45-case verification matrix. The focused parser tests and `deadline-controls.mjs` cover the deadline correction.
 
 Unit 1 restricts `clec` to `{ action: "status" }` with `additionalProperties: false`. It does not claim acceptance of the six-action closed `ClecRequest` contract (`schema`, `help`, `status`, `search`, `read`, `sources`), which Unit 4 integrates after Units 2 and 3.
 
@@ -26,7 +73,7 @@ Unit 1 restricts `clec` to `{ action: "status" }` with `additionalProperties: fa
 3. **User prompts normalize to a single text content block in OpenAI payloads.** Pi's `openai-completions` adapter sends user prompt text as `[{ type: "text", text: "CLEC public question follows.\n..." }]` (or a plain string). The outer payload validator accepts only an exact string or a single-element `{ type: "text", text }` array matching the committed literal prompt bytes.
 4. **Loopback `openai-completions` SSE merges duplicate tool call IDs within one chunk.** Within a single streamed completion, Pi's `ensureToolCallBlock` indexes blocks by `toolCall.id`, so a reused `id` inside the same response collapses into the earlier block or produces an empty ID. The outer supervisor now rejects both empty `toolCall.id` values and duplicate `toolCall.id` values across turns.
 
-## Source, runtime, and binary pins
+## Historical source, runtime, and binary pins
 
 - **Prepared base commit.** `3999d3ef4cd96ddbf03b39aaba0395dccb3996d8` (incorporating Stage 6A acceptance `110c5eb4a06d04c6556fdd675dcfc291a10f22d3`).
 - **Tested Unit 1 source commit.** `e393d226c8cd18ca240306878ed51fdfc38ed211` (`gitDirtyPathsCount: 0` during final matrix run).
@@ -53,7 +100,7 @@ Unit 1 file SHA-256 pins at `e393d226c8cd18ca240306878ed51fdfc38ed211`:
 | `fixtures.ts` | `8982085157cf440d22d3010e0bb57819280052ebea437a136a05a24491337a04` |
 | `run-matrix.ts` | `5308e0a84a445a6cffb8da26d67306afba8bb0f99e05a1d900ea74fde6fa9e4b` |
 
-## Passed Unit 1 matrix
+## Historical Unit 1 matrix
 
 All 45 checks in `run-matrix.ts` passed (`45/45`) and left zero surviving child processes (`ps` verified empty):
 
@@ -62,28 +109,32 @@ All 45 checks in `run-matrix.ts` passed (`45/45`) and left zero surviving child 
 - **Admission (11/11 passed).** `admission_valid` passed 2 provider requests committed before permit ACK with 1 real `clec.exe status` run. `admission_bash_drift`, `admission_schema_drift`, `admission_sync_serialization_err`, `admission_async_channel_reject`, `admission_eof_during_latch`, `admission_record_fail_before_grant`, and `admission_malformed_ack` all produced 0 loopback requests. `admission_replayed_ack` executed turn 1 and rejected turn 2 replay (0 turn-2 requests). `admission_record_fail_after_grant` observed 1 already-granted request, closed further admission, and marked `InvalidEvidence`. `admission_unprotected_guard_sensitivity` proved disabling denial blocking allows 1 forbidden request to reach loopback.
 - **Budget (5/5 passed).** `budget_8_valid_plus_answer` executed 8 serial real `clec.exe status` calls (`nativeStarts: 8`, 9 provider requests) and answered. `budget_8_invalid_then_9th_valid` consumed 8 attempts on schema-invalid calls and denied call 9 with `nativeStarts: 0` and 1 provider request. `budget_8_valid_then_9th_unknown` executed 8 native calls and denied the 9th unknown call at `tool_execution_start` with 0 extra HTTP requests. `budget_duplicate_call_ids` rejected reused `dup_call_1` explicitly (`nativeStarts: 1`). `budget_batch_terminated_early` recorded all 10 declared calls when call 9 terminated the batch.
 - **Before GO (6/6 passed).** `before_go_registered_then_go` committed `group_registered` while the native sentinel was absent, then created the sentinel after `GO`. `before_go_reg_write_fail`, `before_go_eof`, `before_go_pi_death_before_ready`, and `before_go_pi_death_between_reg_and_go` all left the sentinel absent and closed waiting helpers. `before_go_bypass_gate_sensitivity` detected pre-registration sentinel execution.
-- **After GO (4/4 passed).** `after_go_native_kills_pi_ignores_term` (kill escalation 778 ms), `after_go_leader_exit_surviving_child` (kill escalation 754 ms), and `after_go_pi_death_during_output` (kill escalation 904 ms) all killed owned PGIDs within 2 seconds and confirmed `closure.kind === "gone"` via `ps`. `after_go_omit_cleanup_sensitivity` observed 2 surviving native processes in PGID 22791 before explicit test cleanup.
+- **After GO (4/4 passed).** `after_go_native_kills_pi_ignores_term` (historical cleanup elapsed 778 ms), `after_go_leader_exit_surviving_child` (historical cleanup elapsed 754 ms), and `after_go_pi_death_during_output` (historical cleanup elapsed 904 ms) killed owned PGIDs and confirmed `closure.kind === "gone"` via `ps`. Those elapsed samples include observation. `after_go_omit_cleanup_sensitivity` observed 2 surviving native processes in PGID 22791 before explicit test cleanup.
 - **Observation (2/2 passed).** `obs_agrees_with_ps` confirmed `ps` agreement (`gone`) and `obs_ps_failure_unknown` recorded `Unknown` and `uncertified: true` on injected `ps` failure.
 - **Basic ownership and bounds (3/3 passed).** `ownership_exclusive_retained` kept prior run artifacts and index entries byte-identical (including 0-byte `pi.stderr.bin`). `ownership_precreated_paths_and_dup_id` rejected pre-existing `APPEND_SYSTEM.md`, `SYSTEM.md`, `settings.json`, `models.json`, and duplicate `AttemptId` without overwriting bytes or calling the provider. `bounds_caps_and_stalled_sink` verified the 32,768 native stdout prefix cap, 65,536 Pi stderr prefix cap, 63 MiB normal journal cap with 1 MiB emergency reserve, and deadline enforcement under a stalled sink.
 
 ## Pending work and open gates
 
-Independent review at `910e812353e9e43ed51aad5ecffdbc21331c5c7c` reran all 45 controls successfully but found two P1 blockers with additional probes. Synchronous process inspection delayed actual SIGKILL to 2,287 ms, and malformed process-table output established false absence while a separate OS check showed the child alive. The coordinator corrected malformed/empty process-output handling and the future-action documentation directly, with focused regression controls. Cleanup deadline isolation remains unresolved and requires a bounded design correction before Hydrogen implementation. Unit 1 is not accepted; Units 2 through 4 remain gated. Earlier 45/45 results establish only their executed controls.
+The independent review at `910e812353e9e43ed51aad5ecffdbc21331c5c7c` found two blockers. The integrated base corrected malformed process output and future-action guidance. This correction addresses the cleanup deadline and awaits an independent rerun. Node syntax checks and runtime suites ran. A separate TypeScript semantic check remains unverified because the available local toolchain had no `tsc`.
+
+The proof observes the tested macOS arm64 runtime and owned inherited groups. An OS scheduling delay or uninterruptible syscall can defeat timing or closure. PID/PGID reuse and second-resolution start times limit identification. An incomplete write, unknown observation, or missing artifact leaves the proof uncertified.
 
 - **Pending Unit 1 gate.** Independent fresh review and rerun of Unit 1.
 - **Pending implementation units.** Unit 2 (canonical `PublicRunPlan`, external commitments, and unified `Prefix`/`Closed` parser/reducer in `validate`, plus mutation replay), Unit 3 (full bounded capture, split UTF-8 and binary stderr retention, and closure tamper checks), and Unit 4 (one-wave host migration and six-action `ClecRequest` integration).
 - **Unchanged open product and evaluation gates.** Real external provider profiles and entitlements, Google Vertex wire behavior, production bootstrap, package/rights, cross-OS support, live Jev behavior, actual-host quality, Stage 3 (`FAILED`, consumed holdout `CLOSED`), Stage 5 (`mock accepted` unchanged), default manifest `None`, `providerVerified: false`, and the 24 `DRAFT` fresh cases.
 
-## Reproduction command
+## Reproduce the current proof
 
-Run the complete Unit 1 matrix into a fresh exclusive directory under `.cache/phase6b-unit1/`:
-
-```sh
-node evaluation/clec-v1/phase6/proof-startup/run-matrix.ts
-```
-
-Run one case by ID:
+Run from the repository root at the tested source commit. Each invocation allocates a fresh private evidence root.
 
 ```sh
-node evaluation/clec-v1/phase6/proof-startup/run-matrix.ts --case startup_positive
+proof=evaluation/clec-v1/phase6/proof-startup
+node=/Users/century/.nvm/versions/node/v25.7.0/bin/node
+out=$(mktemp -d /tmp/clec-unit1.XXXXXX)
+export NODE_DISABLE_COMPILE_CACHE=1
+"$node" --test "$proof/process-observation.test.mjs"
+"$node" "$proof/run-matrix.ts" --out-parent "$out"
+"$node" "$proof/deadline-controls.mjs" "$out"
 ```
+
+Pass `--case startup_positive` to the matrix to run a single control.
