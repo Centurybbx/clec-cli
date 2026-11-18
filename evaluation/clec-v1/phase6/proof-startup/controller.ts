@@ -1,3 +1,5 @@
+import { deepEqualJson, settingsBytes, STATUS_CORPUS, STATUS_SCHEMA, SYSTEM_PROMPT, systemPrompt, validateProviderPayload, type AttemptIdentity, type ExpectedCommitments } from "./contract.ts";
+import type { PiProjection } from "./validate.ts";
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
@@ -47,94 +49,6 @@ import type {
 } from "./types.ts";
 import { makeAttemptId, makeGroupLeaseId, makeRunId, UNIT1_LIMITS } from "./types.ts";
 
-const EXPECTED_UNIT1_CLEC_SCHEMA = {
-	type: "object",
-	additionalProperties: false,
-	properties: {
-		action: {
-			const: "status",
-			type: "string",
-		},
-	},
-	required: ["action"],
-};
-
-function deepEqualJson(a: unknown, b: unknown): boolean {
-	if (a === b) return true;
-	if (a === null || b === null || typeof a !== typeof b) return false;
-	if (Array.isArray(a) || Array.isArray(b)) {
-		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-		return a.every((v, i) => deepEqualJson(v, b[i]));
-	}
-	if (typeof a === "object" && typeof b === "object") {
-		const aObj = a as Record<string, unknown>;
-		const bObj = b as Record<string, unknown>;
-		const aKeys = Object.keys(aObj).sort();
-		const bKeys = Object.keys(bObj).sort();
-		if (aKeys.length !== bKeys.length) return false;
-		return aKeys.every((k, i) => k === bKeys[i] && deepEqualJson(aObj[k], bObj[k]));
-	}
-	return false;
-}
-
-function extractUserContentText(content: unknown): string | null {
-	if (typeof content === "string") return content;
-	if (
-		Array.isArray(content) &&
-		content.length === 1 &&
-		content[0] !== null &&
-		typeof content[0] === "object"
-	) {
-		const block = content[0] as Record<string, unknown>;
-		if (block.type === "text" && typeof block.text === "string") {
-			return block.text;
-		}
-	}
-	return null;
-}
-
-function validateProviderPayload(params: {
-	readonly payloadJson: string;
-	readonly expectedModelId: string;
-	readonly expectedEncodedPrompt: string;
-}): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(params.payloadJson);
-	} catch (err) {
-		return { ok: false, reason: `Payload JSON invalid: ${err instanceof Error ? err.message : String(err)}` };
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { ok: false, reason: "Payload is not an object" };
-	}
-	const obj = parsed as Record<string, unknown>;
-	if (obj.model !== params.expectedModelId) {
-		return { ok: false, reason: `Unexpected model in payload: ${String(obj.model)}` };
-	}
-	if (!Array.isArray(obj.messages) || obj.messages.length === 0) {
-		return { ok: false, reason: "Payload messages missing or empty" };
-	}
-	const firstUser = obj.messages.find(
-		(m) => m && typeof m === "object" && (m as Record<string, unknown>).role === "user",
-	) as Record<string, unknown> | undefined;
-	const firstUserText = firstUser ? extractUserContentText(firstUser.content) : null;
-	if (firstUserText !== params.expectedEncodedPrompt) {
-		return { ok: false, reason: `Payload user prompt does not match encoded literal prompt (got=${JSON.stringify(firstUser?.content)})` };
-	}
-	if (!Array.isArray(obj.tools) || obj.tools.length !== 1) {
-		return { ok: false, reason: `Expected exactly 1 tool in payload, got ${Array.isArray(obj.tools) ? obj.tools.length : "none"}` };
-	}
-	const tool0 = obj.tools[0] as Record<string, unknown> | undefined;
-	const fn = tool0?.function as Record<string, unknown> | undefined;
-	if (tool0?.type !== "function" || fn?.name !== "clec") {
-		return { ok: false, reason: `Unexpected tool declaration: ${JSON.stringify(tool0)}` };
-	}
-	if (!deepEqualJson(fn?.parameters, EXPECTED_UNIT1_CLEC_SCHEMA)) {
-		return { ok: false, reason: `CLEC tool schema drift: ${JSON.stringify(fn?.parameters)}` };
-	}
-	return { ok: true };
-}
-
 function validateAgentDirPreLaunch(agentDir: string, cwd: string): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
 	const unexpectedInAgent = readdirSync(agentDir);
 	if (unexpectedInAgent.length > 0) {
@@ -153,24 +67,26 @@ export function resolveDefaultAdapterPath(): string {
 
 export async function runUnit1Proof(
 	request: Unit1RunRequest,
-	options?: { readonly cachedClosure?: ExecutionClosure },
+	options?: { readonly cachedClosure?: ExecutionClosure; readonly evidence?: {
+		readonly anchor: ExpectedCommitments; readonly identity: AttemptIdentity; readonly pi: PiProjection;
+	} },
 ): Promise<ProofRunResult> {
 	const monotonicStartMs = performance.now();
-	const nowMs = (): number => Math.round(performance.now() - monotonicStartMs);
+	const nowMs = (): number => performance.now() - monotonicStartMs;
 	const endpoint = new URL(request.mockBaseUrl);
 	if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" ||
 		!endpoint.port || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
 		throw new Error("Unit 1 requires a private IPv4 loopback mock endpoint");
 	}
 
-	const runId = makeRunId(`u1-${Date.now()}-${randomBytes(4).toString("hex")}`);
-	const attemptId = request.faults?.duplicateAttemptIdCollision ?? makeAttemptId(`${runId}-a1`);
+	const runId = options?.evidence?.anchor.runId ?? makeRunId(`u1-${Date.now()}-${randomBytes(4).toString("hex")}`);
+	const attemptId = options?.evidence?.identity.attemptId ?? request.faults?.duplicateAttemptIdCollision ?? makeAttemptId(`${runId}-a1`);
 
 	const closureBefore = options?.cachedClosure ?? captureExecutionClosure();
 	const helperPin = closureBefore.unit1Files.find((file) => file.logicalPath === resolveDefaultHelperPath());
 	if (!helperPin) throw new Error("Missing pinned native helper");
 
-	const bundleDir = join(request.evidenceParentDir, runId);
+	const bundleDir = join(request.evidenceParentDir, options?.evidence ? attemptId : runId);
 	const attemptDir = join(request.evidenceParentDir, "attempts", attemptId);
 	const indexDir = join(request.evidenceParentDir, "_index");
 	const cwd = join(attemptDir, "cwd");
@@ -182,7 +98,7 @@ export async function runUnit1Proof(
 	const journalPath = join(captureDir, "journal.jsonl");
 	const piStdoutPath = join(captureDir, "pi.stdout.jsonl");
 	const piStderrPath = join(captureDir, "pi.stderr.bin");
-	const indexEntryPath = join(indexDir, `${runId}.json`);
+	const indexEntryPath = join(indexDir, `${options?.evidence ? attemptId : runId}.json`);
 
 	if (!existsSync(request.evidenceParentDir)) {
 		createExclusiveDir(request.evidenceParentDir);
@@ -343,21 +259,7 @@ export async function runUnit1Proof(
 
 	writeExclusiveFile(
 		join(agentDir, "settings.json"),
-		JSON.stringify(
-			{
-				defaultProvider: providerId,
-				defaultModel: modelId,
-				defaultThinkingLevel: thinkingLevel,
-				compaction: { enabled: false },
-				cacheWarming: "off",
-				retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
-				enableInstallTelemetry: false,
-				enableAnalytics: false,
-				defaultTools: [],
-			},
-			null,
-			2,
-		),
+		settingsBytes(providerId, modelId, thinkingLevel),
 	);
 
 	writeExclusiveFile(
@@ -396,6 +298,10 @@ export async function runUnit1Proof(
 			kind: "plan_committed",
 			body: {
 				caseLabel: request.caseLabel,
+				...(options?.evidence && {
+					plan: options.evidence.anchor.plan, identity: options.evidence.identity,
+					corpusBefore: readdirSync(dataDir).length === 0 ? STATUS_CORPUS : null,
+				}),
 				toolProfile: UNIT1_LIMITS.toolProfile,
 				limits: UNIT1_LIMITS,
 				originalQuestionSha256,
@@ -442,6 +348,7 @@ export async function runUnit1Proof(
 		"--no-prompt-templates",
 		"--no-themes",
 		"--no-context-files",
+		...(options?.evidence ? ["--system-prompt", SYSTEM_PROMPT] : []),
 		"--offline",
 		"--provider",
 		providerId,
@@ -621,8 +528,14 @@ export async function runUnit1Proof(
 		onEnd: () => {
 			if (!cleanPiEof) terminatePiAndGroups("Pi RPC stdout EOF", "DeniedAndTerminated");
 		},
-		onRecord: async (rec) => {
+		strictFrames: options?.evidence !== undefined,
+		onRecord: async (rec, frame) => {
 			await spawned;
+			if (options?.evidence) {
+				options.evidence.pi.accept(rec);
+				const committed = await journal.append({ runId, attemptId, kind: "pi_frame", body: { ...frame } }, nowMs());
+				if (!committed.ok) return;
+			}
 			if (rec.type === "response") {
 				if (rec.id === "state-1" && rec.command === "get_state") {
 					pendingGetStateResolve?.(rec);
@@ -800,7 +713,7 @@ export async function runUnit1Proof(
 						msg.allTools[0].name === "clec" &&
 						msg.allTools[0].exposure === "direct" &&
 						msg.deferredTools.length === 0 &&
-						deepEqualJson(msg.allTools[0].parameters, EXPECTED_UNIT1_CLEC_SCHEMA) &&
+						deepEqualJson(msg.allTools[0].parameters, STATUS_SCHEMA) &&
 						msg.model?.provider === providerId &&
 						msg.model?.id === modelId;
 					if (!validTools) {
@@ -887,6 +800,7 @@ export async function runUnit1Proof(
 						payloadJson: msg.payloadJson,
 						expectedModelId: modelId,
 						expectedEncodedPrompt: encodedPromptText,
+						expectedSystemPrompt: options?.evidence ? systemPrompt(cwd) : undefined,
 					});
 					if (!payloadValidation.ok) {
 						providerRequestsDenied += 1;
@@ -909,6 +823,7 @@ export async function runUnit1Proof(
 							attemptId,
 							kind: "provider_candidate",
 							body: {
+								...(options?.evidence && { payloadJson: msg.payloadJson }),
 								seq: msg.seq,
 								watermark: msg.watermark,
 								payloadDigest: msg.payloadDigest,
@@ -1051,7 +966,7 @@ export async function runUnit1Proof(
 							runId,
 							attemptId,
 							kind: "tool_start_reserved",
-							body: { ordinal: attemptOrdinal, callId: msg.callId, toolName: msg.toolName },
+							body: { ordinal: attemptOrdinal, callId: msg.callId, toolName: msg.toolName, bridgeSeq: msg.seq },
 						},
 						nowMs(), "durable",
 					);
@@ -1092,6 +1007,7 @@ export async function runUnit1Proof(
 					const outcome = await runRegisteredNativeGroup({
 						registry,
 						leaseId,
+						callId: msg.callId,
 						runId,
 						attemptId,
 						captureDir,
@@ -1168,6 +1084,7 @@ export async function runUnit1Proof(
 								callId: msg.callId,
 								isError: !outcome.ok,
 								stdoutBytes: Buffer.byteLength(outcome.stdoutText, "utf8"),
+								resultSha256: sha256Buffer(toolResultText),
 								stderrBytes: Buffer.byteLength(outcome.stderrText, "utf8"),
 							},
 						},
@@ -1314,7 +1231,7 @@ export async function runUnit1Proof(
 			throw new Error(promptEncodeCommit.error);
 		}
 
-		const promptCommit = await journal.append({ runId, attemptId, kind: "prompt_sent", body: { id: "prompt-1" } }, nowMs(), "durable");
+		const promptCommit = await journal.append({ runId, attemptId, kind: "prompt_sent", body: { id: "prompt-1", ...(options?.evidence && { message: encodedPromptText }) } }, nowMs(), "durable");
 		if (!promptCommit.ok || !releaseAllowed()) throw new Error("Prompt release closed");
 		promptReceived = true;
 		writeBoundedFrame(

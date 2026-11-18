@@ -15,7 +15,7 @@ export type MockOpenAIAction =
 	| {
 			readonly kind: "text";
 			readonly text: string;
-			readonly finishReason?: "stop" | "length";
+			readonly finishReason?: "stop" | "length" | "content_filter";
 	  }
 	| {
 			readonly kind: "tool_calls";
@@ -25,6 +25,7 @@ export type MockOpenAIAction =
 				readonly rawArgumentsJson: string;
 			}>;
 	  }
+	| { readonly kind: "transport_reset" }
 	| {
 			readonly kind: "http_error";
 			readonly status: number;
@@ -34,6 +35,7 @@ export type MockOpenAIAction =
 export interface LoopbackOpenAIServer {
 	readonly baseUrl: string;
 	readonly requests: RecordedLoopbackRequest[];
+	readonly outcomes: MockOpenAIAction["kind"][];
 	close(): Promise<void>;
 }
 
@@ -45,6 +47,7 @@ export async function startUnit1LoopbackOpenAI(
 	responder: (req: RecordedLoopbackRequest) => MockOpenAIAction | Promise<MockOpenAIAction>,
 ): Promise<LoopbackOpenAIServer> {
 	const requests: RecordedLoopbackRequest[] = [];
+	const outcomes: MockOpenAIAction["kind"][] = [];
 	let seq = 0;
 
 	const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -69,6 +72,11 @@ export async function startUnit1LoopbackOpenAI(
 			requests.push(recorded);
 
 			const action = await responder(recorded);
+			outcomes[recorded.seq - 1] = action.kind;
+			if (action.kind === "transport_reset") {
+				req.socket.destroy();
+				return;
+			}
 			const model = typeof bodyJson.model === "string" ? bodyJson.model : "mock-gpt";
 			const id = `chatcmpl-u1-${recorded.seq}`;
 			const created = Math.floor(Date.now() / 1000);
@@ -178,6 +186,7 @@ export async function startUnit1LoopbackOpenAI(
 	return {
 		baseUrl: `http://127.0.0.1:${addr.port}/v1`,
 		requests,
+		outcomes,
 		close: () =>
 			new Promise<void>((res, rej) => {
 				server.close((err) => (err ? rej(err) : res()));

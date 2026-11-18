@@ -1,3 +1,4 @@
+import { sha256Buffer } from "./pins.ts";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { setImmediate as yieldTurn } from "node:timers/promises";
@@ -406,6 +407,7 @@ export function resolveDefaultHelperPath(): string {
 export interface RunRegisteredNativeParams {
 	readonly registry: ProcessGroupRegistry;
 	readonly leaseId: GroupLeaseId;
+	readonly callId: string;
 	readonly runId: RunId;
 	readonly attemptId: AttemptId;
 	readonly captureDir: string;
@@ -452,7 +454,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 	};
 	const commit = async (kind: ProofJournalRecord["kind"], body: Record<string, unknown>, durable = false): Promise<boolean> => {
 		const result = await params.journal.append({
-			runId: params.runId, attemptId: params.attemptId, kind, body: { leaseId: params.leaseId, ...body },
+			runId: params.runId, attemptId: params.attemptId, kind, body: { leaseId: params.leaseId, callId: params.callId, ...body },
 		}, nowMs(), durable ? "durable" : "normal");
 		if (!result.ok) params.onFatal(`${kind} commit failed: ${result.error}`);
 		return result.ok && live();
@@ -558,7 +560,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 						const goCommand: HelperOuterToChild = {
 							kind: "go", leaseId: params.leaseId, execPath: params.execPath, argv: params.argv, cwd: params.cwd,
 						};
-						if (!await commit("group_go_sent", { execPath: params.execPath, argv: params.argv }, true)) return;
+						if (!await commit("group_go_sent", { execPath: params.execPath, argv: params.argv, stdin: "empty" }, true)) return;
 						if (entry.state !== "RegisteredWaiting" || isReaped(child) || go.destroyed || go.writableEnded) {
 							return fail("Owned helper unavailable at GO");
 						}
@@ -597,7 +599,10 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 						const boundedBase64 = rec.dataBase64.slice(0, Math.ceil(prefixLength / 3) * 4);
 						const raw = output.subarray(offset, offset + prefixLength);
 						raw.write(boundedBase64, 0, prefixLength, "base64");
-						const chunkRecord = Buffer.from(`${JSON.stringify({ stream: rec.stream, bytes: byteLength, monotonicMs: nowMs() })}\n`);
+						const chunkRecord = Buffer.from(`${JSON.stringify({
+							runId: params.runId, attemptId: params.attemptId, callId: params.callId, leaseId: params.leaseId,
+							stream: rec.stream, offset, bytes: byteLength, sha256: sha256Buffer(raw), monotonicMs: nowMs(),
+						})}\n`);
 						if (byteLength > prefixLength) params.onOverflow(`${params.leaseId}:${rec.stream}`, sink.bytesWritten + byteLength);
 						if (firstChunk) {
 							firstChunk = false;

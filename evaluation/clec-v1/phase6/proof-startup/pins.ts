@@ -238,6 +238,11 @@ export function captureExecutionClosure(): ExecutionClosure {
 		"process-observation.test.mjs",
 		"framing.test.mjs",
 		"deadline-controls.mjs",
+		"contract.ts",
+		"artifacts.ts",
+		"validate.ts",
+		"runner.ts",
+		"unit2-controls.mjs",
 	];
 	const unit1Files: FilePin[] = [];
 	for (const name of unit1Names) {

@@ -227,6 +227,7 @@ export interface ProofJournalRecord {
 		| "plan_committed"
 		| "closure_verified"
 		| "pi_spawned"
+		| "pi_frame"
 		| "bound_ready"
 		| "bound_ready_ack"
 		| "get_state_ok"

@@ -145,12 +145,34 @@ const errorText = (err: unknown): string => err instanceof Error ? err.message :
 // One native read plus one default Node pipe high water mark.
 const maxPipeChunkBytes = 2 * UNIT1_LIMITS.maxPendingSinkBytes;
 
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+export function strictUtf8(bytes: Uint8Array): string {
+	try { return utf8Decoder.decode(bytes); } catch { throw new Error("raw_utf8"); }
+}
+
+export function parseRawJson(line: Uint8Array): unknown {
+	const text = strictUtf8(line);
+	try { return JSON.parse(text); } catch { throw new Error("raw_json"); }
+}
+
+export interface FrameRange {
+	readonly offset: number;
+	readonly length: number;
+	readonly sha256: import("./types.ts").Sha256Hex;
+}
+
+export function frameRange(line: Buffer, offset: number): FrameRange {
+	return { offset, length: line.length + 1, sha256: sha256Buffer(line) };
+}
+
 export function attachBoundedJsonlReader<T>(params: {
 	readonly stream: Readable;
 	readonly maxFrameBytes: number;
 	readonly maxAggregateBytes?: number;
 	readonly label: string;
-	readonly onRecord: (record: T) => Promise<void>;
+	readonly onRecord: (record: T, range: FrameRange) => Promise<void>;
+	readonly strictFrames?: boolean;
 	readonly rawSink?: BoundedRawSink;
 	readonly onError: (err: Error) => void;
 	readonly onEnd?: () => void;
@@ -225,9 +247,10 @@ export function attachBoundedJsonlReader<T>(params: {
 	else if (params.stream.destroyed) onClose();
 
 	const done = (async (): Promise<DrainResult> => {
-		const decoder = new TextDecoder("utf-8", { fatal: true });
+
 		let partial = Buffer.alloc(0);
 		let frameBytes = 0;
+		let frameOffset = 0;
 		const faulted = () => terminal?.kind === "fault";
 		try {
 			for (;;) {
@@ -267,7 +290,10 @@ export function attachBoundedJsonlReader<T>(params: {
 					frameBytes = 0;
 					partial = Buffer.alloc(0);
 					offset = end + 1;
-					if (line.length > 0) await params.onRecord(JSON.parse(decoder.decode(line)) as T);
+					if (line.length > 0 || params.strictFrames) {
+						await params.onRecord(parseRawJson(line) as T, frameRange(line, frameOffset));
+					}
+					frameOffset += line.length + 1;
 				}
 			}
 		} catch (err) {
