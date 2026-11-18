@@ -2,6 +2,12 @@
 
 The tested source is `486af88f6c31bead62b1d0187451def6cda7f2d3` on integrated `f26d950af05abc91f91491bf0d5cc5257b2fec45`. This is the `PROOF_ONLY_NOT_A_COMPLETE_RUN_CERTIFICATE` status-only profile using synthetic questions and IPv4 loopback. The macOS arm64 proof uses one outer owner and the existing Prefix and Closed reducer.
 
+## Independent acceptance
+
+GPT 6.2 Astra accepted `d0e1ed64f0422355222894f71909c0bb36a372c3` for the status-only synthetic proof on pinned macOS ARM64. Both Unit 3 drivers, the scoped TypeScript check, and a separate partial-write failure probe passed. No P0 or P1 was reproduced. The coordinator fast-forwarded to the accepted commit. [Independent commands](/private/tmp/clec-unit3-review.WYMIjr/run.sh) · [Failed-write result](/private/tmp/clec-unit3-review.WYMIjr/stdout-failure.json)
+
+The review recorded two report discrepancies. The retained deadline receipt enumerates 24 passing cases. The reproduction recipe below omits copying `commands.sh` and `check-receipts.py` into the new output directory before running the checker. All nine original receipt digests matched. [Deadline receipt](/private/tmp/clec-unit3-verified.avgs8B/regression/clec-deadline-controls-PSWPGo/receipt.json) · [Receipt hash list](/private/tmp/clec-unit3-verified.avgs8B/sha256s.txt)
+
 ## Capture and process evidence
 
 | Control | Observed result |
