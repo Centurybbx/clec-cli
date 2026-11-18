@@ -1,22 +1,94 @@
+import type { CorpusCommitment } from "../contract/corpus.ts";
 import { sha256Buffer } from "./pins.ts";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { join, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { attachBoundedJsonlReader, byDeadline, BoundedJournalWriter, BoundedRawSink, type DrainResult, scheduleDeadline, strictUtf8, writeBoundedFrame } from "./framing.ts";
+import { attachBoundedJsonlReader, byDeadline, BoundedJournalWriter, BoundedRawSink, type DrainResult, type AttemptJournalRecord, scheduleDeadline, strictUtf8, writeBoundedFrame } from "./framing.ts";
 import { buildScrubbedChildEnv } from "./pins.ts";
 import type {
 	AttemptId,
 	GroupLeaseId,
-	GroupState,
-	HelperChildToOuter,
-	HelperOuterToChild,
-	ProcessObservation,
-	ProofJournalRecord,
 	RunId,
-} from "./types.ts";
-import { UNIT1_LIMITS } from "./types.ts";
+} from "../contract/types.ts";
+import { HOST_LIMITS } from "../contract/types.ts";
+
+export type GroupState =
+	| "Reserved"
+	| "WaitingForRegistration"
+	| "Stopping"
+	| "RegisteredWaiting"
+	| "Released"
+	| "Closed"
+	| "Unknown";
+
+export type ProcessObservation =
+	| {
+			readonly kind: "gone";
+			readonly pgid: number;
+			readonly checkedAtMonotonicMs: number;
+			readonly pidsChecked: readonly number[];
+	  }
+	| {
+			readonly kind: "alive";
+			readonly pgid: number;
+			readonly checkedAtMonotonicMs: number;
+			readonly survivors: ReadonlyArray<{
+				readonly pid: number;
+				readonly ppid: number;
+				readonly pgid: number;
+				readonly lstart: string;
+				readonly command: string;
+			}>;
+	  }
+	| {
+			readonly kind: "unknown";
+			readonly pgid: number;
+			readonly checkedAtMonotonicMs: number;
+			readonly reason: string;
+	  };
+
+export type HelperChildToOuter =
+	| {
+			readonly kind: "helper_ready";
+			readonly leaseId: GroupLeaseId;
+			readonly pid: number;
+			readonly pgid: number;
+			readonly lstart: string | null;
+	  }
+	| {
+			readonly kind: "native_started";
+			readonly leaseId: GroupLeaseId;
+			readonly pid: number;
+			readonly pgid: number;
+			readonly lstart: string | null;
+	  }
+	| {
+			readonly kind: "native_chunk";
+			readonly leaseId: GroupLeaseId;
+			readonly stream: "stdout" | "stderr";
+			readonly dataBase64: string;
+	  }
+	| {
+			readonly kind: "native_exited";
+			readonly leaseId: GroupLeaseId;
+			readonly exitCode: number | null;
+			readonly signal: string | null;
+	  }
+	| {
+			readonly kind: "helper_error";
+			readonly leaseId: GroupLeaseId;
+			readonly message: string;
+	  };
+
+export type HelperOuterToChild = {
+	readonly kind: "go";
+	readonly leaseId: GroupLeaseId;
+	readonly execPath: string;
+	readonly argv: readonly string[];
+	readonly cwd: string;
+};
 
 export interface PsProcessEntry {
 	readonly pid: number;
@@ -205,7 +277,7 @@ export function armStop(params: {
 }): ArmedStop {
 	const { at, detectedAt } = params.trigger;
 	const { child, pgid } = params;
-	const deadline = at + UNIT1_LIMITS.killGraceMs;
+	const deadline = at + HOST_LIMITS.killGraceMs;
 	const evidence: SignalEvidence = {
 		triggerAt: at, detectedAt, scheduledKillAt: at + params.graceMs,
 		signalDeadline: deadline, observationDeadline: deadline, drainDeadline: deadline,
@@ -309,9 +381,9 @@ export class ProcessGroupRegistry {
 			helperPid: null, helperLstart: null, pgid: null, nativePid: null, nativeLstart: null,
 			registeredBeforeGo: false, sentinelAbsentAtRegistration: null, closure: null, child: null,
 			stop: null, cleanup: null, capture: null, stopCapture: null,
-			stdoutSink: sink("stdout", "stdout.bin", UNIT1_LIMITS.nativeStdoutBytes, params.stallMs),
-			stderrSink: sink("stderr", "stderr.bin", UNIT1_LIMITS.nativeStderrBytes, params.stallMs),
-			chunksSink: sink("chunks", "chunks.jsonl", UNIT1_LIMITS.controlFrameBytes),
+			stdoutSink: sink("stdout", "stdout.bin", HOST_LIMITS.nativeStdoutBytes, params.stallMs),
+			stderrSink: sink("stderr", "stderr.bin", HOST_LIMITS.nativeStderrBytes, params.stallMs),
+			chunksSink: sink("chunks", "chunks.jsonl", HOST_LIMITS.controlFrameBytes),
 		};
 		this.entries.set(params.leaseId, entry);
 		return entry;
@@ -419,6 +491,8 @@ export interface RunRegisteredNativeParams {
 	readonly execPath: string;
 	readonly argv: readonly string[];
 	readonly helperPath?: string;
+	readonly corpusBefore?: CorpusCommitment;
+	readonly executeSeq?: number;
 	readonly verifyLaunch: () => Promise<void>;
 	readonly nativeSentinelPath?: string;
 	readonly journal: BoundedJournalWriter;
@@ -456,7 +530,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		if (performance.now() >= deadline) timeout();
 		return !params.abortSignal.aborted;
 	};
-	const commit = async (kind: ProofJournalRecord["kind"], body: Record<string, unknown>, durable = false): Promise<boolean> => {
+	const commit = async (kind: AttemptJournalRecord["kind"], body: Record<string, unknown>, durable = false): Promise<boolean> => {
 		const result = await params.journal.append({
 			runId: params.runId, attemptId: params.attemptId, kind, body: { leaseId: params.leaseId, callId: params.callId, ...body },
 		}, nowMs(), durable ? "durable" : "normal");
@@ -471,7 +545,7 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		await params.verifyLaunch();
 		if (!live()) return failed("Native launch stopped during pin verification");
 		const ready = await Promise.all([entry.stdoutSink.ready, entry.stderrSink.ready, entry.chunksSink.ready]);
-		if (ready.some((opened) => !opened) || !live() || !await commit("group_reserved", {})) {
+		if (ready.some((opened) => !opened) || !live() || !await commit("group_reserved", params.corpusBefore ? { corpusBefore: params.corpusBefore, bridgeSeq: params.executeSeq } : {})) {
 			return failed("Native reservation did not complete");
 		}
 		const child = spawn(process.execPath, [params.helperPath ?? resolveDefaultHelperPath(), "--lease", params.leaseId], {
@@ -496,8 +570,8 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		const cleanupArmed = Promise.withResolvers<number>();
 		const aborted = Promise.withResolvers<void>();
 		let firstChunk = true;
-		const stdout = Buffer.alloc(UNIT1_LIMITS.nativeStdoutBytes);
-		const stderr = Buffer.alloc(UNIT1_LIMITS.nativeStderrBytes);
+		const stdout = Buffer.alloc(HOST_LIMITS.nativeStdoutBytes);
+		const stderr = Buffer.alloc(HOST_LIMITS.nativeStderrBytes);
 		const fail = (reason: string): void => {
 			outcome = { ...failed(reason), nativeStarted };
 			params.onFatal(reason);
@@ -520,8 +594,8 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 		};
 		params.abortSignal.addEventListener("abort", closeGo, { once: true });
 		const reader = attachBoundedJsonlReader<HelperChildToOuter>({
-			stream: reports, maxFrameBytes: UNIT1_LIMITS.controlFrameBytes,
-			maxAggregateBytes: UNIT1_LIMITS.controlAggregateBytes, label: `helper:${params.leaseId}`,
+			stream: reports, maxFrameBytes: HOST_LIMITS.controlFrameBytes,
+			maxAggregateBytes: HOST_LIMITS.controlAggregateBytes, label: `helper:${params.leaseId}`,
 			onError: (err) => fail(err.message),
 			onEnd: reportChannelEnded,
 			onRecord: async (rec) => {
@@ -566,10 +640,12 @@ export async function runRegisteredNativeGroup(params: RunRegisteredNativeParams
 							kind: "go", leaseId: params.leaseId, execPath: params.execPath, argv: params.argv, cwd: params.cwd,
 						};
 						if (!await commit("group_go_sent", { execPath: params.execPath, argv: params.argv, stdin: "empty" }, true)) return;
+						if (params.corpusBefore) await params.verifyLaunch();
+						if (!live()) return;
 						if (entry.state !== "RegisteredWaiting" || isReaped(child) || go.destroyed || go.writableEnded) {
 							return fail("Owned helper unavailable at GO");
 						}
-						writeBoundedFrame(go, goCommand, UNIT1_LIMITS.controlFrameBytes);
+						writeBoundedFrame(go, goCommand, HOST_LIMITS.controlFrameBytes);
 						goSent = true;
 						entry.state = "Released";
 						break;

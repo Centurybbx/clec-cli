@@ -7,7 +7,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type * as TypeScript from "typescript";
 import { verifyHostImports } from "./source-closure.ts";
-import { asSha256Hex, type Sha256Hex } from "./types.ts";
+import { asSha256Hex, type Sha256Hex } from "../contract/types.ts";
 
 export const PRIMARY_CLEC_BIN =
 	"/tmp/clec-coordinator-install.Y1F9gC/prefix 空 格/lib/node_modules/@clec/cli/bin/clec.exe";
@@ -70,7 +70,7 @@ export interface ExecutionClosure {
 	readonly piTreeFileCount: number;
 	readonly piTreeByteCount: number;
 	readonly piTreeSha256: Sha256Hex;
-	readonly unit1Files: readonly FilePin[];
+	readonly hostFiles: readonly FilePin[];
 	readonly dynamicLibDeps: {
 		readonly clecOtool: readonly string[];
 		readonly nodeOtool: readonly string[];
@@ -194,8 +194,8 @@ function readOtoolDeps(binaryPath: string): readonly string[] {
 	}
 }
 
-export function resolveUnit1RootDir(): string {
-	return realpathSync(import.meta.dirname);
+export function resolveHostRoot(): string {
+	return realpathSync(resolve(import.meta.dirname, ".."));
 }
 
 export async function verifyFilePin(pin: FilePin): Promise<void> {
@@ -229,9 +229,9 @@ interface ClosurePaths {
 // Overrides exist for verification of inert copied fixtures. Launchers use the
 // default roots and never accept executable paths from a closure receipt.
 export function captureExecutionClosure(paths?: ClosurePaths): ExecutionClosure {
-	const sourceRoot = paths?.sourceRoot ?? resolveUnit1RootDir();
-	if (!lstatSync(sourceRoot).isDirectory()) throw new Error(`Expected real proof root: ${sourceRoot}`);
-	const unit1Dir = realpathSync(sourceRoot);
+	const sourceRoot = paths?.sourceRoot ?? resolveHostRoot();
+	if (!lstatSync(sourceRoot).isDirectory()) throw new Error(`Expected real host root: ${sourceRoot}`);
+	const hostDir = realpathSync(sourceRoot);
 	const nodePin = pinRegularFile(paths?.node ?? process.execPath, EXPECTED_NODE_SHA256);
 	const nativePin = pinRegularFile(PRIMARY_CLEC_BIN, EXPECTED_CLEC_BIN_SHA256);
 	const skillPin = pinRegularFile(PRIMARY_CLEC_SKILL, EXPECTED_CLEC_SKILL_SHA256);
@@ -247,36 +247,44 @@ export function captureExecutionClosure(paths?: ClosurePaths): ExecutionClosure 
 	const parserLoader = createRequire(import.meta.url);
 	const ts: typeof TypeScript = parserLoader(sourceParserPin.canonicalPath);
 
-	const unit1Names = [
+	const hostNames = [
 		"PROTOCOL.md",
-		"tsconfig.json",
-		"types.ts",
-		"pins.ts",
-		"source-closure.ts",
-		"framing.ts",
-		"process-group.ts",
-		"group-helper.mjs",
-		"clec-adapter.ts",
-		"controller.ts",
-		"fixtures.ts",
-		"run-matrix.ts",
-		"process-observation.test.mjs",
-		"framing.test.mjs",
-		"deadline-controls.mjs",
+		"capture/framing.ts",
+		"capture/group-helper.mjs",
+		"capture/pins.ts",
+		"capture/process-group.ts",
+		"capture/source-closure.ts",
+		"clec-tool.ts",
+		"clec-tool/protocol.ts",
 		"contract.ts",
-		"artifacts.ts",
-		"validate.ts",
+		"contract/corpus.ts",
+		"contract/request.ts",
+		"contract/types.ts",
 		"runner.ts",
-		"unit2-controls.mjs",
-		"unit3-capture-controls.mjs",
-		"unit3-closure-controls.mjs",
+		"runner/attempt.ts",
+		"runner/attempt-types.ts",
+		"runner/loopback.ts",
+		"test/attempt.ts",
+		"test/corpus.ts",
+		"test/deadline-controls.mjs",
+		"test/fixtures.ts",
+		"test/framing.test.mjs",
+		"test/process-observation.test.mjs",
+		"test/run-matrix.ts",
+		"test/unit2-controls.mjs",
+		"test/unit3-capture-controls.mjs",
+		"test/unit3-closure-controls.mjs",
+		"test/unit4-controls.mjs",
+		"tsconfig.json",
+		"validate.ts",
+		"validate/artifacts.ts",
 	];
-	const unit1Files: FilePin[] = [];
-	for (const name of unit1Names) {
-		const candidate = join(unit1Dir, name);
-		unit1Files.push(pinRegularFile(candidate));
+	const hostFiles: FilePin[] = [];
+	for (const name of hostNames) {
+		const candidate = join(hostDir, name);
+		hostFiles.push(pinRegularFile(candidate));
 	}
-	verifyHostImports({ root: unit1Dir, files: unit1Files, ts });
+	verifyHostImports({ root: hostDir, files: hostFiles, ts });
 
 	const dynamicLibDeps = {
 		clecOtool: readOtoolDeps(nativePin.canonicalPath),
@@ -296,7 +304,7 @@ export function captureExecutionClosure(paths?: ClosurePaths): ExecutionClosure 
 			sourceParserSha: sourceParserPin.sha256,
 			sourceParserPackageSha: sourceParserPackagePin.sha256,
 			piTreeSha: piTree.treeSha256,
-			unit1Files: unit1Files.map((f) => ({ path: f.logicalPath, sha: f.sha256 })),
+			hostFiles: hostFiles.map((f) => ({ path: f.logicalPath, sha: f.sha256 })),
 			dynamicLibDeps,
 		}),
 	);
@@ -319,7 +327,7 @@ export function captureExecutionClosure(paths?: ClosurePaths): ExecutionClosure 
 		piTreeFileCount: piTree.fileCount,
 		piTreeByteCount: piTree.byteCount,
 		piTreeSha256: piTree.treeSha256,
-		unit1Files,
+		hostFiles,
 		dynamicLibDeps,
 		closureDigest,
 	};
@@ -335,7 +343,7 @@ export function verifyExecutionClosure(expected: ExecutionClosure, paths?: Closu
 
 export function buildScrubbedChildEnv(overrides: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
 	const scrubbed: NodeJS.ProcessEnv = {
-		PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+		PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
 		LANG: "C.UTF-8",
 		LC_ALL: "C.UTF-8",
 		TERM: "dumb",

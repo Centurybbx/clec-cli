@@ -1,13 +1,14 @@
+import { pinAttemptCorpus, readPublicCorpus, retainCorpus } from "./contract/corpus.ts";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { appendFileSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { readEvidence } from "./artifacts.ts";
-import { anchorFor, digest, type AttemptIdentity, type ExpectedCommitments, parsePlan, PROOF_MODEL, publicProfile, STATUS_CORPUS } from "./contract.ts";
-import { runUnit1Proof } from "./controller.ts";
-import { startUnit1LoopbackOpenAI, type MockOpenAIAction } from "./fixtures.ts";
-import { createExclusiveDir, parseRawJson, publishExclusiveIndex, writeExclusiveFile } from "./framing.ts";
-import { captureExecutionClosure } from "./pins.ts";
-import { makeRunId, UNIT1_LIMITS } from "./types.ts";
+import { readEvidence } from "./validate/artifacts.ts";
+import { anchorFor, type AttemptIdentity, type ExpectedCommitments, parsePlan, PROOF_MODEL, publicProfile, systemPreamble } from "./contract.ts";
+import { runAttempt } from "./runner/attempt.ts";
+import { startSyntheticLoopback, type MockOpenAIAction } from "./runner/loopback.ts";
+import { createExclusiveDir, parseRawJson, publishExclusiveIndex, writeExclusiveFile } from "./capture/framing.ts";
+import { captureExecutionClosure, sha256Buffer } from "./capture/pins.ts";
+import { makeRunId, HOST_LIMITS } from "./contract/types.ts";
 import { equal, inspectRun, PiProjection, reconcile, requireFact, runtimeWitness, snapshotArtifacts, summaryEnvelope, type Validation } from "./validate.ts";
 
 type Prefix = Extract<Validation, { kind: "Incomplete" }>;
@@ -31,18 +32,25 @@ export { inspectRun };
 
 // The synthetic fixture is injected at the server boundary. It cannot change
 // the Pi runtime, native invocation, evidence files, tool permissions or schedule.
-export async function collectRun(input: unknown, evidenceParent: string, fixture: LoopbackFixture) {
+export async function collectRun(input: unknown, evidenceParent: string, publicCorpusDir: string, fixture: LoopbackFixture) {
 	const closure = captureExecutionClosure();
-	const witness = runtimeWitness(closure);
-	const plan = parsePlan(input, publicProfile(closure));
+	const corpus = readPublicCorpus(publicCorpusDir);
+	const skill = readFileSync(closure.skillPin.canonicalPath);
+	equal(sha256Buffer(skill), closure.skillPin.sha256, "skill_pin");
+	const preamble = systemPreamble(skill);
+	const profile = publicProfile(closure, corpus.commitment, preamble);
+	const witness = runtimeWitness(closure, profile);
+	const plan = parsePlan(input, profile);
 	const parent = realpathSync(evidenceParent);
-	const runId = makeRunId(`u2-${Date.now()}-${randomBytes(8).toString("hex")}`);
+	const runId = makeRunId(`host-${Date.now()}-${randomBytes(8).toString("hex")}`);
 	const root = join(parent, runId);
 	createExclusiveDir(root);
 	const expected = anchorFor(runId, plan, root);
 	const anchorPath = join(parent, `${runId}.expected.json`);
 	await publishExclusiveIndex(anchorPath, JSON.stringify(expected, null, 2));
 
+	retainCorpus(join(root, "corpus"), corpus);
+	writeExclusiveFile(join(root, "skill.bin"), skill);
 	writeExclusiveFile(join(root, "plan.json"), JSON.stringify(plan));
 	const journal = join(root, "run.jsonl");
 	let seq = 0;
@@ -61,16 +69,16 @@ export async function collectRun(input: unknown, evidenceParent: string, fixture
 			const identity = progress.next;
 			const item = plan.cases.find(c => c.id === identity.caseId);
 			requireFact(item, "case_order");
-			requireFact(performance.now() + UNIT1_LIMITS.caseDeadlineMs + UNIT1_LIMITS.killGraceMs <= deadline, "run_deadline");
-			equal(parseRawJson(readEvidence(parent, `${runId}.expected.json`, UNIT1_LIMITS.controlFrameBytes)), expected, "external_anchor");
-			const pi = new PiProjection(UNIT1_LIMITS.promptPrefix + item.question, join(root, "attempts", identity.attemptId, "cwd"));
-			const mock = await startUnit1LoopbackOpenAI(req => fixture(identity, req.seq));
+			requireFact(performance.now() + HOST_LIMITS.caseDeadlineMs + HOST_LIMITS.killGraceMs <= deadline, "run_deadline");
+			equal(parseRawJson(readEvidence(parent, `${runId}.expected.json`, HOST_LIMITS.controlFrameBytes)), expected, "external_anchor");
+			const pi = new PiProjection(HOST_LIMITS.promptPrefix + item.question, join(root, "attempts", identity.attemptId, "cwd"), preamble);
+			const mock = await startSyntheticLoopback(req => fixture(identity, req.seq));
 			try {
 				appendFileSync(journal, encode("attempt_started", { identity }));
-				const result = await runUnit1Proof({
+				const result = await runAttempt({
 					caseLabel: item.id, evidenceParentDir: root, question: item.question, mockBaseUrl: mock.baseUrl,
 					providerId: PROOF_MODEL.provider, modelId: PROOF_MODEL.model, thinkingLevel: PROOF_MODEL.thinking,
-				}, { cachedClosure: closure, evidence: { identity, anchor: expected, pi } });
+				}, { cachedClosure: closure, evidence: { identity, anchor: expected, pi, corpus, preamble } });
 				const capture = join(root, "attempts", identity.attemptId, "capture");
 				if (lstatSync(capture, { throwIfNoEntry: false }) === undefined) return report(inspectRun(root, expected));
 				writeExclusiveFile(join(capture, "question.bin"), Buffer.from(item.question));
@@ -80,11 +88,13 @@ export async function collectRun(input: unknown, evidenceParent: string, fixture
 					return report(inspectRun(root, expected));
 				}
 				const after = captureExecutionClosure();
-				equal(runtimeWitness(after), witness, "closure_postcheck");
+				equal(runtimeWitness(after, profile), witness, "closure_postcheck");
 				const artifacts = snapshotArtifacts(root, identity);
 				const data = join(root, "attempts", identity.attemptId, "data");
-				const corpusAfter = readdirSync(data).length === 0 ? STATUS_CORPUS : null;
-				appendFileSync(journal, encode("attempt", { identity, artifacts, witness: runtimeWitness(after), corpusAfter }));
+				pinAttemptCorpus(data, corpus.commitment);
+				const corpusAfter = readPublicCorpus(join(root, "corpus")).commitment;
+				equal(corpusAfter, corpus.commitment, "corpus_postcheck");
+				appendFileSync(journal, encode("attempt", { identity, artifacts, witness: runtimeWitness(after, profile), corpusAfter }));
 				const projection = pi.finish("Prefix");
 				progress = reconcile(root, expected, "Prefix", { identity, projection });
 				if (progress.kind !== "Incomplete") return report(progress);
@@ -101,7 +111,7 @@ export async function collectRun(input: unknown, evidenceParent: string, fixture
 		equal(sealed, inspected, "seal_inspect");
 		if (sealed.kind === "Complete") {
 			await publishExclusiveIndex(join(parent, `${runId}.final.json`), JSON.stringify({
-				expected, summary: "summary.json", sha256: digest(sealed.summary),
+				expected, summary: "summary.json", sha256: sha256Buffer(readEvidence(root, "summary.json", HOST_LIMITS.journalTotalBytes)),
 			}, null, 2));
 		}
 		return report(sealed);

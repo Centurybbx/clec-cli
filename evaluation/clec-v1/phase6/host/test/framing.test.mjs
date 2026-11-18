@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import test from "node:test";
-import { attachBoundedJsonlReader, BoundedRawSink, publishExclusiveIndex } from "./framing.ts";
-import { UNIT1_LIMITS } from "./types.ts";
+import { attachBoundedJsonlReader, BoundedRawSink, publishExclusiveIndex } from "../capture/framing.ts";
+import { HOST_LIMITS } from "../contract/types.ts";
 
 const timeout = { timeout: 3_000 };
 const deadline = () => performance.now() + 1_000;
@@ -44,7 +44,7 @@ for (const fault of ["eof", "error", "queue bytes", "queue chunks", "frame cap",
       if (fault === "eof") pipe.end("2\n3\n");
       else if (fault === "error") pipe.destroy(new Error("injected pipe error"));
       else if (fault === "queue chunks") {
-        for (let i = 0; i <= UNIT1_LIMITS.maxQueuedPipeChunks; i++) pipe.write("\n");
+        for (let i = 0; i <= HOST_LIMITS.maxQueuedPipeChunks; i++) pipe.write("\n");
       } else if (fault === "queue bytes") pipe.write("2\n".repeat(17));
       else if (fault === "frame cap") pipe.write("0".repeat(32));
       else pipe.write("2\n".repeat(10));

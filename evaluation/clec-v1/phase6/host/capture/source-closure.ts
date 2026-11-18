@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import type * as TypeScript from "typescript";
 import type { FilePin } from "./pins.ts";
 
-const entrypoints = ["runner.ts", "controller.ts", "group-helper.mjs", "clec-adapter.ts"];
+const entrypoints = ["runner.ts", "runner/attempt.ts", "capture/group-helper.mjs", "clec-tool.ts"];
 
 export function verifyHostImports(input: {
 	readonly root: string;
@@ -27,9 +27,9 @@ export function verifyHostImports(input: {
 			const target = specifier.text;
 			if (target.startsWith("node:") && isBuiltin(target)) return;
 			// Pi extension resolution and the closure parser are pinned separately.
-			if (name === "clec-adapter.ts" &&
+			if (name === "clec-tool.ts" &&
 				(target === "typebox" || (typeOnly && target === "@earendil-works/pi-coding-agent"))) return;
-			if ((name === "source-closure.ts" || name === "pins.ts") && typeOnly && target === "typescript") return;
+			if ((name === "capture/source-closure.ts" || name === "capture/pins.ts") && typeOnly && target === "typescript") return;
 			if (!target.startsWith("./") && !target.startsWith("../")) {
 				throw new Error(`Unlisted external host import in ${name}: ${target}`);
 			}

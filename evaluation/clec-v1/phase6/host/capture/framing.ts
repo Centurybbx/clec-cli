@@ -3,8 +3,48 @@ import { link, lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import type { Readable, Writable } from "node:stream";
 import { dirname } from "node:path";
 import { sha256Buffer } from "./pins.ts";
-import type { ProofJournalRecord, Sha256Hex } from "./types.ts";
-import { UNIT1_LIMITS } from "./types.ts";
+import type { AttemptId, RunId, Sha256Hex } from "../contract/types.ts";
+import { HOST_LIMITS } from "../contract/types.ts";
+
+export interface AttemptJournalRecord {
+	readonly seq: number;
+	readonly monotonicMs: number;
+	readonly utcIso: string;
+	readonly runId: RunId;
+	readonly attemptId: AttemptId;
+	readonly kind:
+		| "plan_committed"
+		| "closure_verified"
+		| "pi_spawned"
+		| "pi_frame"
+		| "bound_ready"
+		| "bound_ready_ack"
+		| "get_state_ok"
+		| "prompt_encoded"
+		| "prompt_sent"
+		| "prompt_preflight"
+		| "provider_candidate"
+		| "provider_grant"
+		| "provider_denied"
+		| "provider_permit_sent"
+		| "tool_declared_batch"
+		| "tool_start_reserved"
+		| "tool_start_denied"
+		| "group_reserved"
+		| "group_registered"
+		| "group_go_sent"
+		| "native_pid_reported"
+		| "native_exited"
+		| "tool_result_delivered"
+		| "agent_settled"
+		| "pi_exited"
+		| "group_closure_observed"
+		| "overflow_uncertified"
+		| "journal_fault"
+		| "attempt_closed";
+	readonly body: Record<string, unknown>;
+}
+
 
 export class FrameCapExceededError extends Error {
 	readonly limitBytes: number;
@@ -143,7 +183,7 @@ export type WriteResult = { kind: "written" } | { kind: "overflow" } | { kind: "
 const errorText = (err: unknown): string => err instanceof Error ? err.message : String(err);
 
 // One native read plus one default Node pipe high water mark.
-const maxPipeChunkBytes = 2 * UNIT1_LIMITS.maxPendingSinkBytes;
+const maxPipeChunkBytes = 2 * HOST_LIMITS.maxPendingSinkBytes;
 
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
@@ -159,7 +199,7 @@ export function parseRawJson(line: Uint8Array): unknown {
 export interface FrameRange {
 	readonly offset: number;
 	readonly length: number;
-	readonly sha256: import("./types.ts").Sha256Hex;
+	readonly sha256: import("../contract/types.ts").Sha256Hex;
 }
 
 export function frameRange(line: Buffer, offset: number): FrameRange {
@@ -210,7 +250,7 @@ export function attachBoundedJsonlReader<T>(params: {
 		if (terminal) return;
 		try {
 			checkPipeChunk(chunk);
-			if (queue.length >= UNIT1_LIMITS.maxQueuedPipeChunks || queuedBytes + chunk.length > params.maxFrameBytes) {
+			if (queue.length >= HOST_LIMITS.maxQueuedPipeChunks || queuedBytes + chunk.length > params.maxFrameBytes) {
 				throw new Error(`${params.label} ingress queue exceeded its byte or chunk limit`);
 			}
 			// Queue bytes count the full backing, including small slices of Node's pool.
@@ -259,7 +299,7 @@ export function attachBoundedJsonlReader<T>(params: {
 		try {
 			for (;;) {
 				if (params.rawSink && !terminal && queue.length === 0) {
-					const chunk = params.stream.read(Math.min(params.stream.readableLength, UNIT1_LIMITS.maxPendingSinkBytes));
+					const chunk = params.stream.read(Math.min(params.stream.readableLength, HOST_LIMITS.maxPendingSinkBytes));
 					if (chunk !== null) ingest(chunk);
 				}
 				const chunk = queue.shift();
@@ -327,8 +367,8 @@ function checkPipeChunk(chunk: Buffer): void {
 }
 
 async function writeRawChunks(sink: BoundedRawSink, chunk: Buffer): Promise<WriteResult> {
-	for (let offset = 0; offset < chunk.length; offset += UNIT1_LIMITS.maxPendingSinkBytes) {
-		const result = await sink.writeChunk(chunk.subarray(offset, offset + UNIT1_LIMITS.maxPendingSinkBytes));
+	for (let offset = 0; offset < chunk.length; offset += HOST_LIMITS.maxPendingSinkBytes) {
+		const result = await sink.writeChunk(chunk.subarray(offset, offset + HOST_LIMITS.maxPendingSinkBytes));
 		if (result.kind !== "written") return result;
 	}
 	return { kind: "written" };
@@ -411,7 +451,7 @@ export class BoundedRawSink {
 		if (this.closing || this.pending || this.failure) {
 			return Promise.resolve(this.fail(new Error(this.failure ?? "Raw sink is closing or already has a pending write")));
 		}
-		if (chunk.length > UNIT1_LIMITS.maxPendingSinkBytes) {
+		if (chunk.length > HOST_LIMITS.maxPendingSinkBytes) {
 			return Promise.resolve(this.fail(new Error("Raw sink input exceeds its pending write limit")));
 		}
 		if (this.overflowed) return Promise.resolve({ kind: "overflow" });
@@ -464,7 +504,7 @@ export class BoundedRawSink {
 	}
 }
 
-type JournalRecord = Omit<ProofJournalRecord, "seq" | "monotonicMs" | "utcIso">;
+type JournalRecord = Omit<AttemptJournalRecord, "seq" | "monotonicMs" | "utcIso">;
 type CommitResult = { readonly ok: true; readonly seq: number; readonly start: number; readonly end: number }
 	| { readonly ok: false; readonly error: string };
 
@@ -477,11 +517,11 @@ export class BoundedJournalWriter {
 	private bytesWritten = 0;
 	private failed = false;
 	private corrupted = false;
-	private failNextKind: ProofJournalRecord["kind"] | null;
+	private failNextKind: AttemptJournalRecord["kind"] | null;
 
 	private readonly params: {
 		readonly path: string;
-		readonly failNextKind?: ProofJournalRecord["kind"];
+		readonly failNextKind?: AttemptJournalRecord["kind"];
 		readonly onFailure?: (reason: string) => void;
 	};
 
@@ -496,7 +536,7 @@ export class BoundedJournalWriter {
 	get currentSeq(): number { return this.seq; }
 	get writtenBytes(): number { return this.bytesWritten; }
 
-	setFailOnKind(kind: ProofJournalRecord["kind"] | null): void {
+	setFailOnKind(kind: AttemptJournalRecord["kind"] | null): void {
 		this.failNextKind = kind;
 	}
 
@@ -512,7 +552,7 @@ export class BoundedJournalWriter {
 			if (this.failNextKind === record.kind && !emergency) return this.fail(`Injected journal write failure on ${record.kind}`);
 			const seq = this.seq + 1;
 			const start = this.bytesWritten;
-			const cap = UNIT1_LIMITS.journalTotalBytes - (emergency ? 0 : UNIT1_LIMITS.journalEmergencyReserveBytes);
+			const cap = HOST_LIMITS.journalTotalBytes - (emergency ? 0 : HOST_LIMITS.journalEmergencyReserveBytes);
 			let line: Buffer;
 			try {
 				const { json } = boundedJsonStringify({ seq, monotonicMs, utcIso, ...record }, cap - start - 1);

@@ -6,19 +6,21 @@ import {
 	cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { artifactRef, frames } from "./artifacts.ts";
-import { digest, publicProfile } from "./contract.ts";
-import { BoundedJournalWriter, writeExclusiveFile } from "./framing.ts";
-import { captureExecutionClosure, sha256Buffer } from "./pins.ts";
-import { collectRun, inspectRun, sealRun } from "./runner.ts";
-import { PiProjection } from "./validate.ts";
+import { artifactRef, frames } from "../validate/artifacts.ts";
+import { buildPublicFixture, fixtureProfile } from "./corpus.ts";
+import { digest } from "../contract.ts";
+import { BoundedJournalWriter, writeExclusiveFile } from "../capture/framing.ts";
+import { captureExecutionClosure, sha256Buffer } from "../capture/pins.ts";
+import { collectRun, inspectRun, sealRun } from "../runner.ts";
+import { PiProjection } from "../validate.ts";
 
 const parent = process.argv[2];
 assert(parent, "Pass an existing private output directory");
 const output = mkdtempSync(join(parent, "unit2-controls-"));
 process.stdout.write(`evidence ${output}\n`);
 const closure = captureExecutionClosure();
-const profile = publicProfile(closure);
+const { dir: corpusDir } = buildPublicFixture(output);
+const profile = fixtureProfile(corpusDir, closure);
 const cases = (...ids) => ids.map(id => {
 	const question = `/Synthetic ${id}\nStatus fixture — café @example`;
 	return { id, question, questionSha256: sha256Buffer(question) };
@@ -33,7 +35,7 @@ const ordinary = (_, seq) => seq === 1 ? native(seq) : answer;
 const runs = new Map();
 
 async function baseline(name, ids, fixture, expectedStatus, replacements, statuses) {
-	const run = await collectRun({ version: 1, profile, cases: cases(...ids) }, output, fixture);
+	const run = await collectRun({ version: 1, profile, cases: cases(...ids) }, output, corpusDir, fixture);
 	assert.equal(run.result.kind, "Complete", JSON.stringify(run.result));
 	const summary = run.result.summary;
 	assert.equal(summary.status, expectedStatus);
@@ -102,12 +104,16 @@ async function mutate(name, expectedInvariant, change, baselineName = "one") {
 	const baseline = runs.get(baselineName);
 	const root = mkdtempSync(join(output, `mutation-${name}-`));
 	// Copy only the small retained evidence, never the installed/source closure.
-	for (const file of ["plan.json", "run.jsonl", "summary.json"]) {
+	for (const file of ["plan.json", "run.jsonl", "summary.json", "skill.bin"]) {
 		cpSync(join(baseline.root, file), join(root, file), { force: false, errorOnExist: true });
 	}
+	cpSync(join(baseline.root, "corpus"), join(root, "corpus"), { recursive: true, force: false, errorOnExist: true });
 	const runFile = join(root, "run.jsonl");
 	const run = readLines(runFile);
 	for (const item of run.filter(entry => entry.kind === "attempt")) {
+		const data = `attempts/${item.identity.attemptId}/data`;
+		mkdirSync(join(root, data, ".."), { recursive: true });
+		cpSync(join(baseline.root, data), join(root, data), { recursive: true, force: false, errorOnExist: true });
 		for (const { path } of item.artifacts) {
 			mkdirSync(join(root, path, ".."), { recursive: true });
 			cpSync(join(baseline.root, path), join(root, path), { force: false, errorOnExist: true });
@@ -502,7 +508,7 @@ BoundedJournalWriter.prototype.close = async function (deadline) {
 };
 let late;
 try {
-	late = await collectRun({ version: 1, profile, cases: cases("alpha", "beta") }, output, () => reset);
+	late = await collectRun({ version: 1, profile, cases: cases("alpha", "beta") }, output, corpusDir, () => reset);
 } finally {
 	BoundedJournalWriter.prototype.close = originalClose;
 }
@@ -537,7 +543,7 @@ fsPromises.link = async (from, to) => {
 syncBuiltinESMExports();
 let refused;
 try {
-	refused = await collectRun({ version: 1, profile, cases: cases("alpha", "beta") }, output, () => answer);
+	refused = await collectRun({ version: 1, profile, cases: cases("alpha", "beta") }, output, corpusDir, () => answer);
 } finally {
 	fsPromises.link = link;
 	syncBuiltinESMExports();

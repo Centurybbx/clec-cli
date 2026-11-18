@@ -1,34 +1,11 @@
+import type { PipeOuterToChild as OuterMsg } from "./clec-tool/protocol.ts";
+import { CLEC_TOOL_DESCRIPTION, CLEC_TOOL_PARAMETERS_SCHEMA } from "./contract/request.ts";
 import { createHash } from "node:crypto";
 import { Socket } from "node:net";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const MAX_CONTROL_FRAME_BYTES = 16 * 1024 * 1024;
-
-type OuterMsg =
-	| { readonly kind: "bound_ready_ack"; readonly seq: number; readonly attemptId: string }
-	| {
-			readonly kind: "provider_permit";
-			readonly seq: number;
-			readonly attemptId: string;
-			readonly watermark: number;
-			readonly payloadDigest: string;
-	  }
-	| {
-			readonly kind: "tool_start_ack";
-			readonly seq: number;
-			readonly callId: string;
-			readonly allowed: boolean;
-			readonly ordinal?: number;
-			readonly reason?: string;
-	  }
-	| {
-			readonly kind: "tool_result";
-			readonly seq: number;
-			readonly callId: string;
-			readonly isError: boolean;
-			readonly text: string;
-	  };
 
 function boundedJsonStringify(value: unknown, maxBytes: number): { readonly json: string; readonly byteLength: number } {
 	const chunks: string[] = [];
@@ -128,10 +105,13 @@ export default function clecUnit1Adapter(pi: ExtensionAPI): void {
 	const pendingToolResults = new Map<number, (msg: Extract<OuterMsg, { kind: "tool_result" }>) => void>();
 
 	const sendToOuter = (msg: unknown): boolean => {
-		if (channelBroken) return false;
+		if (channelBroken || ctrlOut.destroyed || ctrlOut.writableEnded) return false;
 		try {
 			const { json } = boundedJsonStringify(msg, MAX_CONTROL_FRAME_BYTES - 1);
-			return ctrlOut.write(`${json}\n`, "utf8");
+			// A false write return means the frame is queued. The peer can
+			// still acknowledge it after the socket drains.
+			ctrlOut.write(`${json}\n`, "utf8");
+			return true;
 		} catch {
 			return false;
 		}
@@ -232,16 +212,18 @@ export default function clecUnit1Adapter(pi: ExtensionAPI): void {
 		ctrlOut.end();
 	});
 
+	let rejection: string | undefined;
 	pi.registerTool({
 		name: "clec",
-		label: "CLEC Status",
-		description: "Unit 1 narrow development profile: inspect local CLEC corpus status.",
-		parameters: Type.Object(
-			{
-				action: Type.Literal("status"),
-			},
-			{ additionalProperties: false },
-		),
+		label: "CLEC",
+		description: CLEC_TOOL_DESCRIPTION,
+		parameters: Type.Unsafe<unknown>(CLEC_TOOL_PARAMETERS_SCHEMA),
+		prepareArguments(args) {
+			const decline = rejection;
+			rejection = undefined;
+			if (decline !== undefined) throw new Error(decline);
+			return args;
+		},
 		executionMode: "sequential",
 		execute(toolCallId, params) {
 			return new Promise<AgentToolResult<unknown>>((resolve) => {
@@ -251,7 +233,7 @@ export default function clecUnit1Adapter(pi: ExtensionAPI): void {
 						if (res.callId !== toolCallId) return;
 						resolve({
 							content: [{ type: "text", text: res.text }],
-							details: { unit1NarrowProfile: true },
+							details: {},
 							isError: res.isError,
 						});
 					});
@@ -334,6 +316,7 @@ export default function clecUnit1Adapter(pi: ExtensionAPI): void {
 				pendingToolStartAcks.set(seq, (ack) => {
 					if (ack.seq === seq && ack.callId === event.toolCallId && ack.allowed === true) {
 						lastOuterSeq = ack.seq;
+						rejection = event.toolName === "clec" ? ack.rejection : undefined;
 						resolve();
 					}
 				});

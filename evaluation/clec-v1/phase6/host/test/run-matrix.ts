@@ -1,20 +1,21 @@
+import type { AttemptReport } from "../runner/attempt-types.ts";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { runUnit1Proof } from "./controller.ts";
+import { runUnit1Proof } from "./attempt.ts";
 import {
 	writeBypassGoHelperFixture,
 	writeFaultAdapterFixture,
 	writeFaultBinary,
 	writeLeaderExitSurvivingChildHelper,
-	startUnit1LoopbackOpenAI,
+	startSyntheticLoopback,
 	type RecordedLoopbackRequest,
 } from "./fixtures.ts";
-import { BoundedJournalWriter, createExclusiveDir, writeExclusiveFile } from "./framing.ts";
-import { captureExecutionClosure, sha256Buffer, sha256FileStreaming } from "./pins.ts";
-import { observeGroupInProcessTable } from "./process-group.ts";
-import { makeAttemptId, makeRunId, type ProofRunResult, UNIT1_LIMITS } from "./types.ts";
+import { BoundedJournalWriter, createExclusiveDir, writeExclusiveFile } from "../capture/framing.ts";
+import { captureExecutionClosure, sha256Buffer, sha256FileStreaming } from "../capture/pins.ts";
+import { observeGroupInProcessTable } from "../capture/process-group.ts";
+import { makeAttemptId, makeRunId, HOST_LIMITS } from "../contract/types.ts";
 
 interface MatrixCaseOutcome {
 	readonly id: string;
@@ -81,7 +82,7 @@ async function runCase(
 	polarity: MatrixCaseOutcome["polarity"],
 	fn: () => Promise<{
 		readonly detail: string;
-		readonly result?: ProofRunResult;
+		readonly result?: AttemptReport;
 		readonly serverRequests?: readonly RecordedLoopbackRequest[];
 		readonly nativeStarts?: number;
 		readonly extraEvidence?: Record<string, unknown>;
@@ -158,7 +159,7 @@ async function main(): Promise<void> {
 		polarity: MatrixCaseOutcome["polarity"],
 		fn: () => Promise<{
 			readonly detail: string;
-			readonly result?: ProofRunResult;
+			readonly result?: AttemptReport;
 			readonly serverRequests?: readonly RecordedLoopbackRequest[];
 			readonly nativeStarts?: number;
 			readonly extraEvidence?: Record<string, unknown>;
@@ -169,7 +170,7 @@ async function main(): Promise<void> {
 	};
 
 	add("startup_positive", "startup", "positive", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Startup verified." }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "Startup verified." }));
 		try {
 			const res = await runUnit1Proof(
 				{
@@ -202,7 +203,7 @@ async function main(): Promise<void> {
 	});
 
 	add("startup_missing_extension", "startup", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 		try {
 			const missingPath = join(fixturesDir, "does-not-exist.ts");
 			const res = await runUnit1Proof(
@@ -226,7 +227,7 @@ async function main(): Promise<void> {
 
 	for (const kind of ["import_failure", "setup_throw", "session_start_throw", "no_ready", "early_eof", "broken_channel"] as const) {
 		add(`startup_${kind}`, "startup", "negative", async () => {
-			const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+			const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 			try {
 				const adapterPath = writeFaultAdapterFixture(fixturesDir, kind);
 				const res = await runUnit1Proof(
@@ -253,7 +254,7 @@ async function main(): Promise<void> {
 	}
 
 	add("startup_bypass_ready_sensitivity", "startup", "control_sensitivity", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Bypassed readiness." }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "Bypassed readiness." }));
 		try {
 			const adapterPath = writeFaultAdapterFixture(fixturesDir, "no_ready");
 			const res = await runUnit1Proof(
@@ -291,7 +292,7 @@ async function main(): Promise<void> {
 
 	for (const lit of literalInputs) {
 		add(lit.id, "literal_input", "positive", async () => {
-			const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Literal verified." }));
+			const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "Literal verified." }));
 			try {
 				const res = await runUnit1Proof(
 					{
@@ -305,7 +306,7 @@ async function main(): Promise<void> {
 				assert(res.status === "Answered", `expected Answered, got ${res.status}`);
 				assert(srv.requests.length === 1, `expected 1 request, got ${srv.requests.length}`);
 				const receivedPrompt = extractFirstUserPromptFromLoopback(srv.requests[0]);
-				const expectedPrompt = `${UNIT1_LIMITS.promptPrefix}${lit.question}`;
+				const expectedPrompt = `${HOST_LIMITS.promptPrefix}${lit.question}`;
 				assert(
 					receivedPrompt === expectedPrompt,
 					`prompt mismatch: expected ${JSON.stringify(expectedPrompt)}, got ${JSON.stringify(receivedPrompt)}`,
@@ -327,7 +328,7 @@ async function main(): Promise<void> {
 	}
 
 	add("literal_altered_encoder_sensitivity", "literal_input", "control_sensitivity", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Altered." }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "Altered." }));
 		try {
 			const question = "/help literal";
 			const res = await runUnit1Proof(
@@ -344,7 +345,7 @@ async function main(): Promise<void> {
 			);
 			assert(srv.requests.length === 1, "altered encoder should still run startup cleanly to test byte comparison");
 			const receivedPrompt = extractFirstUserPromptFromLoopback(srv.requests[0]);
-			const canonicalExpected = `${UNIT1_LIMITS.promptPrefix}${question}`;
+			const canonicalExpected = `${HOST_LIMITS.promptPrefix}${question}`;
 			assert(receivedPrompt !== canonicalExpected, "altered encoder must produce predicted byte mismatch");
 			assert(receivedPrompt === question, "expected unprefixed bytes");
 			return {
@@ -359,7 +360,7 @@ async function main(): Promise<void> {
 	});
 
 	add("admission_valid", "admission", "positive", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return {
 					kind: "tool_calls",
@@ -398,7 +399,7 @@ async function main(): Promise<void> {
 		"eof_during_latch",
 	] as const) {
 		add(`admission_${kind}`, "admission", "negative", async () => {
-			const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+			const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 			try {
 				const adapterPath = writeFaultAdapterFixture(fixturesDir, kind);
 				const res = await runUnit1Proof(
@@ -430,7 +431,7 @@ async function main(): Promise<void> {
 	}
 
 	add("admission_record_fail_before_grant", "admission", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 		try {
 			const res = await runUnit1Proof(
 				{
@@ -452,7 +453,7 @@ async function main(): Promise<void> {
 	});
 
 	add("admission_record_fail_after_grant", "admission", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return {
 					kind: "tool_calls",
@@ -483,7 +484,7 @@ async function main(): Promise<void> {
 	});
 
 	add("admission_malformed_ack", "admission", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 		try {
 			const res = await runUnit1Proof(
 				{
@@ -504,7 +505,7 @@ async function main(): Promise<void> {
 	});
 
 	add("admission_replayed_ack", "admission", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return {
 					kind: "tool_calls",
@@ -533,7 +534,7 @@ async function main(): Promise<void> {
 	});
 
 	add("admission_unprotected_guard_sensitivity", "admission", "control_sensitivity", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "UNPROTECTED_REACHED_LOOPBACK" }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "UNPROTECTED_REACHED_LOOPBACK" }));
 		try {
 			const adapterPath = writeFaultAdapterFixture(fixturesDir, "unprotected_guard");
 			const res = await runUnit1Proof(
@@ -558,7 +559,7 @@ async function main(): Promise<void> {
 	});
 
 	add("budget_8_valid_plus_answer", "budget", "positive", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq <= 8) {
 				return {
 					kind: "tool_calls",
@@ -588,7 +589,7 @@ async function main(): Promise<void> {
 	});
 
 	add("budget_8_invalid_then_9th_valid", "budget", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				const calls = [];
 				for (let i = 1; i <= 8; i++) {
@@ -619,7 +620,7 @@ async function main(): Promise<void> {
 	});
 
 	add("budget_8_valid_then_9th_unknown", "budget", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq <= 8) {
 				return {
 					kind: "tool_calls",
@@ -654,7 +655,7 @@ async function main(): Promise<void> {
 	});
 
 	add("budget_duplicate_call_ids", "budget", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return {
 					kind: "tool_calls",
@@ -689,7 +690,7 @@ async function main(): Promise<void> {
 	});
 
 	add("budget_batch_terminated_early", "budget", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				const calls = [];
 				for (let i = 1; i <= 10; i++) {
@@ -729,7 +730,7 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "executed-after-go\\n", "utf8");
 process.stdout.write(JSON.stringify({ ok: true, sentinel: true }) + "\\n");
 process.exit(0);`,
 		);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "bg_1", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -768,7 +769,7 @@ process.exit(0);`,
 			`import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 		);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "bg_rf", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -806,7 +807,7 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 			`import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 		);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "bg_eof", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -844,7 +845,7 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 			`import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 		);
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 		try {
 			const res = await runUnit1Proof(
 				{
@@ -877,7 +878,7 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 			`import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 		);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "bg_rg", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -911,7 +912,7 @@ writeFileSync(${JSON.stringify(sentinelPath)}, "SHOULD_NOT_RUN\\n", "utf8");`,
 	add("before_go_bypass_gate_sensitivity", "before_go", "control_sensitivity", async () => {
 		const sentinelPath = join(fixturesDir, "sentinel-bypass-go.txt");
 		const bypassHelper = writeBypassGoHelperFixture(fixturesDir, sentinelPath);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "bg_byp", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -951,7 +952,7 @@ setInterval(() => {}, 1000);`;
 	add("after_go_native_kills_pi_ignores_term", "after_go", "positive", async () => {
 		const killerBin = writeFaultBinary(fixturesDir, "killer-native.mjs", killerNativeBody);
 		const marker = join(fixturesDir, "killer-started.txt");
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "ag_1", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -975,7 +976,7 @@ setInterval(() => {}, 1000);`;
 			assert(existsSync(marker), "fault native must have started");
 			assert(g !== undefined && g.state === "Closed", `expected group Closed, got ${g?.state}`);
 			assert(g.closure?.kind === "gone", `expected closure gone, got ${g.closure?.kind}`);
-			assert(g.killEscalationMs !== null && g.killEscalationMs <= UNIT1_LIMITS.killGraceMs, `kill escalation took ${g.killEscalationMs}ms > 2000ms`);
+			assert(g.killEscalationMs !== null && g.killEscalationMs <= HOST_LIMITS.killGraceMs, `kill escalation took ${g.killEscalationMs}ms > 2000ms`);
 			const directObs = await observeGroupInProcessTable({ pgid: g.pgid!, knownIdentities: [], monotonicStartMs: performance.now() });
 			assert(directObs.kind === "gone", `direct ps verification failed: ${JSON.stringify(directObs)}`);
 			return {
@@ -991,7 +992,7 @@ setInterval(() => {}, 1000);`;
 	add("after_go_omit_cleanup_sensitivity", "after_go", "control_sensitivity", async () => {
 		const killerBin = writeFaultBinary(fixturesDir, "killer-omit.mjs", killerNativeBody);
 		const marker = join(fixturesDir, "killer-omit-started.txt");
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "ag_omit", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -1043,7 +1044,7 @@ setInterval(() => {}, 1000);`;
 
 	add("after_go_leader_exit_surviving_child", "after_go", "positive", async () => {
 		const leaderExitHelper = writeLeaderExitSurvivingChildHelper(fixturesDir);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "ag_le", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -1066,7 +1067,7 @@ setInterval(() => {}, 1000);`;
 			const g = res.groupObservations[0];
 			assert(g !== undefined && g.state === "Closed", `expected group Closed after leader exit, got ${g?.state}`);
 			assert(g.closure?.kind === "gone", `expected child in PGID gone, got ${g.closure?.kind}`);
-			assert(g.killEscalationMs !== null && g.killEscalationMs <= UNIT1_LIMITS.killGraceMs, `escalation exceeded 2s: ${g.killEscalationMs}`);
+			assert(g.killEscalationMs !== null && g.killEscalationMs <= HOST_LIMITS.killGraceMs, `escalation exceeded 2s: ${g.killEscalationMs}`);
 			return { detail: `Helper leader exited early while child survived; outer killed PGID ${g.pgid} in ${g.killEscalationMs}ms`, result: res, serverRequests: srv.requests };
 		} finally {
 			await srv.close();
@@ -1082,7 +1083,7 @@ setInterval(() => {
 	process.stdout.write("chunk-" + "X".repeat(256) + "\\n");
 }, 20);`,
 		);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "ag_out", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -1106,7 +1107,7 @@ setInterval(() => {
 			const g = res.groupObservations[0];
 			assert(g !== undefined && g.state === "Closed", `expected Closed, got ${g?.state}`);
 			assert(g.closure?.kind === "gone", `expected gone, got ${g.closure?.kind}`);
-			assert(g.killEscalationMs !== null && g.killEscalationMs <= UNIT1_LIMITS.killGraceMs, `escalation exceeded 2s: ${g.killEscalationMs}`);
+			assert(g.killEscalationMs !== null && g.killEscalationMs <= HOST_LIMITS.killGraceMs, `escalation exceeded 2s: ${g.killEscalationMs}`);
 			return { detail: `Pi SIGKILL during output cleaned up streaming native PGID ${g.pgid} in ${g.killEscalationMs}ms`, result: res, serverRequests: srv.requests };
 		} finally {
 			await srv.close();
@@ -1114,7 +1115,7 @@ setInterval(() => {
 	});
 
 	add("obs_agrees_with_ps", "observation", "positive", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "obs_1", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -1141,7 +1142,7 @@ setInterval(() => {
 	});
 
 	add("obs_ps_failure_unknown", "observation", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "obs_f", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -1169,7 +1170,7 @@ setInterval(() => {
 	});
 
 	add("ownership_exclusive_retained", "ownership_and_bounds", "positive", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Retention check." }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "Retention check." }));
 		try {
 			const r1 = await runUnit1Proof(
 				{ caseLabel: "ownership_run_1", evidenceParentDir, question: "First run.", mockBaseUrl: srv.baseUrl },
@@ -1193,7 +1194,7 @@ setInterval(() => {
 	});
 
 	add("ownership_precreated_paths_and_dup_id", "ownership_and_bounds", "negative", async () => {
-		const srv = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "FORBIDDEN" }));
+		const srv = await startSyntheticLoopback(() => ({ kind: "text", text: "FORBIDDEN" }));
 		try {
 			for (const rel of ["APPEND_SYSTEM.md", "SYSTEM.md", "settings.json", "models.json"] as const) {
 				const res = await runUnit1Proof(
@@ -1255,7 +1256,7 @@ setInterval(() => {
 			`process.stdout.write("A".repeat(40000));
 process.exit(0);`,
 		);
-		const srv = await startUnit1LoopbackOpenAI((req) => {
+		const srv = await startSyntheticLoopback((req) => {
 			if (req.seq === 1) {
 				return { kind: "tool_calls", calls: [{ id: "bnd_1", name: "clec", rawArgumentsJson: '{"action":"status"}' }] };
 			}
@@ -1274,7 +1275,7 @@ process.exit(0);`,
 			);
 			const nativeStdoutPath = join(evidenceParentDir, "attempts", rNative.attemptId, "capture", "lease-1.native.stdout.bin");
 			const nativeStdoutSize = statSync(nativeStdoutPath).size;
-			assert(nativeStdoutSize === UNIT1_LIMITS.nativeStdoutBytes, `expected exact prefix ${UNIT1_LIMITS.nativeStdoutBytes}, got ${nativeStdoutSize}`);
+			assert(nativeStdoutSize === HOST_LIMITS.nativeStdoutBytes, `expected exact prefix ${HOST_LIMITS.nativeStdoutBytes}, got ${nativeStdoutSize}`);
 			assert(rNative.uncertified, "overflow must mark uncertified");
 			const rNativeJournal = readFileSync(rNative.rawArtifacts.journalPath, "utf8");
 			assert(rNativeJournal.includes("overflow_uncertified"), "journal must record overflow_uncertified");
@@ -1292,7 +1293,7 @@ process.exit(0);`,
 			);
 			assert(rStderr.rawArtifacts.piStderrPath !== null, "Pi stderr capture must exist");
 			const piStderrSize = statSync(rStderr.rawArtifacts.piStderrPath).size;
-			assert(piStderrSize === UNIT1_LIMITS.piStderrBytes, `expected exact ${UNIT1_LIMITS.piStderrBytes} prefix, got ${piStderrSize}`);
+			assert(piStderrSize === HOST_LIMITS.piStderrBytes, `expected exact ${HOST_LIMITS.piStderrBytes} prefix, got ${piStderrSize}`);
 			assert(rStderr.uncertified, "Pi stderr overflow must mark uncertified");
 
 			const jTestPath = join(fixturesDir, "reserve-test.journal.jsonl");
@@ -1313,7 +1314,7 @@ process.exit(0);`,
 				999,
 				"emergency",
 			);
-			await jWriter.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+			await jWriter.close(performance.now() + HOST_LIMITS.killGraceMs);
 			assert(emergRes.ok, "1 MiB emergency reserve must accept final attempt_closed after normal cap hit");
 
 			const tStall0 = performance.now();
@@ -1359,8 +1360,8 @@ process.exit(0);`,
 	const passedCount = outcomes.filter((o) => o.passed).length;
 	const failedCount = outcomes.length - passedCount;
 	const summary = {
-		certificateNotice: UNIT1_LIMITS.certificateNotice,
-		toolProfile: UNIT1_LIMITS.toolProfile,
+		certificateNotice: HOST_LIMITS.certificateNotice,
+		toolProfile: HOST_LIMITS.toolProfile,
 		matrixRunId,
 		matrixDir,
 		gitHead: gitMeta.head,
@@ -1390,7 +1391,7 @@ function inspectMatrixOwnership(evidenceParentDir: string) {
 	const pids = new Set<number>();
 	const pgids = new Set<number>();
 	for (const file of readdirSync(index)) {
-		const result = JSON.parse(readFileSync(join(index, file), "utf8")) as Partial<ProofRunResult>;
+		const result = JSON.parse(readFileSync(join(index, file), "utf8")) as Partial<AttemptReport>;
 		if (result.piPid) pids.add(result.piPid);
 		for (const group of result.groupObservations ?? []) {
 			if (group.pgid) pgids.add(group.pgid);

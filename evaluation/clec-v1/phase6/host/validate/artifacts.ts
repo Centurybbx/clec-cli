@@ -1,8 +1,8 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { frameRange, parseRawJson, type FrameRange } from "./framing.ts";
-import { sha256Buffer } from "./pins.ts";
-import { UNIT1_LIMITS } from "./types.ts";
+import { frameRange, parseRawJson, type FrameRange } from "../capture/framing.ts";
+import { sha256Buffer } from "../capture/pins.ts";
+import { HOST_LIMITS } from "../contract/types.ts";
 
 export function readEvidence(root: string, path: string, cap: number): Buffer {
 	const parts = path.split("/");
@@ -50,7 +50,7 @@ export function artifactRef(path: string, role: string, bytes: Buffer) {
 	return { path, role, offset: 0, length: bytes.length, sha256: sha256Buffer(bytes) };
 }
 
-export function* frames(bytes: Buffer, cap = UNIT1_LIMITS.controlFrameBytes): Generator<{ value: unknown; range: FrameRange }> {
+export function* frames(bytes: Buffer, cap = HOST_LIMITS.controlFrameBytes): Generator<{ value: unknown; range: FrameRange }> {
 	for (let offset = 0; offset < bytes.length;) {
 		const newline = bytes.indexOf(10, offset);
 		if (newline === -1 || newline - offset + 1 > cap) throw new Error("raw_frame");

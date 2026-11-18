@@ -1,46 +1,64 @@
-# Stage 6B Unit 1 Startup, Admission, and Lifetime Proof Protocol
+# Stage 6B public CLEC host protocol
 
-Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`.
+The host runs synthetic public controls on macOS arm64 with the installed native CLI, its installed Skill, and Pi 1.5.2 over IPv4 loopback. A complete bundle establishes the recorded execution and closure for this profile. Unit 4 preparation is pending independent review. Actual-host evaluation, quality, external provider behavior, and cross-platform support remain separate gates.
 
-This protocol governs only the Unit 1 feasibility proof in `evaluation/clec-v1/phase6/proof-startup/`. It proves startup ordering, nonrejecting provider admission, tool-budget enforcement, pre-GO native group ownership, and bounded raw capture against real installed Pi 1.5.2 and pinned `clec.exe`. It does not emit production run certificates, implement the full six-action CLEC boundary, or open any host-quality, Google-wire, or cross-OS gate.
+## Collection and inspection
 
-## Narrow Unit 1 Tool Profile
+`runner.ts` exposes `collectRun(plan, evidenceParent, publicCorpusDir, fixture)`. It owns the ordered schedule, an exclusive evidence root, an independent plan anchor, attempt execution, and seal publication. The trusted fixture scripts the synthetic HTTP response for each admitted request. Model messages cannot change the schedule, evidence locations, fixture, invocation environment, or attempt identities.
 
-Unit 1 registers one narrow development tool named `clec` with a strict status-only schema:
+`inspectRun(root, expected)` requires commitments from the independent anchor. Both sealing and inspection run the same Closed verifier over retained bytes. Prefix uses the same reducer and permits outstanding obligations while collection progresses. An attempt with pending or unknown capture or closure cannot seal. The summary is a checked projection of raw records. Supplying a new summary digest cannot fix incomplete or contradictory evidence.
 
-- `action`: literal `"status"`
-- `additionalProperties`: `false`
+## CLEC request contract
 
-Unit 4 restores the closed six-action `ClecRequest` contract (`schema`, `help`, `status`, `search`, `read`, `sources`).
+The sole direct tool is `clec`. The runner validates the original tool-start arguments against the committed public IDs and the fields for each action. Pi's own argument coercion grants no permission. The runner builds fixed offline argv and the helper starts the pinned CLI with empty stdin. The request supports these fields.
 
-## Pinned Inputs and Runtime Environment
+| Action | Fields |
+| --- | --- |
+| `schema`, `status` | Optional `maxBytes` |
+| `help` | Required `command` of `top`, `search`, `read`, `sources`, `status`, or `schema` |
+| `search` | One to four `queries`, optional `matchMode`, `limit`, `perWork`, `workId`, `sourceId`, `role`, `dateFrom`, and `dateTo` |
+| `read` passages | One to 50 passage `ids`, optional `context` and `find`. Omit `original` or set it to `false`. |
+| `read` originals | One to 50 source `ids`, required `original: true`, optional `find` |
+| `sources` | Optional `query`, `workId`, `role`, `canonicalOnly`, `limit`, and `offset` |
 
-Every proof run resolves and hashes its closure before launching Pi:
+Every action accepts `maxBytes` from 1 to 32,768. Search limits and per-work caps are 1 to 5. Passage context is 0 to 2. Sources limit is 1 to 100 and offset is 0 to 1,000,000. Query and find values occupy at most 2,048 UTF-8 bytes. They must contain nonblank, well-formed text without NUL or a leading dash after whitespace. Dates use calendar days in `YYYY-MM-DD` form.
+
+Successful output reaches Pi and the next provider request as the exact UTF-8 stdout text. Native errors use a bounded exit and error-code result. Raw stderr is retained separately. The installed CLI's full schema exceeds the 32,768-byte host budget and returns `OUTPUT_BUDGET_TOO_SMALL` at that cap.
+
+## Pinned inputs and runtime environment
+
+Every run resolves and hashes its closure before launching Pi:
 
 - Pinned native CLI binary (`clec.exe`, SHA-256 `083e4f86aad0e2962ea3033304b8f3b3c57b03b208e89311f5b972cbb135b1b7`).
 - Pinned CLEC skill (`SKILL.md`, SHA-256 `66031f09781b0ed95f610e607719bca0967c067a546656d8da83b3dc90d4eb9b`).
 - Pinned Pi 1.5.2 release closure (`dist/bundle/cli.js` SHA-256 `e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774`, bundle chunks, runtime dependencies, and Node executable), excluding user auth and mutable state.
-- Explicit proof source inventory. The pinned TypeScript 5.9.3 parser checks the transitive imports of the runner, controller, Pi adapter, and native helper. Relative imports must resolve to inventoried regular files inside the proof root. Builtins and the adapter's typebox dependency in the pinned Pi tree are allowed. Fixture drivers and their explicitly injected fault adapters exercise the proof under separate control labels.
+- Explicit host source inventory. The pinned TypeScript 5.9.3 parser checks the transitive imports of the runner, Pi adapter, native helper, and offline verifier. Relative imports must resolve to inventoried regular files inside the host root. Builtins and the adapter's typebox dependency in the pinned Pi tree are allowed. Fault drivers and alternate executables run through the isolated entrypoint under `test/`.
 
-The launcher rehashes the current closure against any supplied commitment before allocating an attempt. The collector anchors its plan to the original closure and rehashes again after definitive attempt publication. The closure identifies the installed executables and proof source. System libraries and OS behavior are part of the recorded environment.
+The launcher rehashes the current closure against any supplied commitment before allocating an attempt. The collector anchors its plan to the original closure and rehashes again after definitive attempt publication. The closure identifies the installed executables and host source. System libraries and OS behavior are part of the recorded environment.
 
 Each attempt runs in a freshly created exclusive directory tree (`cwd`, `home`, `agentDir`, `dataDir`, `tmpDir`, `captureDir`) with `NODE_DISABLE_COMPILE_CACHE=1`, scrubbed `NODE_OPTIONS`/`NODE_PATH`/proxy/preload variables, an offline `models.json` pointing only at the loopback OpenAI mock with an inert sentinel `--api-key`, and `settings.json` disabling retries (`retry.enabled: false`, `retry.provider.maxRetries: 0`), auto-compaction (`compaction.enabled: false`), cache warming (`cacheWarming: "off"`), telemetry (`enableInstallTelemetry: false`), and analytics (`enableAnalytics: false`). Pre-existing `APPEND_SYSTEM.md`, `SYSTEM.md`, `settings.json`, or `models.json` paths reject before launch without overwriting.
 
-## Startup Sequence
+The plan binds the installed Skill bytes, prompt profile, tool schema, settings, case schedule, and executable inventory. The system preamble is the UTF-8 installed Skill with trailing whitespace removed, two line feeds, the fixed tool mapping addendum, and a final line feed. Pi appends its pinned cwd section. It runs with Skill discovery disabled.
 
-1. Outer controller spawns Pi with `--mode rpc --no-session --no-extensions -e <adapter> --no-builtin-tools --no-skills --no-prompt-templates --no-themes --no-context-files --offline --provider <provider> --model <model> --thinking <level> --api-key <sentinel>` and inherited private pipes on FD 3 (outer to adapter) and FD 4 (adapter to outer).
-2. Inside `session_start`, `clec-adapter.ts` verifies that active tools equal `["clec"]` and all tools match the expected direct `clec` definition with zero deferred or extra tools. It sends `bound_ready` on FD 4 and waits for a matching `bound_ready_ack` on FD 3 before returning from `session_start`. It never calls or awaits `get_state` inside `session_start`.
+The corpus directory contains the local manifest, compressed database archive, active pointer, and the release-named SQLite database. The host verifies the manifest's hashes and sizes, derives the public index from immutable read-only SQLite, and binds all five commitments to the plan. Evidence retains the corpus and Skill. Each attempt gets its own active pointer and database. The runner checks those bytes before provider admission, before helper launch and GO, and after invocation. Replay checks the retained bytes, admission and postcheck records, fixed invocation, and result pairing. These checks cover the trusted local fixture under the stated ownership model. They provide no guarantee against byte changes restored between observations.
+
+## RPC startup and shutdown
+
+1. Outer controller spawns Pi with `--mode rpc --no-session --no-extensions -e <adapter> --no-builtin-tools --no-skills --no-prompt-templates --no-themes --no-context-files --system-prompt <preamble> --offline --provider <provider> --model <model> --thinking <level> --api-key <sentinel>` and inherited private pipes on FD 3 (outer to adapter) and FD 4 (adapter to outer).
+2. Inside `session_start`, `clec-tool.ts` verifies that active tools equal `["clec"]` and all tools match the expected direct `clec` definition with zero deferred or extra tools. It sends `bound_ready` on FD 4 and waits for a matching `bound_ready_ack` on FD 3 before returning from `session_start`. It never calls or awaits `get_state` inside `session_start`.
 3. Outer commits `bound_ready` and synchronizes through `bound_ready_ack` before sending the ACK. It then sends one correlated RPC `get_state` command on Pi stdin. Outer requires `success: true`, matching `model` and `thinkingLevel`, `isStreaming === false`, `isCompacting === false`, `messageCount === 0`, `pendingMessageCount === 0`, `sessionFile === undefined`, and `autoCompactionEnabled === false`.
 4. After `get_state` succeeds, outer commits `prompt_encoded` and synchronizes through `prompt_sent`. It then sends one correlated RPC `prompt` command whose `message` is `"CLEC public question follows.\n" + literalQuestion`, serialized with `JSON.stringify`.
 5. After observing `prompt` preflight `disposition: "started"`, streaming events, terminal assistant answer, `agent_settled`, and idle `get_state`, outer closes Pi stdin (EOF) and waits for clean process exit and group closure.
 
-## Provider and Tool Admission
+## Provider and tool admission
 
-- Every `before_provider_request` invocation returns a Promise that never rejects and resolves only upon receiving a valid `provider_permit` matching the active attempt, monotonic request sequence, observation watermark, and payload SHA-256 digest. Sync and async errors stay pending inside the promise; outer kills Pi (`SIGTERM` then `SIGKILL` within 2 seconds) on denial, EOF, malformed or replayed ACK, record failure, or deadline.
-- Outer validates the provider payload's model, prompt, tool inventory, and tool JSON schema, commits `provider_candidate` and synchronizes through `provider_grant` before sending `provider_permit`. A journal failure before grant prevents dispatch; a failure after grant closes further admission, kills Pi, and marks the run invalid.
-- `clec-adapter.ts` hooks `tool_execution_start` (which Pi emits before tool lookup and schema validation) and awaits an outer `tool_start_ack` latch on FD 3/4. Outer assigns authoritative ordinals 1..8, rejects duplicate call IDs, enforces serial execution, and denies call 9 without spawning native or granting further provider requests. Outer also reconciles complete declared tool batches from assistant `message_end` events.
+- The nonrejecting `before_provider_request` latch resolves only on a permit matching attempt identity, bridge sequence, observation watermark, and payload digest. Serialization and channel failures leave it pending. The owner stops Pi on denial, EOF, or deadline.
+- The runner verifies the exact loopback request profile and waits for committed preceding turn evidence before admitting the next request. It matches the prompt, sole tool definition, schema, options, and prior tool history. Candidate and grant commit before permit. A case deadline, Pi exit, or bridge failure fences late commits.
+- The runner waits for the raw declaration and reserves a unique call ID before allowing Pi to proceed past `tool_execution_start`. Invalid CLEC requests return a bounded typed rejection. Unknown tool results must match Pi's pinned lookup error. Both consume an attempt and neither launches native.
+- Eight attempts leave the answer request available. An observed ninth start closes provider and native admission. Raw evidence retains the complete declared batch, including unvisited calls. Pi records lookup errors before it publishes result messages for an unknown-only batch. A witnessed ninth denial can stop publication after those lookup errors are captured. Replay pairs reservations, fixed argv, group records, native chunks and exit, result bytes, Pi result messages, and admitted HTTP requests.
+- A replacement requires one observed transport reset before any assistant content or tool request and complete predecessor evidence. It is immediate, for the same case, and subject to one replacement per run.
 
-## Native Group Helper and Ownership
+## Native group helper and ownership
 
 1. Outer arms the case deadline before spawning Pi. It retains the child handle and verifies Pi's identity with an asynchronous process-table sample. A native call arms its own deadline before pin verification, resource allocation, and helper registration.
 2. Outer allocates the native registry entry and exclusively opens capture sinks before spawning the detached helper. The spawn handle supplies provisional PID and PGID ownership. Outer compares `helper_ready` with that handle and verifies the expected PID, PPID, PGID, and start identity in the OS table.
@@ -70,13 +88,14 @@ A bounded asynchronous `/bin/ps` observer runs at most one invocation at a time 
 
 The contract covers trusted inherited POSIX groups on the tested runtime. Retired leases cannot act through stale callbacks. A POSIX PGID is numeric and can be reused between observations and signals. Process start times from `ps` have one-second granularity. OS scheduling and uninterruptible kernel work can prevent timely signals or closure. Supervisor SIGKILL, host death, malicious group escape, and hostile same-account interference are outside the proof.
 
-## Frozen Unit 1 Caps
+## Frozen limits
 
-- Max attempts per attempt run: `8`
+- Max tool attempts per case: `8`
 - Native stdout cap: `32768` bytes
 - Native stderr cap: `8192` bytes
 - Native command deadline: `30` seconds
 - Case deadline: `180` seconds
+- Run deadline: `5400` seconds
 - Answer text cap: `65536` bytes
 - Pi stdout raw events cap: `16777216` bytes (16 MiB)
 - Pi stderr cap: `65536` bytes
@@ -87,3 +106,9 @@ The contract covers trusted inherited POSIX groups on the tested runtime. Retire
 - Signal initiation, observation, and drain cutoff: `2000` ms from trigger
 - Pending raw sink backing: `65536` bytes (64 KiB)
 - Queued private control input per JSONL pipe: at most `16777216` bytes (16 MiB) and `1024` chunks
+
+## Evidence limits
+
+Execution closure identifies the pinned Node, native binary, installed Skill, Pi release tree, observer, source parser, and inventoried host files. The receipt records native and Node linkage on the tested OS. Runtime and corpus hashes attest to observed bytes. The host does not provide an OS sandbox, publisher authentication, or hermetic system-library coverage. Offline inspection assumes the independently retained anchor is trustworthy and cannot detect a trusted writer replacing the complete record and anchor together.
+
+Earlier Unit 1 through 3 reports describe their historical artifacts and source revisions. The migrated controls retain their fault sensitivities and use new exclusive roots. The open Unit 2 P2 replay observation remains recorded in its acceptance report.

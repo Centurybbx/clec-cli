@@ -6,11 +6,11 @@ import { open } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { runUnit1Proof } from "./controller.ts";
-import { startUnit1LoopbackOpenAI } from "./fixtures.ts";
-import { BoundedJournalWriter, BoundedRawSink, byDeadline } from "./framing.ts";
-import { captureExecutionClosure } from "./pins.ts";
-import { armStop, ProcessGroupRegistry, readOsProcessTable } from "./process-group.ts";
+import { runUnit1Proof } from "./attempt.ts";
+import { startSyntheticLoopback } from "./fixtures.ts";
+import { BoundedJournalWriter, BoundedRawSink, byDeadline } from "../capture/framing.ts";
+import { captureExecutionClosure } from "../capture/pins.ts";
+import { armStop, ProcessGroupRegistry, readOsProcessTable } from "../capture/process-group.ts";
 
 const root = fs.mkdtempSync(join(process.argv[2] ?? "/tmp", "clec-deadline-controls-"));
 const log = [];
@@ -422,7 +422,7 @@ async function loopbackCommit(dir, kind, mode) {
     appendFileSync(${JSON.stringify(sentinel)}, "started\\n");
     process.stdout.write("exact stdout £\\n");
   `, { mode: 0o700, flag: "wx" });
-  const server = await startUnit1LoopbackOpenAI((request) => native && request.seq === 1
+  const server = await startSyntheticLoopback((request) => native && request.seq === 1
     ? { kind: "tool_calls", calls: [{ id: "owned-call", name: "clec", rawArgumentsJson: '{"action":"status"}' }] }
     : { kind: "text", text: "Public synthetic answer." });
   const entered = Promise.withResolvers();
@@ -567,7 +567,7 @@ async function wrongReporter(dir) {
     }) + "\\n");
     setInterval(() => {}, 1000);
   `, { flag: "wx" });
-  const server = await startUnit1LoopbackOpenAI(() => ({
+  const server = await startSyntheticLoopback(() => ({
     kind: "tool_calls", calls: [{ id: "wrong-reporter", name: "clec", rawArgumentsJson: '{"action":"status"}' }],
   }));
   const signals = trackSignals([unrelated.pid, -unrelated.pid]);
@@ -685,14 +685,15 @@ async function partialProcessTable(dir) {
 async function bufferedAdapterEof(dir) {
   const adapter = join(dir, "adapter-eof.ts");
   const marker = join(dir, "adapter-finished");
-  const original = fs.readFileSync(join(import.meta.dirname, "clec-adapter.ts"), "utf8");
+  const original = fs.readFileSync(join(import.meta.dirname, "..", "clec-tool.ts"), "utf8")
+    .replace('"./contract/request.ts"', JSON.stringify(join(import.meta.dirname, "..", "contract", "request.ts")));
   const spliceAt = "if (!sent) {\n\t\t\t\t\tpendingPermits";
   const modified = original.replace(spliceAt, `
     setTimeout(() => ctrlOut.end("\\n", () => writeFileSync(${JSON.stringify(marker)}, String(Date.now()))), 90);
     ${spliceAt}`);
   assert.notEqual(modified, original);
   fs.writeFileSync(adapter, 'import { writeFileSync } from "node:fs";\n' + modified, { flag: "wx" });
-  const server = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Public synthetic answer." }));
+  const server = await startSyntheticLoopback(() => ({ kind: "text", text: "Public synthetic answer." }));
   const wire = [];
   let pi;
   let atEof;
@@ -757,7 +758,7 @@ async function bufferedAdapterEof(dir) {
 }
 
 async function indexPublication(dir, fail) {
-  const server = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Public synthetic answer." }));
+  const server = await startSyntheticLoopback(() => ({ kind: "text", text: "Public synthetic answer." }));
   let firstWriteAt;
   let lastWriteAt;
   let writes = 0;
@@ -812,7 +813,7 @@ async function indexPublication(dir, fail) {
 }
 
 async function lateReapDuringPublication(dir) {
-  const server = await startUnit1LoopbackOpenAI(() => ({ kind: "text", text: "Public synthetic answer." }));
+  const server = await startSyntheticLoopback(() => ({ kind: "text", text: "Public synthetic answer." }));
   let pi;
   let kill;
   let reapAt;

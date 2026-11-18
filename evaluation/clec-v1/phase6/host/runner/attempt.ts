@@ -1,5 +1,10 @@
-import { deepEqualJson, settingsBytes, STATUS_CORPUS, STATUS_SCHEMA, SYSTEM_PROMPT, systemPrompt, validateProviderPayload, type AttemptIdentity, type ExpectedCommitments } from "./contract.ts";
-import type { PiProjection } from "./validate.ts";
+import type { AttemptJournalRecord } from "../capture/framing.ts";
+import type { AttemptStatus, AttemptReport, AttemptInput, FaultControls } from "./attempt-types.ts";
+import type { PipeChildToOuter, PipeOuterToChild } from "../clec-tool/protocol.ts";
+import { materializeCorpus, verifyAttemptCorpus, type readPublicCorpus } from "../contract/corpus.ts";
+import { CLEC_TOOL_PARAMETERS_SCHEMA, fixedInvocation, nativeErrorText, parseRequest, requestRejection, type ClecRequest } from "../contract/request.ts";
+import { deepEqualJson, modelsBytes, settingsBytes, systemPrompt, validateProviderPayload, type AttemptIdentity, type ExpectedCommitments } from "../contract.ts";
+import type { PiProjection } from "../validate.ts";
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
@@ -17,7 +22,7 @@ import {
 	writeBoundedFrame,
 	writeExclusiveFile,
 	publishExclusiveIndex,
-} from "./framing.ts";
+} from "../capture/framing.ts";
 import {
 	buildScrubbedChildEnv,
 	captureExecutionClosure,
@@ -25,7 +30,7 @@ import {
 	verifyExecutionClosure,
 	sha256Buffer,
 	verifyFilePin,
-} from "./pins.ts";
+} from "../capture/pins.ts";
 import {
 	armStop,
 	type ArmedStop,
@@ -34,21 +39,14 @@ import {
 	readOsProcessTable,
 	runRegisteredNativeGroup,
 	resolveDefaultHelperPath,
-} from "./process-group.ts";
+} from "../capture/process-group.ts";
 import type {
 	AttemptId,
-	AttemptStatus,
 	GroupLeaseId,
-	PipeChildToOuter,
-	PipeOuterToChild,
-	ProcessObservation,
-	ProofJournalRecord,
-	ProofRunResult,
 	RunId,
 	Sha256Hex,
-	Unit1RunRequest,
-} from "./types.ts";
-import { makeAttemptId, makeGroupLeaseId, makeRunId, UNIT1_LIMITS } from "./types.ts";
+} from "../contract/types.ts";
+import { makeAttemptId, makeGroupLeaseId, makeRunId, HOST_LIMITS } from "../contract/types.ts";
 
 function validateAgentDirPreLaunch(agentDir: string, cwd: string): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
 	const unexpectedInAgent = readdirSync(agentDir);
@@ -63,16 +61,26 @@ function validateAgentDirPreLaunch(agentDir: string, cwd: string): { readonly ok
 }
 
 export function resolveDefaultAdapterPath(): string {
-	return resolve(import.meta.dirname, "clec-adapter.ts");
+	return resolve(import.meta.dirname, "../clec-tool.ts");
 }
 
-export async function runUnit1Proof(
-	request: Unit1RunRequest,
-	options?: { readonly cachedClosure?: ExecutionClosure; readonly evidence?: {
-		readonly anchor: ExpectedCommitments; readonly identity: AttemptIdentity; readonly pi: PiProjection;
-	} },
-): Promise<ProofRunResult> {
-	const closureBefore = options?.cachedClosure
+type AttemptEvidence = {
+	readonly anchor: ExpectedCommitments;
+	readonly identity: AttemptIdentity;
+	readonly pi: PiProjection;
+	readonly corpus: ReturnType<typeof readPublicCorpus>;
+	readonly preamble: string;
+};
+
+export async function runAttempt(
+	request: AttemptInput,
+	options: { readonly cachedClosure?: ExecutionClosure } & (
+		| { readonly evidence: AttemptEvidence; readonly faultControls?: never }
+		| { readonly evidence?: never; readonly faultControls?: FaultControls }
+	),
+): Promise<AttemptReport> {
+	if (options.evidence && options.faultControls) throw new Error("Fault controls are test-only");
+	const closureBefore = options.cachedClosure
 		? verifyExecutionClosure(options.cachedClosure)
 		: captureExecutionClosure();
 	const monotonicStartMs = performance.now();
@@ -80,13 +88,13 @@ export async function runUnit1Proof(
 	const endpoint = new URL(request.mockBaseUrl);
 	if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" ||
 		!endpoint.port || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
-		throw new Error("Unit 1 requires a private IPv4 loopback mock endpoint");
+		throw new Error("The host requires a private IPv4 loopback mock endpoint");
 	}
 
 	const runId = options?.evidence?.anchor.runId ?? makeRunId(`u1-${Date.now()}-${randomBytes(4).toString("hex")}`);
-	const attemptId = options?.evidence?.identity.attemptId ?? request.faults?.duplicateAttemptIdCollision ?? makeAttemptId(`${runId}-a1`);
+	const attemptId = options?.evidence?.identity.attemptId ?? options.faultControls?.duplicateAttemptIdCollision ?? makeAttemptId(`${runId}-a1`);
 
-	const helperPin = closureBefore.unit1Files.find((file) => file.logicalPath === resolveDefaultHelperPath());
+	const helperPin = closureBefore.hostFiles.find((file) => file.logicalPath === resolveDefaultHelperPath());
 	if (!helperPin) throw new Error("Missing pinned native helper");
 
 	const bundleDir = join(request.evidenceParentDir, options?.evidence ? attemptId : runId);
@@ -137,10 +145,10 @@ export async function runUnit1Proof(
 			nowMs(),
 			"emergency",
 		);
-		await collisionJournal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await collisionJournal.close(performance.now() + HOST_LIMITS.killGraceMs);
 		return publishAttemptIndex({
-			certificateNotice: UNIT1_LIMITS.certificateNotice,
-			toolProfile: UNIT1_LIMITS.toolProfile,
+			certificateNotice: HOST_LIMITS.certificateNotice,
+			toolProfile: HOST_LIMITS.toolProfile,
 			runId,
 			attemptId,
 			bundleDir,
@@ -174,19 +182,19 @@ export async function runUnit1Proof(
 		stopOnIoFailure?.(reason);
 	};
 	const journal = new BoundedJournalWriter({
-		path: journalPath, failNextKind: request.faults?.injectJournalFailOnKind,
+		path: journalPath, failNextKind: options.faultControls?.injectJournalFailOnKind,
 		onFailure: ioFailure,
 	});
 	const piSink = (stream: string, path: string, maxBytes: number): BoundedRawSink => new BoundedRawSink({
-		path, maxBytes, stallMs: request.faults?.simulatedSinkStallMs,
+		path, maxBytes, stallMs: options.faultControls?.simulatedSinkStallMs,
 		onOverflow: (bytes) => {
 			ioFailure(`${stream} overflow: ${bytes} > ${maxBytes}`);
 			overflow = { stream, observedBytes: bytes };
 		},
 		onWriteFailure: (err) => ioFailure(`${stream}: ${err.message}`),
 	});
-	const piStdoutSink = piSink("pi_stdout", piStdoutPath, UNIT1_LIMITS.piStdoutBytes);
-	const piStderrSink = piSink("pi_stderr", piStderrPath, UNIT1_LIMITS.piStderrBytes);
+	const piStdoutSink = piSink("pi_stdout", piStdoutPath, HOST_LIMITS.piStdoutBytes);
+	const piStderrSink = piSink("pi_stderr", piStderrPath, HOST_LIMITS.piStderrBytes);
 
 	const providerId = request.providerId ?? "mock-openai";
 	const modelId = request.modelId ?? "mock-gpt";
@@ -194,9 +202,9 @@ export async function runUnit1Proof(
 	const registry = new ProcessGroupRegistry(monotonicStartMs);
 
 	const originalQuestionSha256 = sha256Buffer(Buffer.from(request.question, "utf8"));
-	const encodedPromptText = request.faults?.alterPromptEncoder
-		? request.faults.alterPromptEncoder(request.question)
-		: `${UNIT1_LIMITS.promptPrefix}${request.question}`;
+	const encodedPromptText = options.faultControls?.alterPromptEncoder
+		? options.faultControls.alterPromptEncoder(request.question)
+		: `${HOST_LIMITS.promptPrefix}${request.question}`;
 	const encodedPromptSha256 = sha256Buffer(Buffer.from(encodedPromptText, "utf8"));
 
 	let status: AttemptStatus = "PreWorkInfrastructureFailed";
@@ -212,11 +220,17 @@ export async function runUnit1Proof(
 	const seenDeclaredCallIds = new Set<string>();
 	const seenStartedCallIds = new Set<string>();
 	const reservedCallOrdinals = new Map<string, number>();
+	const executableCalls = new Map<string, { ordinal: number; request: ClecRequest }>();
+	const corpus = options.evidence?.corpus;
+	const corpusPins = corpus && materializeCorpus(dataDir, corpus);
+	const checkCorpus = async (): Promise<void> => {
+		if (corpusPins) await verifyAttemptCorpus(dataDir, corpusPins);
+	};
 
-	if (request.faults?.precreateAgentDirFile) {
+	if (options.faultControls?.precreateAgentDirFile) {
 		writeExclusiveFile(
-			join(agentDir, request.faults.precreateAgentDirFile.relativePath),
-			request.faults.precreateAgentDirFile.content,
+			join(agentDir, options.faultControls.precreateAgentDirFile.relativePath),
+			options.faultControls.precreateAgentDirFile.content,
 		);
 	}
 
@@ -229,12 +243,12 @@ export async function runUnit1Proof(
 			nowMs(),
 			"emergency",
 		);
-		await piStdoutSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		await piStderrSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		await journal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await piStdoutSink.close(performance.now() + HOST_LIMITS.killGraceMs);
+		await piStderrSink.close(performance.now() + HOST_LIMITS.killGraceMs);
+		await journal.close(performance.now() + HOST_LIMITS.killGraceMs);
 		return publishAttemptIndex({
-			certificateNotice: UNIT1_LIMITS.certificateNotice,
-			toolProfile: UNIT1_LIMITS.toolProfile,
+			certificateNotice: HOST_LIMITS.certificateNotice,
+			toolProfile: HOST_LIMITS.toolProfile,
 			runId,
 			attemptId,
 			bundleDir,
@@ -265,34 +279,7 @@ export async function runUnit1Proof(
 		settingsBytes(providerId, modelId, thinkingLevel),
 	);
 
-	writeExclusiveFile(
-		join(agentDir, "models.json"),
-		JSON.stringify(
-			{
-				providers: {
-					[providerId]: {
-						baseUrl: request.mockBaseUrl,
-						api: "openai-completions",
-						apiKey: "clec-unit1-sentinel-key",
-						authHeader: true,
-						models: [
-							{
-								id: modelId,
-								name: "Unit 1 Loopback Mock",
-								reasoning: false,
-								input: ["text"],
-								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-								contextWindow: 128000,
-								maxTokens: 4096,
-							},
-						],
-					},
-				},
-			},
-			null,
-			2,
-		),
-	);
+	writeExclusiveFile(join(agentDir, "models.json"), modelsBytes(providerId, modelId, request.mockBaseUrl));
 
 	await journal.append(
 		{
@@ -303,10 +290,10 @@ export async function runUnit1Proof(
 				caseLabel: request.caseLabel,
 				...(options?.evidence && {
 					plan: options.evidence.anchor.plan, identity: options.evidence.identity,
-					corpusBefore: readdirSync(dataDir).length === 0 ? STATUS_CORPUS : null,
+					corpusBefore: options.evidence.corpus.commitment,
 				}),
-				toolProfile: UNIT1_LIMITS.toolProfile,
-				limits: UNIT1_LIMITS,
+				toolProfile: HOST_LIMITS.toolProfile,
+				limits: HOST_LIMITS,
 				originalQuestionSha256,
 				encodedPromptSha256,
 			},
@@ -332,12 +319,12 @@ export async function runUnit1Proof(
 	);
 
 	if (!(await piStdoutSink.ready) || !(await piStderrSink.ready) || journal.hasFailed) {
-		const deadline = performance.now() + UNIT1_LIMITS.killGraceMs;
+		const deadline = performance.now() + HOST_LIMITS.killGraceMs;
 		await Promise.all([piStdoutSink.close(deadline), piStderrSink.close(deadline), journal.close(deadline)]);
 		throw new Error("Pre-launch capture or journal allocation failed");
 	}
 
-	const adapterPath = request.faults?.adapterPathOverride ?? resolveDefaultAdapterPath();
+	const adapterPath = options.faultControls?.adapterPathOverride ?? resolveDefaultAdapterPath();
 	const piArgs = [
 		closureBefore.piEntryPin.canonicalPath,
 		"--mode",
@@ -351,7 +338,7 @@ export async function runUnit1Proof(
 		"--no-prompt-templates",
 		"--no-themes",
 		"--no-context-files",
-		...(options?.evidence ? ["--system-prompt", SYSTEM_PROMPT] : []),
+		...(options?.evidence ? ["--system-prompt", options.evidence.preamble] : []),
 		"--offline",
 		"--provider",
 		providerId,
@@ -396,21 +383,27 @@ export async function runUnit1Proof(
 	let piExitObservedAt: number | null = null;
 	let piExitResolve: (() => void) | null = null;
 	let captureDrain: DrainResult = { kind: "drained" };
-	let finalCapture: ProofRunResult["finalCapture"];
+	let finalCapture: AttemptReport["finalCapture"];
+	let committedTurns = 0;
+	let resolveTurnCommit: (() => void) | undefined;
+	const committedDeclarations = new Set<string>();
+	let resolveDeclarationCommit: (() => void) | undefined;
 
 	const beginStop = (at = performance.now()): ArmedStop => {
 		if (stopTicket) return stopTicket;
 		admissionClosed = true;
 		const trigger = { at, detectedAt: performance.now() };
 		stopTicket = armStop({ trigger, child: piChild, graceMs: STOP_GRACE_MS.pi });
-		registry.beginStop(trigger, request.faults?.injectOmitNativeTeardown === true);
+		registry.beginStop(trigger, options.faultControls?.injectOmitNativeTeardown === true);
 		nativeAbort.abort();
 		resolveStartupWait?.(false, failureReason ?? "Startup stopped");
 		pendingGetStateResolve?.(null);
 		pendingIdleGetStateResolve?.(null);
 		settledResolve?.();
+		resolveTurnCommit?.();
+		resolveDeclarationCommit?.();
 		piExitResolve?.();
-		groupCleanup = registry.finishStop(request.faults?.injectPsFailure);
+		groupCleanup = registry.finishStop(options.faultControls?.injectPsFailure);
 		return stopTicket;
 	};
 	const terminatePiAndGroups = (reason: string, finalStatus: AttemptStatus, at?: number): void => {
@@ -423,7 +416,7 @@ export async function runUnit1Proof(
 		terminated.resolve();
 	};
 	stopOnIoFailure = (reason) => terminatePiAndGroups(reason, "InvalidEvidence");
-	const caseDeadlineMs = request.faults?.caseDeadlineMsOverride ?? UNIT1_LIMITS.caseDeadlineMs;
+	const caseDeadlineMs = options.faultControls?.caseDeadlineMsOverride ?? HOST_LIMITS.caseDeadlineMs;
 	const caseDeadline = performance.now() + caseDeadlineMs;
 	const caseTimeout = (): void => terminatePiAndGroups(`Case deadline ${caseDeadlineMs} ms exceeded`, "DeniedAndTerminated", caseDeadline);
 	const cancelCaseTimer = scheduleDeadline(caseDeadline, caseTimeout);
@@ -447,12 +440,12 @@ export async function runUnit1Proof(
 		status = "PreWorkInfrastructureFailed";
 		uncertified = true;
 		await journal.append({ runId, attemptId, kind: "attempt_closed", body: { status, reason: failureReason } }, nowMs(), "emergency");
-		await piStdoutSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		await piStderrSink.close(performance.now() + UNIT1_LIMITS.killGraceMs);
-		await journal.close(performance.now() + UNIT1_LIMITS.killGraceMs);
+		await piStdoutSink.close(performance.now() + HOST_LIMITS.killGraceMs);
+		await piStderrSink.close(performance.now() + HOST_LIMITS.killGraceMs);
+		await journal.close(performance.now() + HOST_LIMITS.killGraceMs);
 		return publishAttemptIndex({
-			certificateNotice: UNIT1_LIMITS.certificateNotice,
-			toolProfile: UNIT1_LIMITS.toolProfile,
+			certificateNotice: HOST_LIMITS.certificateNotice,
+			toolProfile: HOST_LIMITS.toolProfile,
 			runId,
 			attemptId,
 			bundleDir,
@@ -524,8 +517,8 @@ export async function runUnit1Proof(
 
 	const rpcReader = attachBoundedJsonlReader<Record<string, unknown>>({
 		stream: rpcOut,
-		maxFrameBytes: UNIT1_LIMITS.controlFrameBytes,
-		maxAggregateBytes: UNIT1_LIMITS.controlAggregateBytes,
+		maxFrameBytes: HOST_LIMITS.controlFrameBytes,
+		maxAggregateBytes: HOST_LIMITS.controlAggregateBytes,
 		label: "pi_rpc_stdout",
 		rawSink: piStdoutSink,
 		onError: (err) => {
@@ -542,6 +535,10 @@ export async function runUnit1Proof(
 				options.evidence.pi.accept(rec);
 				const committed = await journal.append({ runId, attemptId, kind: "pi_frame", body: { ...frame } }, nowMs());
 				if (!committed.ok) return;
+				if (rec.type === "turn_end") {
+					committedTurns = options.evidence.pi.completedTurns;
+					resolveTurnCommit?.();
+				}
 			}
 			if (rec.type === "response") {
 				if (rec.id === "state-1" && rec.command === "get_state") {
@@ -640,15 +637,18 @@ export async function runUnit1Proof(
 						if (!batchCommit.ok) {
 							uncertified = true;
 							terminatePiAndGroups(`tool_declared_batch journal failed: ${batchCommit.error}`, "InvalidEvidence");
+						} else {
+							for (const call of batchCalls) committedDeclarations.add(call.id);
+							resolveDeclarationCommit?.();
 						}
 					}
 					const stopReason = typeof msg.stopReason === "string" ? msg.stopReason : null;
 					terminalAssistantStopReason = stopReason;
 					if (textParts.length > 0 || stopReason === "stop" || stopReason === "error") {
 						const joined = textParts.join("");
-						if (Buffer.byteLength(joined, "utf8") > UNIT1_LIMITS.answerBytes) {
+						if (Buffer.byteLength(joined, "utf8") > HOST_LIMITS.answerBytes) {
 							uncertified = true;
-							terminatePiAndGroups(`Answer text exceeded ${UNIT1_LIMITS.answerBytes} bytes`, "InvalidEvidence");
+							terminatePiAndGroups(`Answer text exceeded ${HOST_LIMITS.answerBytes} bytes`, "InvalidEvidence");
 						} else if (joined.length > 0) {
 							answerText = joined;
 						}
@@ -674,8 +674,8 @@ export async function runUnit1Proof(
 
 	const adapterReader = attachBoundedJsonlReader<PipeChildToOuter>({
 		stream: pipeFromAdapter,
-		maxFrameBytes: UNIT1_LIMITS.controlFrameBytes,
-		maxAggregateBytes: UNIT1_LIMITS.controlAggregateBytes,
+		maxFrameBytes: HOST_LIMITS.controlFrameBytes,
+		maxAggregateBytes: HOST_LIMITS.controlAggregateBytes,
 		label: "adapter_private_pipe",
 		onError: (err) => {
 			uncertified = true;
@@ -720,7 +720,7 @@ export async function runUnit1Proof(
 						msg.allTools[0].name === "clec" &&
 						msg.allTools[0].exposure === "direct" &&
 						msg.deferredTools.length === 0 &&
-						deepEqualJson(msg.allTools[0].parameters, STATUS_SCHEMA) &&
+						deepEqualJson(msg.allTools[0].parameters, CLEC_TOOL_PARAMETERS_SCHEMA) &&
 						msg.model?.provider === providerId &&
 						msg.model?.id === modelId;
 					if (!validTools) {
@@ -765,7 +765,7 @@ export async function runUnit1Proof(
 					if (!releaseAllowed()) return;
 					expectedOuterWatermark = msg.seq;
 					boundReadySeen = true;
-					writeBoundedFrame(pipeToAdapter, ack, UNIT1_LIMITS.controlFrameBytes);
+					writeBoundedFrame(pipeToAdapter, ack, HOST_LIMITS.controlFrameBytes);
 					resolveStartupWait?.(true);
 					break;
 				}
@@ -780,7 +780,7 @@ export async function runUnit1Proof(
 						return;
 					}
 					const actualDigest = sha256Buffer(Buffer.from(msg.payloadJson, "utf8"));
-					if (actualDigest !== msg.payloadDigest) {
+					if (actualDigest !== msg.payloadDigest || Buffer.byteLength(msg.payloadJson) !== msg.payloadByteLength) {
 						providerRequestsDenied += 1;
 						terminatePiAndGroups("Provider payload digest mismatch", "DeniedAndTerminated");
 						await journal.append(
@@ -803,11 +803,16 @@ export async function runUnit1Proof(
 						);
 						return;
 					}
+					if (options.evidence && committedTurns < providerRequestsGranted) {
+						await new Promise<void>(resolve => { resolveTurnCommit = resolve; });
+						resolveTurnCommit = undefined;
+						if (!releaseAllowed()) return;
+					}
 					const payloadValidation = validateProviderPayload({
 						payloadJson: msg.payloadJson,
 						expectedModelId: modelId,
 						expectedEncodedPrompt: encodedPromptText,
-						expectedSystemPrompt: options?.evidence ? systemPrompt(cwd) : undefined,
+						expectedSystemPrompt: options?.evidence ? systemPrompt(cwd, options.evidence.preamble) : undefined,
 					});
 					if (!payloadValidation.ok) {
 						providerRequestsDenied += 1;
@@ -824,6 +829,9 @@ export async function runUnit1Proof(
 						return;
 					}
 
+					options.evidence?.pi.checkProviderPrefix(msg.payloadJson);
+					await checkCorpus();
+					if (!releaseAllowed()) return;
 					const candCommit = await journal.append(
 						{
 							runId,
@@ -856,6 +864,7 @@ export async function runUnit1Proof(
 								watermark: msg.watermark,
 								payloadDigest: msg.payloadDigest,
 								attemptsUsedSoFar: attemptOrdinal,
+								...(corpus && { corpus: corpus.commitment }),
 							},
 						},
 						nowMs(), "durable",
@@ -877,7 +886,7 @@ export async function runUnit1Proof(
 
 					if (!releaseAllowed()) return;
 
-					if (request.faults?.injectMalformedPermitAck) {
+					if (options.faultControls?.injectMalformedPermitAck) {
 						providerRequestsDenied += 1;
 						pipeToAdapter.write('{"kind":"provider_permit","seq":999999,"bad":true}\n', "utf8");
 						setTimeout(() => {
@@ -885,9 +894,9 @@ export async function runUnit1Proof(
 						}, 80);
 						return;
 					}
-					if (request.faults?.injectReplayedPermitAck && lastPermitAck !== null) {
+					if (options.faultControls?.injectReplayedPermitAck && lastPermitAck !== null) {
 						providerRequestsDenied += 1;
-						writeBoundedFrame(pipeToAdapter, lastPermitAck, UNIT1_LIMITS.controlFrameBytes);
+						writeBoundedFrame(pipeToAdapter, lastPermitAck, HOST_LIMITS.controlFrameBytes);
 						setTimeout(() => {
 							terminatePiAndGroups("Injected replayed permit ACK", "DeniedAndTerminated");
 						}, 80);
@@ -895,12 +904,13 @@ export async function runUnit1Proof(
 					}
 
 					lastPermitAck = permit;
+					await checkCorpus();
 					if (!releaseAllowed()) return;
 					expectedOuterWatermark = msg.seq;
 					providerRequestsGranted += 1;
-					writeBoundedFrame(pipeToAdapter, permit, UNIT1_LIMITS.controlFrameBytes);
+					writeBoundedFrame(pipeToAdapter, permit, HOST_LIMITS.controlFrameBytes);
 
-					if (request.faults?.injectJournalFailAfterGrant) {
+					if (options.faultControls?.injectJournalFailAfterGrant) {
 						journal.setFailOnKind("tool_declared_batch");
 					}
 					const permitSentCommit = await journal.append(
@@ -935,9 +945,21 @@ export async function runUnit1Proof(
 						);
 						return;
 					}
+					if (options.evidence) {
+						if (!committedDeclarations.has(msg.callId)) {
+							await new Promise<void>(resolve => { resolveDeclarationCommit = resolve; });
+							resolveDeclarationCommit = undefined;
+							if (!releaseAllowed()) return;
+						}
+						if (!committedDeclarations.has(msg.callId) ||
+							!options.evidence.pi.matchesDeclaration(msg.callId, msg.toolName, msg.args)) {
+							throw new Error("Tool start differs from the raw declaration");
+						}
+					}
 					seenStartedCallIds.add(msg.callId);
 					attemptOrdinal += 1;
-					if (attemptOrdinal > UNIT1_LIMITS.maxAttempts) {
+					reservedCallOrdinals.set(msg.callId, attemptOrdinal);
+					if (attemptOrdinal > HOST_LIMITS.maxAttempts) {
 						terminatePiAndGroups(
 							`Attempt budget exceeded at ordinal ${attemptOrdinal} (${msg.toolName})`,
 							"DeniedAndTerminated",
@@ -950,9 +972,9 @@ export async function runUnit1Proof(
 								body: {
 									reason: "attemptBudgetExceeded",
 									ordinal: attemptOrdinal,
-									maxAttempts: UNIT1_LIMITS.maxAttempts,
+									maxAttempts: HOST_LIMITS.maxAttempts,
 									callId: msg.callId,
-									toolName: msg.toolName,
+									toolName: msg.toolName, args: msg.args, bridgeSeq: msg.seq,
 								},
 							},
 							nowMs(),
@@ -963,17 +985,24 @@ export async function runUnit1Proof(
 						}
 						return;
 					}
-					reservedCallOrdinals.set(msg.callId, attemptOrdinal);
 					const existingDeclared = declaredToolCalls.find((d) => d.id === msg.callId);
 					if (existingDeclared) {
 						(existingDeclared as { ordinal: number | null }).ordinal = attemptOrdinal;
 					}
+					const parsed = msg.toolName === "clec" ? parseRequest(msg.args, corpus?.index ?? {
+						release: sha256Buffer(""), workIds: new Set(), sourceIds: new Set(), passageIds: new Set(),
+					}) : null;
+					const rejection = parsed?.ok === false ? requestRejection(parsed) : undefined;
+					if (parsed?.ok) executableCalls.set(msg.callId, { ordinal: attemptOrdinal, request: parsed.request });
 					const reserveCommit = await journal.append(
 						{
 							runId,
 							attemptId,
 							kind: "tool_start_reserved",
-							body: { ordinal: attemptOrdinal, callId: msg.callId, toolName: msg.toolName, bridgeSeq: msg.seq },
+							body: {
+								ordinal: attemptOrdinal, callId: msg.callId, toolName: msg.toolName, bridgeSeq: msg.seq,
+								args: msg.args, rejection: parsed === null ? "UNKNOWN_TOOL" : rejection ?? null,
+							},
 						},
 						nowMs(), "durable",
 					);
@@ -991,25 +1020,29 @@ export async function runUnit1Proof(
 							seq: msg.seq,
 							callId: msg.callId,
 							allowed: true,
-							ordinal: attemptOrdinal,
+							ordinal: attemptOrdinal, rejection,
 						} satisfies PipeOuterToChild,
-						UNIT1_LIMITS.controlFrameBytes,
+						HOST_LIMITS.controlFrameBytes,
 					);
 					break;
 				}
 				case "tool_execute": {
-					const ordinal = reservedCallOrdinals.get(msg.callId);
-					if (ordinal === undefined || ordinal > UNIT1_LIMITS.maxAttempts || admissionClosed) {
+					const reserved = executableCalls.get(msg.callId);
+					if (!reserved || msg.toolName !== "clec" || admissionClosed) {
 						terminatePiAndGroups(`Unauthorized tool_execute for callId=${msg.callId}`, "DeniedAndTerminated");
 						return;
 					}
-					const leaseId = makeGroupLeaseId(`lease-${ordinal}`);
-					const execPath = request.faults?.nativeExecOverride ?? closureBefore.nativePin.canonicalPath;
-					const argv = request.faults?.nativeArgsOverride
-						? request.faults.nativeArgsOverride.map((arg) =>
+					executableCalls.delete(msg.callId);
+					const leaseId = makeGroupLeaseId(`lease-${reserved.ordinal}`);
+					const invocation = fixedInvocation(reserved.request, {
+						nativePath: closureBefore.nativePin.canonicalPath, dataDir, release: corpus?.commitment.release ?? sha256Buffer(""),
+					});
+					const execPath = options.faultControls?.nativeExecOverride ?? invocation.execPath;
+					const argv = options.faultControls?.nativeArgsOverride
+						? options.faultControls.nativeArgsOverride.map((arg) =>
 								arg === "__PI_PID__" ? String(piChild?.pid ?? -1) : arg,
 						  )
-						: ["--data-dir", dataDir, "--offline", "--json", "status"];
+						: invocation.argv;
 
 					const outcome = await runRegisteredNativeGroup({
 						registry,
@@ -1022,19 +1055,22 @@ export async function runUnit1Proof(
 						cwd,
 						execPath,
 						argv,
-						helperPath: request.faults?.helperPathOverride,
+						helperPath: options.faultControls?.helperPathOverride,
+						corpusBefore: corpus?.commitment,
+						executeSeq: msg.seq,
 						verifyLaunch: async () => {
+							await checkCorpus();
 							await verifyFilePin(closureBefore.nodePin);
-							if (!request.faults?.helperPathOverride) await verifyFilePin(helperPin);
-							if (!request.faults?.nativeExecOverride) await verifyFilePin(closureBefore.nativePin);
+							if (!options.faultControls?.helperPathOverride) await verifyFilePin(helperPin);
+							if (!options.faultControls?.nativeExecOverride) await verifyFilePin(closureBefore.nativePin);
 						},
-						nativeSentinelPath: request.faults?.nativeSentinelPath,
+						nativeSentinelPath: options.faultControls?.nativeSentinelPath,
 						journal,
 						monotonicStartMs,
-						deadlineMs: request.faults?.nativeDeadlineMsOverride ?? UNIT1_LIMITS.nativeDeadlineMs,
+						deadlineMs: options.faultControls?.nativeDeadlineMsOverride ?? HOST_LIMITS.nativeDeadlineMs,
 						abortSignal: nativeAbort.signal,
-						skipGoAndCloseHelper: request.faults?.injectSkipGoAndCloseHelper,
-						onKillPiBetweenRegAndGo: request.faults?.injectKillPiBetweenRegAndGo
+						skipGoAndCloseHelper: options.faultControls?.injectSkipGoAndCloseHelper,
+						onKillPiBetweenRegAndGo: options.faultControls?.injectKillPiBetweenRegAndGo
 							? async () => {
 									if (piChild && typeof piChild.pid === "number") {
 										try {
@@ -1046,7 +1082,7 @@ export async function runUnit1Proof(
 									}
 							  }
 							: undefined,
-						onNativeFirstChunk: request.faults?.injectKillPiDuringNativeOutput
+						onNativeFirstChunk: options.faultControls?.injectKillPiDuringNativeOutput
 							? () => {
 									if (piChild && typeof piChild.pid === "number") {
 										try {
@@ -1063,7 +1099,7 @@ export async function runUnit1Proof(
 						},
 						onSinkFailure: (stream, err) => ioFailure(`${stream}: ${err.message}`),
 						onInvalidStdout: () => ioFailure("Successful native stdout is invalid UTF-8"),
-						sinkStallMs: request.faults?.simulatedSinkStallMs,
+						sinkStallMs: options.faultControls?.simulatedSinkStallMs,
 						onFatal: (reason, at) => terminatePiAndGroups(reason, "DeniedAndTerminated", at),
 					});
 					if (!releaseAllowed()) return;
@@ -1071,18 +1107,21 @@ export async function runUnit1Proof(
 					if (!entry) throw new Error("Native lease was not reserved");
 					const at = performance.now();
 					registry.beginOne(entry, { at, detectedAt: at });
-					await registry.finishOne(entry, request.faults?.injectPsFailure);
+					await registry.finishOne(entry, options.faultControls?.injectPsFailure);
 					if (!releaseAllowed()) return;
 					if (entry.state !== "Closed" || entry.stop?.evidence.drain?.kind !== "drained") {
 						ioFailure("Native closure or drain is incomplete");
 						return;
 					}
 
+					await checkCorpus();
+					await verifyFilePin(closureBefore.nativePin);
+					if (!releaseAllowed()) return;
 					const toolResultText = outcome.ok
 						? outcome.stdoutText
-						: JSON.stringify({ ok: false, error: outcome.errorMessage ?? outcome.stderrText });
+						: nativeErrorText(outcome.exitCode, outcome.stderrText);
 
-					await journal.append(
+					const delivery = await journal.append(
 						{
 							runId,
 							attemptId,
@@ -1091,15 +1130,16 @@ export async function runUnit1Proof(
 								leaseId,
 								callId: msg.callId,
 								isError: !outcome.ok,
-								stdoutBytes: Buffer.byteLength(outcome.stdoutText, "utf8"),
+								stdoutBytes: entry.stdoutSink.bytesWritten,
 								resultSha256: sha256Buffer(toolResultText),
-								stderrBytes: Buffer.byteLength(outcome.stderrText, "utf8"),
+								stderrBytes: entry.stderrSink.bytesWritten,
+								...(corpus && { corpusAfter: corpus.commitment, nativeSha256: closureBefore.nativePin.sha256 }),
 							},
 						},
-						nowMs(),
+						nowMs(), "durable",
 					);
 
-					if (!releaseAllowed()) return;
+					if (!delivery.ok || !releaseAllowed()) return;
 					writeBoundedFrame(
 						pipeToAdapter,
 						{
@@ -1109,7 +1149,7 @@ export async function runUnit1Proof(
 							isError: !outcome.ok,
 							text: toolResultText,
 						} satisfies PipeOuterToChild,
-						UNIT1_LIMITS.controlFrameBytes,
+						HOST_LIMITS.controlFrameBytes,
 					);
 					break;
 				}
@@ -1118,7 +1158,7 @@ export async function runUnit1Proof(
 	});
 
 	const driveRpc = async (): Promise<void> => {
-		if (request.faults?.injectKillPiBeforeReady && typeof pi.pid === "number") {
+		if (options.faultControls?.injectKillPiBeforeReady && typeof pi.pid === "number") {
 			try {
 				process.kill(pi.pid, "SIGKILL");
 			} catch {
@@ -1126,8 +1166,8 @@ export async function runUnit1Proof(
 			}
 		}
 
-		if (!request.faults?.bypassReadyCheck) {
-			const startupTimeoutMs = request.faults?.startupTimeoutMsOverride ?? UNIT1_LIMITS.startupTimeoutMs;
+		if (!options.faultControls?.bypassReadyCheck) {
+			const startupTimeoutMs = options.faultControls?.startupTimeoutMsOverride ?? HOST_LIMITS.startupTimeoutMs;
 			const readyOk = await new Promise<{ readonly ok: boolean; readonly reason?: string }>((res) => {
 				const timer = setTimeout(() => {
 					resolveStartupWait = null;
@@ -1172,7 +1212,7 @@ export async function runUnit1Proof(
 				res(null);
 				return;
 			}
-			writeBoundedFrame(rpcIn, { id: "state-1", type: "get_state" }, UNIT1_LIMITS.controlFrameBytes);
+			writeBoundedFrame(rpcIn, { id: "state-1", type: "get_state" }, HOST_LIMITS.controlFrameBytes);
 		});
 
 		if (!getStateRes || getStateRes.success !== true) {
@@ -1246,7 +1286,7 @@ export async function runUnit1Proof(
 		writeBoundedFrame(
 			rpcIn,
 			{ id: "prompt-1", type: "prompt", message: encodedPromptText },
-			UNIT1_LIMITS.controlFrameBytes,
+			HOST_LIMITS.controlFrameBytes,
 		);
 
 		await new Promise<void>((res) => {
@@ -1270,7 +1310,7 @@ export async function runUnit1Proof(
 					clearTimeout(timer);
 					res(r);
 				};
-				writeBoundedFrame(rpcIn, { id: "state-end", type: "get_state" }, UNIT1_LIMITS.controlFrameBytes);
+				writeBoundedFrame(rpcIn, { id: "state-end", type: "get_state" }, HOST_LIMITS.controlFrameBytes);
 			});
 			const idleData = (idleRes?.data ?? {}) as Record<string, unknown>;
 			const isIdle =
@@ -1291,7 +1331,7 @@ export async function runUnit1Proof(
 				const t = setTimeout(() => {
 					piExitResolve = null;
 					res();
-				}, UNIT1_LIMITS.killGraceMs);
+				}, HOST_LIMITS.killGraceMs);
 				piExitResolve = () => {
 					clearTimeout(t);
 					piExitResolve = null;
@@ -1357,7 +1397,7 @@ export async function runUnit1Proof(
 		evidence.drain = drained;
 		adapterReader.stop();
 		if (reaped.kind === "timeout" || (evidence.reapedAt ?? Infinity) > evidence.observationDeadline ||
-			drained.kind === "incomplete" || !boundReadySeen || request.faults?.bypassReadyCheck || journal.hasFailed) {
+			drained.kind === "incomplete" || !boundReadySeen || options.faultControls?.bypassReadyCheck || journal.hasFailed) {
 			uncertified = true;
 		}
 		const missedSignal = (e: ArmedStop["evidence"]): boolean => e.killAttemptAt !== null && e.killAttemptAt > e.signalDeadline;
@@ -1371,7 +1411,7 @@ export async function runUnit1Proof(
 		}
 		if (uncertified) status = invalidateAnswer(status);
 		const recordCleanup = async (): Promise<boolean> => {
-			const record = async (kind: ProofJournalRecord["kind"], body: Record<string, unknown>): Promise<boolean> => {
+			const record = async (kind: AttemptJournalRecord["kind"], body: Record<string, unknown>): Promise<boolean> => {
 				if (performance.now() >= evidence.drainDeadline) return false;
 				return (await journal.append({ runId, attemptId, kind, body }, nowMs(), "emergency")).ok;
 			};
@@ -1419,9 +1459,9 @@ export async function runUnit1Proof(
 		closure: entry.closure,
 	}));
 
-	const result: ProofRunResult = {
-		certificateNotice: UNIT1_LIMITS.certificateNotice,
-		toolProfile: UNIT1_LIMITS.toolProfile,
+	const result: AttemptReport = {
+		certificateNotice: HOST_LIMITS.certificateNotice,
+		toolProfile: HOST_LIMITS.toolProfile,
 		runId,
 		attemptId,
 		bundleDir,
@@ -1453,7 +1493,7 @@ export async function runUnit1Proof(
 	return publishAttemptIndex(result);
 }
 
-async function publishAttemptIndex(result: ProofRunResult): Promise<ProofRunResult> {
+async function publishAttemptIndex(result: AttemptReport): Promise<AttemptReport> {
 	const snapshot = structuredClone(result);
 	try {
 		await publishExclusiveIndex(snapshot.indexEntryPath, JSON.stringify(snapshot, null, 2));

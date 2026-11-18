@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
-import { observeGroupInProcessTable, readOsProcessTable } from "./process-group.ts";
+import { observeGroupInProcessTable, readOsProcessTable } from "../capture/process-group.ts";
 
 const valid = "123 1 123 Tue Nov 17 23:00:00 2026 native-child\n";
 

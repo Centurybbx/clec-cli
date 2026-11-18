@@ -7,12 +7,12 @@ import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { setImmediate as nextTurn } from "node:timers/promises";
-import { frames } from "./artifacts.ts";
-import { runUnit1Proof } from "./controller.ts";
-import { startUnit1LoopbackOpenAI, writeFaultBinary } from "./fixtures.ts";
-import { attachBoundedJsonlReader, writeExclusiveFile } from "./framing.ts";
-import { captureExecutionClosure, sha256Buffer } from "./pins.ts";
-import { UNIT1_LIMITS as L } from "./types.ts";
+import { frames } from "../validate/artifacts.ts";
+import { runUnit1Proof } from "./attempt.ts";
+import { startSyntheticLoopback, writeFaultBinary } from "./fixtures.ts";
+import { attachBoundedJsonlReader, writeExclusiveFile } from "../capture/framing.ts";
+import { captureExecutionClosure, sha256Buffer } from "../capture/pins.ts";
+import { HOST_LIMITS as L } from "../contract/types.ts";
 
 const root = fs.mkdtempSync(join(process.argv[2] ?? "/tmp", "clec-unit3-capture-"));
 const closure = captureExecutionClosure();
@@ -42,7 +42,7 @@ function observe(knownPids = pids, knownPgids = pgids) {
 async function attempt(name, { faults = {}, text, tool = false } = {}) {
 	const dir = join(root, name);
 	fs.mkdirSync(dir, { mode: 0o700 });
-	const server = await startUnit1LoopbackOpenAI(({ seq }) => tool && seq === 1
+	const server = await startSyntheticLoopback(({ seq }) => tool && seq === 1
 		? { kind: "tool_calls", calls: [{ id: "capture-status", name: "clec", rawArgumentsJson: '{"action":"status"}' }] }
 		: { kind: "text", text: text ?? "Synthetic capture answer." });
 	try {
@@ -196,7 +196,7 @@ function floodFixture(name, stream, block, repeats) {
 	writeExclusiveFile(path, `
 		import { once } from "node:events";
 		import { Writable } from "node:stream";
-		import realAdapter from ${JSON.stringify(join(import.meta.dirname, "clec-adapter.ts"))};
+		import realAdapter from ${JSON.stringify(join(import.meta.dirname, "..", "clec-tool.ts"))};
 		export default function (pi) {
 			realAdapter(pi);
 			process.on("SIGTERM", () => {});
