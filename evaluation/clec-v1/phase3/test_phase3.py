@@ -29,6 +29,19 @@ import bench
 import eval as phase3_eval
 import projection
 import score
+import verify_local
+
+
+class LocalVerificationTest(unittest.TestCase):
+    def test_compare_requires_the_same_initial_search_for_each_question(self) -> None:
+        outcome = {"id": "question", "steps": [{"step": "search", "stdoutUtf8": "{}"}]}
+        report = {"perQuestion": [{"id": "question", "status": "completed"}]}
+        self.assertEqual(verify_local.paired_changes(report, report, [outcome], [outcome]), [])
+        changed = {"id": "question", "steps": [{"step": "search", "stdoutUtf8": "[]"}]}
+        with self.assertRaisesRegex(ValueError, "Initial search observations differ"):
+            verify_local.paired_changes(report, report, [outcome], [changed])
+        with self.assertRaisesRegex(ValueError, "Question coverage differs"):
+            verify_local.paired_changes(report, {"perQuestion": []}, [outcome], [outcome])
 
 
 class _CliStepDict(TypedDict):

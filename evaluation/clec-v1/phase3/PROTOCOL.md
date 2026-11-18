@@ -8,6 +8,8 @@ Phase 3 scaffold and synthetic correctness fixtures verify the evaluation harnes
 
 Do not modify `native/` retrieval behavior or ranking parameters while scaffolding this harness.
 
+Use [the local verification guide](LOCAL-VERIFICATION.md) to rerun development cases on a full corpus and compare a change against a saved baseline.
+
 ## Annotation JSON contract (`schemaVersion: 1`)
 
 The evaluator accepts JSON datasets matching this schema:
