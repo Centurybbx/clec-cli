@@ -1,8 +1,44 @@
 # Stage 6B Unit 1 feasibility proof report
 
-Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. The Stage 6B Unit 1 deadline correction is implemented and author-verified at clean source commit `cae3ac5d8d608909ffb1ef3358bef63d0ea98f1e`. Fresh independent GPT 6.2 Astra review is pending. Units 2 through 4 remain gated.
+Status is `PROOF_ONLY`, `NOT_A_COMPLETE_RUN_CERTIFICATE`. This candidate repairs the four authority failures in Stage 6B Unit 1 of the six-stage CLEC plan. The tested proof source is `55207fb0fb2be8de7505857aeb5fae8394ac9626`. Fresh independent GPT 6.2 Astra review is required before parent integration or work on Units 2 through 4.
 
-## Deadline correction
+## Authority repairs
+
+- Group retirement requires a fresh process table, stable known identities, a reaped leader, and `ESRCH` from signal 0 to the owned negative PGID. Table omissions and probe failures keep escalation armed. The stop ticket ignores stale callbacks after retirement. POSIX PGID reuse between observations and signals remains a kernel identity limitation.
+- Pipe ingestion reads independently of the one ordered policy consumer. Each pipe queues at most 16 MiB of independently backed bytes and 1,024 input chunks. Node pipe input, the current frame, and decoding have separate bounds. EOF, stream errors, and overflow close the admission epoch during a pending journal write. Release still requires the durable commit and the final epoch check.
+- Index publication runs after cleanup. The controller writes and synchronizes an exclusive staging file, then publishes it using an exclusive hard link. The final entry uses the returned result shape, including for early terminal returns. A write failure leaves no final index for that attempt and returns `InvalidEvidence` with the publication error. Publication completion is outside the two-second cleanup budget.
+- Each raw sink detaches a bounded payload before awaiting file I/O. Callers split larger reads, and native stdout and stderr assemble into fixed-size capped buffers. The sink reports the backing bytes it retains. [Protocol](../../../evaluation/clec-v1/phase6/proof-startup/PROTOCOL.md)
+
+## Verification of the authority repairs
+
+The prepared parent was `6886ff11b89564337cebca54e956d0841558afa2`. Normal cherry-picks brought in deadline implementation `05a7405` and its report `ae87ffb`. The clean source run passed **45 matrix controls**, **7 process-observation tests**, **9 framing tests**, and **23 deadline controls**. Three additional injected `datasync` failures prevented provider permit or GO. TypeScript 5.9.3 checked all scoped TypeScript sources with zero diagnostics under pinned Node 25.7.0. The invocation uses the pinned Pi installation's Node type directory.
+
+| Control | Independent result before repair | Result at tested source |
+| --- | --- | --- |
+| Line-aligned successful process table prefix omitted a live group | Closed after leader reap. Direct `ps` found a surviving descendant after grace. | The leader reaped before SIGKILL. The owner called SIGKILL at 403.01 ms from trigger. Direct `ps` then found no matching group or PID. |
+| Buffered adapter EOF with grant and post-send delays | The outer sent a permit after the peer finished. The post-send delay allowed one actual loopback request. | Pi was live when the outer observed EOF, 357.73 ms before the held grant write resumed. The wire had no permit and the server received zero requests. |
+| Slow and failed final index publication | The delayed write left an `Answered` index after returning `InvalidEvidence`. | The delayed write took 2350.46 ms, then the returned and indexed `Answered` results matched. A separate error after seven written bytes left the index directory empty. |
+| Stalled write of a slice backed by 4 MiB | The stalled sink retained the full 4 MiB and reported 64 KiB. | Forced GC collected the original backing during the stall. The pending write retained 64 KiB and wrote exactly the expected bytes. Oversized logical input was rejected. |
+
+Both real asynchronous FIFO writes remained blocked for over 2.2 seconds and returned Incomplete drain while the owner invoked SIGKILL on schedule. The corresponding old synchronous paths exceeded the 2-second signal cutoff. Positive permit and GO controls waited for actual data synchronization. They observed one provider request or one native start and the following result request. The retired-lease test delivered the captured stale callback after grace and observed no signal to the later group.
+
+The first local matrix run caught a regression when observation waited for all capture. The final implementation reports live survivors while capture is pending, then requires fresh evidence before retiring an absent group. The final omitted-teardown control detected both survivors and explicitly cleaned up its group. A fresh direct `/bin/ps` scan on 2026-11-18T00:32:36.026497+00:00 found zero survivors across 154 recorded PIDs and 60 PGIDs.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| [Matrix receipt](/tmp/clec-unit1-final.VSBXV2/matrix-1794961822422-11212742/matrix-receipt.json) | `2543bbd0d01128055f480ae273aa962aa15735a711205e969b214474bc0e8913` |
+| [Deadline receipt](/tmp/clec-unit1-final.VSBXV2/clec-deadline-controls-b6ch6c/receipt.json) | `e9054f5b49dbed4c4fdbfd1fa54d61b5761d07ba8a979fa2a4f0494bd76fe4a0` |
+| [Process observation results](/tmp/clec-unit1-final.VSBXV2/parser.log) | `2e842a7545c1f2738ffd7e9960f9d59ee4db23eec4a03f4f9b30ec1078fe8686` |
+| [Framing results](/tmp/clec-unit1-final.VSBXV2/framing.log) | `ed06ac9f0af3f20aee1c5432ec8c0a2a7861d2bab61117beac5376f5131bdf44` |
+| [TypeScript results](/tmp/clec-unit1-final.VSBXV2/typecheck.log) | `81e013dcc4d57b1e3ac2d36e567e623322b2bee63cbe7b0ff09ceb39fec3e0a5` |
+| [Direct survivors scan](/tmp/clec-unit1-final.VSBXV2/survivors.json) | `87bd46f381c0304169f16fedc22a7ae63065ad239a73ad0a20c6514a8ca9f35d` |
+| [Source hash manifest](/tmp/clec-unit1-final.VSBXV2/source.sha256) | `97bfd8f4eaf53a2252eb158bd63906a2e96dae5556299c4c81b10da79ce54eab` |
+| [Additional datasync failures](/tmp/clec-unit1-final.VSBXV2/sync.log) | `ba9a6eec654e2906b41317b5afc4c89e72ecaaf410d0f124588f5bd46668b5db` |
+| [Raw partial-write error](/tmp/clec-unit1-final.VSBXV2/raw-partial.log) | `21083d184a7eadc66ec08da249260c66b793379eb83c7674c921ab7e4761191e` |
+
+The pinned runtime and proof source produced closure digest `8044aded2f49c09b509b9eef8ef98240e963e6690e0160034e8b7185816ac862` before and after the matrix. [Source revision](/tmp/clec-unit1-final.VSBXV2/git-revisions) · [Independent review and original failures](/tmp/clec-unit1-final.VSBXV2/independent-before/review.md) · [Decision trail](/tmp/clec-unit1-final.VSBXV2/decisions.tsv)
+
+## Previous deadline correction
 
 The outer controller now retains the Pi handle and each provisional native lease before it awaits active I/O. Stop closes the admission epoch and arms Pi and all live groups before waiting on observation, reaping, or capture. The owner gives Pi 350 ms and each native group 400 ms of TERM grace, measured from the armed or detected trigger. The timer checks the absolute deadline when it runs. The receipt records actual signal calls separately from OS observation, direct reaping, and drain.
 
@@ -10,7 +46,7 @@ The launch path uses asynchronous exclusive opens and bounded file reads for the
 
 The active-path inventory leaves synchronous provisioning, settings writes, and the initial full closure hash before spawn. Native sink opens and closes, sentinel metadata, pin reads, process inspection, journal writes and synchronization, and final index publication are asynchronous. Full synchronous final hashing is conditional on positive target closure. When a matrix supplies its precomputed pin set, the matrix independently rehashes the full closure at the end. An attempt with Unknown ownership has no final closure digest. [Controller](../../../evaluation/clec-v1/phase6/proof-startup/controller.ts) · [Process owner](../../../evaluation/clec-v1/phase6/proof-startup/process-group.ts) · [Framing and writers](../../../evaluation/clec-v1/phase6/proof-startup/framing.ts) · [Pins](../../../evaluation/clec-v1/phase6/proof-startup/pins.ts)
 
-## Author verification at the tested commit
+## Historical verification of the deadline correction
 
 The clean run started at `2026-11-18T00:09:08Z` and ended at `2026-11-18T00:10:30Z`. It passed all 45 original controls, six process-observation tests, and 19 deadline controls. A separate `/bin/ps` scan checked 122 recorded PID identities and 39 PGIDs at `2026-11-18T00:09:59.937Z`. It found zero survivors after the explicit cleanup for the deliberately omitted-teardown case.
 
@@ -33,7 +69,7 @@ The real Pi loopback controls held or failed the provider grant, GroupRegistered
 - Parser test log. SHA-256 `7d9324b22586b60a2fae03ab0ca9f5c000e57173d2c2635273e4cb3b66eeec52`. [Parser log](/tmp/clec-unit1-exact.YnKfuE/parser.log)
 - The independent review's original signal miss was 2,287.166 ms. The first local reproduction on integrated base `9a0124487f3fca68e99376646c28ed47874d0c13` measured 2,284.576 ms. After explicit reaping, each direct final process scan was empty. [Independent receipt](/tmp/clec-review-910e-probes/run-K0WSrt/receipt.json) · [First local receipt](/tmp/clec-deadline-old.vKKglx/run-0d3yLO/receipt.json)
 
-The tested execution closure digest was `7b258050707372cdebaa1db5fc69aac060a92ec7beff6637a3c1e1a55623365a` before and after the matrix. The installed Node, Pi release tree, native executable, and Skill matched the exact runtime pins in the historical section below. The observer `/bin/ps` hashed to `1e46cdb824858eb32e4c85ca920ba31b4541a814a133980d8b3484f39942276c`. The current proof-source pins are:
+The tested execution closure digest was `7b258050707372cdebaa1db5fc69aac060a92ec7beff6637a3c1e1a55623365a` before and after the matrix. The installed Node, Pi release tree, native executable, and Skill matched the exact runtime pins in the historical section below. The observer `/bin/ps` hashed to `1e46cdb824858eb32e4c85ca920ba31b4541a814a133980d8b3484f39942276c`. The historical deadline-correction source pins follow.
 
 | File | SHA-256 |
 | --- | --- |
@@ -62,7 +98,7 @@ Unit 1 delivers only the minimum feasibility artifact in `evaluation/clec-v1/pha
 - `evaluation/clec-v1/phase6/proof-startup/group-helper.mjs` and `evaluation/clec-v1/phase6/proof-startup/process-group.ts` implement the detached Node group helper, pre-GO registration, `SIGTERM` to `SIGKILL` escalation within 2 seconds, and OS `ps` closure observation.
 - `evaluation/clec-v1/phase6/proof-startup/clec-adapter.ts` implements the SDK-typed Pi extension with the narrow Unit 1 status-only `clec` tool, `BoundReady` handshake, `tool_execution_start` outer admission latch, and nonrejecting `before_provider_request` latch.
 - `evaluation/clec-v1/phase6/proof-startup/controller.ts` implements the outer supervisor `runUnit1Proof` and immutable per-run index entries.
-- `evaluation/clec-v1/phase6/proof-startup/fixtures.ts` and `evaluation/clec-v1/phase6/proof-startup/run-matrix.ts` run the loopback OpenAI mock server and the 45-case verification matrix. The focused parser tests and `deadline-controls.mjs` cover the deadline correction.
+- `evaluation/clec-v1/phase6/proof-startup/fixtures.ts` and `evaluation/clec-v1/phase6/proof-startup/run-matrix.ts` run the loopback OpenAI mock server and the 45-case verification matrix. The focused parser and framing tests and `deadline-controls.mjs` exercise both repairs.
 
 Unit 1 restricts `clec` to `{ action: "status" }` with `additionalProperties: false`. It does not claim acceptance of the six-action closed `ClecRequest` contract (`schema`, `help`, `status`, `search`, `read`, `sources`), which Unit 4 integrates after Units 2 and 3.
 
@@ -115,7 +151,7 @@ All 45 checks in `run-matrix.ts` passed (`45/45`) and left zero surviving child 
 
 ## Pending work and open gates
 
-The independent review at `910e812353e9e43ed51aad5ecffdbc21331c5c7c` found two blockers. The integrated base corrected malformed process output and future-action guidance. This correction addresses the cleanup deadline and awaits an independent rerun. Node syntax checks and runtime suites ran. A separate TypeScript semantic check remains unverified because the available local toolchain had no `tsc`.
+The deadline correction resolved event-loop stalls from process enumeration and file writes. The next independent review identified the four authority failures above. The repaired source and receipts are ready for a fresh independent rerun.
 
 The proof observes the tested macOS arm64 runtime and owned inherited groups. An OS scheduling delay or uninterruptible syscall can defeat timing or closure. PID/PGID reuse and second-resolution start times limit identification. An incomplete write, unknown observation, or missing artifact leaves the proof uncertified.
 
@@ -132,7 +168,11 @@ proof=evaluation/clec-v1/phase6/proof-startup
 node=/Users/century/.nvm/versions/node/v25.7.0/bin/node
 out=$(mktemp -d /tmp/clec-unit1.XXXXXX)
 export NODE_DISABLE_COMPILE_CACHE=1
+tsc=/Users/century/vibing/clec/cli/node_modules/typescript/lib/tsc.js
+node_types=/Users/century/.pi/agent/install/releases/1.5.2/node_modules/@types
+"$node" "$tsc" -p "$proof/tsconfig.json" --typeRoots "$node_types"
 "$node" --test "$proof/process-observation.test.mjs"
+"$node" --expose-gc --test "$proof/framing.test.mjs"
 "$node" "$proof/run-matrix.ts" --out-parent "$out"
 "$node" "$proof/deadline-controls.mjs" "$out"
 ```
