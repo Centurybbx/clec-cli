@@ -14,15 +14,20 @@ use crate::domain::{
     SCHEMA_VERSION, SEGMENTATION_REVISION, Sag2ErrorContext, Sag2Stage, SourceId, SourceRole,
     TOKENIZATION_REVISION, TypedRef, WorkId,
 };
+use crate::lexical::Normalization;
 use crate::retrieval::{
-    BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, MatchMode, PreparedSearch, SearchData,
-    SearchRequest, execute_search,
+    BudgetReport, DEFAULT_PER_WORK, DEFAULT_SEARCH_LIMIT, LeadPassage, MatchMode, PreparedSearch,
+    SearchData, SearchLead, SearchQueryTerms, SearchRequest, execute_search, json_prefix,
+    project_lead,
 };
 #[cfg(not(feature = "test-hooks"))]
 use crate::sag2::run_sag2;
 #[cfg(feature = "test-hooks")]
 use crate::sag2::run_sag2_with_test_overrides;
-use crate::sag2::{Sag2SearchData, jev::ValidatedJevConfig, minimum_sag2_search_data};
+use crate::sag2::{
+    Sag2CallStats, Sag2CandidateCounts, Sag2Consumption, Sag2Limits, Sag2SearchData,
+    Sag2StopReason, Sag2UsageProvenance, jev::ValidatedJevConfig, minimum_sag2_search_data,
+};
 use crate::snapshot::{
     StatusData, SyncData, SyncDryRunData, data_dir_status, ensure_current_store, sync_dry_run,
     sync_with_prepare,
@@ -136,7 +141,7 @@ impl From<RoleArg> for SourceRole {
 enum Commands {
     /// Verify and atomically activate a local or HTTPS release manifest
     Sync(SyncArgs),
-    /// Search passages using 1 to 4 queries with BM25 + RRF and work-aware diversity
+    /// Find passage IDs and short original excerpts using 1 to 4 lexical queries
     Search(SearchArgs),
     /// Read exact passages (p_...) or original sources (s_... --original)
     Read(ReadArgs),
@@ -169,9 +174,13 @@ struct SearchArgs {
     #[arg(long, value_enum, default_value_t = MatchArg::Any)]
     pub match_mode: MatchArg,
 
-    /// Maximum returned whole passages (1..=5)
+    /// Maximum returned passage leads (1..=50)
     #[arg(long, default_value_t = DEFAULT_SEARCH_LIMIT, value_name = "N")]
     pub limit: usize,
+
+    /// Zero-based pagination offset for local search
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub offset: usize,
 
     /// Preferred per-work diversity cap before backfill (1..=5)
     #[arg(long, default_value_t = DEFAULT_PER_WORK, value_name = "N")]
@@ -213,8 +222,16 @@ struct ReadArgs {
     pub ids: Vec<String>,
 
     /// Adjacent passages per side for PassageId reads (0..=2)
-    #[arg(long, default_value_t = 1, value_name = "N")]
+    #[arg(long, default_value_t = 0, value_name = "N")]
     pub context: usize,
+
+    /// Include detailed subtitle cues for passages and their context
+    #[arg(long)]
+    pub cues: bool,
+
+    /// Require the active release that produced these IDs
+    #[arg(long, value_name = "SHA256")]
+    pub release: Option<String>,
 
     /// Return verbatim original UTF-8 text for a SourceId (s_...)
     #[arg(long)]
@@ -270,12 +287,12 @@ enum ReadItem {
     SourceOverview(SourceOverviewItem),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct ReadData {
-    pub release: ReleaseHash,
-    pub items: Vec<ReadItem>,
-    pub budget: ReadBudgetReport,
+struct ReadData<'a> {
+    pub release: &'a ReleaseHash,
+    pub items: &'a [ReadItem],
+    pub budget: ReadDeliveryBudget<'a>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -284,6 +301,16 @@ struct ReadBudgetReport {
     pub max_bytes: usize,
     pub used_bytes: usize,
     pub omitted_count: usize,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReadDeliveryBudget<'a> {
+    #[serde(flatten)]
+    pub size: ReadBudgetReport,
+    pub omitted_ids: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_required_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -329,18 +356,110 @@ struct UnsupportedFeatureSpec {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum SearchOutput {
     Local(SearchData),
-    Sag2(Box<Sag2SearchData>),
+    Sag2(Box<Sag2SearchOutput>),
 }
 
-#[derive(Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-enum SearchOutputRef<'a> {
-    Local(&'a SearchData),
-    Sag2(&'a Sag2SearchData),
+#[derive(Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct Sag2Lead {
+    #[serde(flatten)]
+    lead: SearchLead,
+    jev_score: f64,
+    dpp_order: Option<usize>,
+    found_in_round: usize,
+    matched_queries: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct Sag2SearchOutput {
+    #[serde(flatten)]
+    search: SearchData<Sag2Lead>,
+    algorithm: String,
+    algorithm_revision: String,
+    provider_verified: bool,
+    requested_model: String,
+    actual_model: Option<String>,
+    rounds_completed: usize,
+    stop_reason: Sag2StopReason,
+    candidate_counts: Sag2CandidateCounts,
+    calls: Sag2CallStats,
+    limits: Sag2Limits,
+    consumption: Sag2Consumption,
+    usage: Sag2UsageProvenance,
+}
+
+impl Sag2SearchOutput {
+    fn project(data: Sag2SearchData, normalization: Normalization) -> Result<Self, ClecError> {
+        let hits = data
+            .hits
+            .into_iter()
+            .map(|hit| {
+                let time_range = hit
+                    .cues
+                    .iter()
+                    .map(|cue| cue.start_ms)
+                    .min()
+                    .zip(hit.cues.iter().map(|cue| cue.end_ms).max());
+                let lead = project_lead(
+                    LeadPassage {
+                        passage_id: hit.passage_id,
+                        work: &hit.work,
+                        source: &hit.source,
+                        text: &hit.text,
+                        spans: &hit.spans,
+                        time_range,
+                        continued_from: hit.continued_from,
+                        continued_to: hit.continued_to,
+                        rrf_score: hit.rrf_score,
+                    },
+                    &data.queries,
+                    normalization,
+                )?;
+                Ok(Sag2Lead {
+                    lead,
+                    jev_score: hit.jev_score,
+                    dpp_order: hit.dpp_order,
+                    found_in_round: hit.found_in_round,
+                    matched_queries: hit
+                        .matched_queries
+                        .iter()
+                        .map(|query| json_prefix(query, 32).to_owned())
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, ClecError>>()?;
+        Ok(Self {
+            search: SearchData {
+                release: data.release,
+                match_mode: data.match_mode,
+                queries: data.queries,
+                total_candidates: data.total_candidates,
+                offset: data.offset,
+                limit: data.limit,
+                has_more: data.has_more,
+                next_offset: None,
+                hits,
+                budget: data.budget,
+            },
+            algorithm: data.algorithm,
+            algorithm_revision: data.algorithm_revision,
+            provider_verified: data.provider_verified,
+            requested_model: data.requested_model,
+            actual_model: data.actual_model,
+            rounds_completed: data.rounds_completed,
+            stop_reason: data.stop_reason,
+            candidate_counts: data.candidate_counts,
+            calls: data.calls,
+            limits: data.limits,
+            consumption: data.consumption,
+            usage: data.usage,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -620,6 +739,8 @@ struct PreparedRead {
     targets: Vec<PreparedReadTarget>,
     context: usize,
     find: Option<String>,
+    cues: bool,
+    release: Option<ReleaseHash>,
 }
 
 impl PreparedRead {
@@ -678,6 +799,12 @@ impl PreparedRead {
             targets,
             context: args.context,
             find: args.find.clone(),
+            cues: args.cues,
+            release: args
+                .release
+                .as_deref()
+                .map(ReleaseHash::parse)
+                .transpose()?,
         })
     }
 }
@@ -724,6 +851,7 @@ fn prepare_search_request(args: &SearchArgs) -> Result<PreparedSearch, ClecError
         queries: args.queries.clone(),
         match_mode: args.match_mode.into(),
         limit: args.limit,
+        offset: args.offset,
         per_work: args.per_work,
         work_filter: args.work.as_deref().map(WorkId::parse).transpose()?,
         source_filter: args.source.as_deref().map(SourceId::parse).transpose()?,
@@ -830,14 +958,20 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                     "--key-file requires --sag2 on `clec search`.",
                 ));
             }
-            let prepared = prepare_search_request(args)?;
+            if cli.sag2 && args.offset > 0 {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidArgument,
+                    "--offset is only supported on local `clec search`; increase --limit (up to 50) for `--sag2`.",
+                ));
+            }
+            let mut prepared = prepare_search_request(args)?;
             if cli.sag2 {
                 let min_bytes = minimum_sag2_search_envelope_bytes(&prepared, use_json, max_bytes)?;
                 if max_bytes < min_bytes {
                     return Err(ClecError::new(
                         ErrorCode::OutputBudgetTooSmall,
                         format!(
-                            "Output requires at least {min_bytes} UTF-8 bytes, exceeding --max-bytes {max_bytes}."
+                            "The minimum search envelope needs {min_bytes} UTF-8 bytes. Retry with --max-bytes 32768 or higher."
                         ),
                     ));
                 }
@@ -851,10 +985,11 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                 &options.transfer_policy,
                 None,
             )?;
+            prepared.bind_normalization(store.normalization)?;
             match mode {
                 SearchMode::Local => {
                     let full = execute_search(&store, &prepared)?;
-                    fit_search_budget(full, use_json, max_bytes)
+                    fit_search_budget(SearchOutput::Local(full), use_json, max_bytes)
                 }
                 SearchMode::Sag2(jev_config) => {
                     #[cfg(feature = "test-hooks")]
@@ -867,7 +1002,7 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                     )?;
                     #[cfg(not(feature = "test-hooks"))]
                     let full = run_sag2(&mut store, &prepared, jev_config)?;
-                    fit_sag2_search_budget(full, use_json, max_bytes)
+                    fit_sag2_search_budget(full, prepared.normalization, use_json, max_bytes)
                 }
             }
         }
@@ -917,12 +1052,27 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                 &options.transfer_policy,
                 None,
             )?;
+            if prepared
+                .release
+                .as_ref()
+                .is_some_and(|release| release != &store.release)
+            {
+                return Err(ClecError::new(
+                    ErrorCode::VersionUnavailable,
+                    "Active release differs from requested --release.",
+                ));
+            }
             let mut items = Vec::with_capacity(prepared.targets.len());
             for (idx, target) in prepared.targets.iter().enumerate() {
                 match target {
                     PreparedReadTarget::Passage(pid) => {
                         let item = store
-                            .read_passage(pid, prepared.context, prepared.find.as_deref())
+                            .read_passage_with_cues(
+                                pid,
+                                prepared.context,
+                                prepared.find.as_deref(),
+                                prepared.cues,
+                            )
                             .map_err(|e| e.with_input_index(idx))?;
                         items.push(ReadItem::Passage(Box::new(item)));
                     }
@@ -940,16 +1090,7 @@ fn dispatch(cli: &Cli, use_json: bool, options: &RuntimeOptions) -> Result<Strin
                     }
                 }
             }
-            let data = ReadData {
-                release: store.release,
-                items,
-                budget: ReadBudgetReport {
-                    max_bytes,
-                    used_bytes: 0,
-                    omitted_count: 0,
-                },
-            };
-            fit_read_budget(data, use_json, max_bytes)
+            fit_read_budget(&store.release, &items, &args.ids, use_json, max_bytes)
         }
     }
 }
@@ -1037,49 +1178,175 @@ where
     ))
 }
 
+fn required_budget(
+    mut render: impl FnMut(usize, usize) -> Result<String, ClecError>,
+) -> Result<usize, ClecError> {
+    Ok(converge_rendered_bytes(0, &mut |_, bytes| render(bytes, bytes))?.len())
+}
+
+fn budget_error(required: usize, max_bytes: usize) -> ClecError {
+    ClecError::new(
+        ErrorCode::OutputBudgetTooSmall,
+        format!("Output requires {required} UTF-8 bytes, exceeding --max-bytes {max_bytes}."),
+    )
+    .with_required_bytes(required)
+}
+
+fn format_search(output: &SearchOutput, use_json: bool) -> Result<String, ClecError> {
+    if use_json {
+        serialize_envelope("search", output)
+    } else {
+        Ok(match output {
+            SearchOutput::Local(data) => format_search_text(data),
+            SearchOutput::Sag2(data) => format_sag2_search_text(data),
+        })
+    }
+}
+
 fn minimum_sag2_search_envelope_bytes(
     prepared: &PreparedSearch,
     use_json: bool,
     max_bytes: usize,
 ) -> Result<usize, ClecError> {
-    let min_data = minimum_sag2_search_data(prepared, max_bytes);
-    if use_json {
-        Ok(serialize_envelope("search", &SearchOutputRef::Sag2(&min_data))?.len())
-    } else {
-        Ok(format_sag2_search_text(&min_data).len())
+    let mut data = minimum_sag2_search_data(prepared, max_bytes);
+    // The real response may omit the query echo when it does not fit its own cap.
+    data.queries.clear();
+    let output = SearchOutput::Sag2(Box::new(Sag2SearchOutput::project(
+        data,
+        prepared.normalization,
+    )?));
+    Ok(format_search(&output, use_json)?.len())
+}
+
+fn cap_query_echo(queries: &mut Vec<SearchQueryTerms>) -> Result<(), ClecError> {
+    let encoded_len = |queries: &[SearchQueryTerms]| {
+        serde_json::to_vec(queries)
+            .map(|bytes| bytes.len())
+            .map_err(|error| {
+                ClecError::new(
+                    ErrorCode::InternalError,
+                    format!("Query echo serialization failed: {error}"),
+                )
+            })
+    };
+    if encoded_len(queries)? > 2048 {
+        for query in queries.iter_mut() {
+            query.terms.clear();
+        }
     }
+    if encoded_len(queries)? > 2048 {
+        queries.clear();
+    }
+    Ok(())
+}
+
+enum SearchHits {
+    Local(Vec<SearchLead>),
+    Sag2(Vec<Sag2Lead>),
+}
+
+fn render_search_keep(
+    output: &mut SearchOutput,
+    all_hits: &SearchHits,
+    keep: usize,
+    cap: usize,
+    used_bytes: usize,
+    use_json: bool,
+) -> Result<String, ClecError> {
+    match (&mut *output, all_hits) {
+        (SearchOutput::Local(data), SearchHits::Local(all)) => {
+            data.hits = all[..keep].to_vec();
+            let omitted_ids: Vec<PassageId> =
+                all[keep..].iter().map(|h| h.passage_id.clone()).collect();
+            let returned_end = data.offset.saturating_add(keep);
+            data.has_more = returned_end < data.total_candidates;
+            data.next_offset = data.has_more.then_some(returned_end);
+            data.budget = BudgetReport {
+                max_bytes: cap,
+                used_bytes,
+                omitted_count: omitted_ids.len(),
+                omitted_ids,
+            };
+        }
+        (SearchOutput::Sag2(data), SearchHits::Sag2(all)) => {
+            data.search.hits = all[..keep].to_vec();
+            let omitted_ids: Vec<PassageId> = all[keep..]
+                .iter()
+                .map(|h| h.lead.passage_id.clone())
+                .collect();
+            let returned_end = data.search.offset.saturating_add(keep);
+            data.search.has_more = returned_end < data.search.total_candidates;
+            data.search.next_offset = None;
+            data.search.budget = BudgetReport {
+                max_bytes: cap,
+                used_bytes,
+                omitted_count: omitted_ids.len(),
+                omitted_ids,
+            };
+        }
+        _ => unreachable!("SearchOutput and SearchHits variants always match"),
+    }
+    format_search(output, use_json)
 }
 
 fn fit_search_budget(
-    mut data: SearchData,
+    mut output: SearchOutput,
     use_json: bool,
     max_bytes: usize,
 ) -> Result<String, ClecError> {
-    let all_hits = std::mem::take(&mut data.hits);
-    let total = all_hits.len();
-    let min_keep = usize::from(total > 0);
-    fit_list_budget(total, min_keep, max_bytes, |keep, used_bytes| {
-        let omitted_ids: Vec<PassageId> = all_hits[keep..]
-            .iter()
-            .map(|h| h.passage_id.clone())
-            .collect();
-        data.hits = all_hits[..keep].to_vec();
-        data.budget = BudgetReport {
-            max_bytes,
-            used_bytes,
-            omitted_count: total - keep,
-            omitted_ids,
-        };
-        if use_json {
-            serialize_envelope("search", &SearchOutputRef::Local(&data))
-        } else {
-            Ok(format_search_text(&data))
+    match &mut output {
+        SearchOutput::Local(data) => cap_query_echo(&mut data.queries)?,
+        SearchOutput::Sag2(data) => cap_query_echo(&mut data.search.queries)?,
+    }
+    let (total, all_hits) = match &mut output {
+        SearchOutput::Local(data) => {
+            let hits = std::mem::take(&mut data.hits);
+            (hits.len(), SearchHits::Local(hits))
         }
-    })
+        SearchOutput::Sag2(data) => {
+            let hits = std::mem::take(&mut data.search.hits);
+            (hits.len(), SearchHits::Sag2(hits))
+        }
+    };
+    let full = converge_rendered_bytes(total, &mut |k, used| {
+        render_search_keep(&mut output, &all_hits, k, max_bytes, used, use_json)
+    })?;
+    if full.len() <= max_bytes {
+        return Ok(full);
+    }
+    if total <= 1 {
+        let required = required_budget(|cap, used| {
+            render_search_keep(&mut output, &all_hits, total, cap, used, use_json)
+        })?;
+        return Err(budget_error(required, max_bytes));
+    }
+    let min_keep = 1usize;
+    let first = converge_rendered_bytes(min_keep, &mut |k, used| {
+        render_search_keep(&mut output, &all_hits, k, max_bytes, used, use_json)
+    })?;
+    if first.len() > max_bytes {
+        let required = required_budget(|cap, used| {
+            render_search_keep(&mut output, &all_hits, min_keep, cap, used, use_json)
+        })?;
+        return Err(budget_error(required, max_bytes));
+    }
+    for keep in (min_keep..total).rev() {
+        if keep == min_keep {
+            return Ok(first);
+        }
+        let out = converge_rendered_bytes(keep, &mut |k, used| {
+            render_search_keep(&mut output, &all_hits, k, max_bytes, used, use_json)
+        })?;
+        if out.len() <= max_bytes {
+            return Ok(out);
+        }
+    }
+    Ok(first)
 }
 
 fn fit_sag2_search_budget(
-    mut data: Sag2SearchData,
+    data: Sag2SearchData,
+    normalization: Normalization,
     use_json: bool,
     max_bytes: usize,
 ) -> Result<String, ClecError> {
@@ -1095,28 +1362,9 @@ fn fit_sag2_search_budget(
         response_bytes: data.consumption.response_bytes,
         estimated_token_units: data.consumption.estimated_token_units,
     };
-    let all_hits = std::mem::take(&mut data.hits);
-    let total = all_hits.len();
-    let min_keep = usize::from(total > 0);
-    fit_list_budget(total, min_keep, max_bytes, |keep, used_bytes| {
-        let omitted_ids: Vec<PassageId> = all_hits[keep..]
-            .iter()
-            .map(|h| h.passage_id.clone())
-            .collect();
-        data.hits = all_hits[..keep].to_vec();
-        data.budget = BudgetReport {
-            max_bytes,
-            used_bytes,
-            omitted_count: total - keep,
-            omitted_ids,
-        };
-        if use_json {
-            serialize_envelope("search", &SearchOutputRef::Sag2(&data))
-        } else {
-            Ok(format_sag2_search_text(&data))
-        }
-    })
-    .map_err(|err| err.with_sag2_stage(stage_ctx))
+    Sag2SearchOutput::project(data, normalization)
+        .and_then(|data| fit_search_budget(SearchOutput::Sag2(Box::new(data)), use_json, max_bytes))
+        .map_err(|err| err.with_sag2_stage(stage_ctx))
 }
 
 fn fit_sources_budget(
@@ -1142,26 +1390,86 @@ fn fit_sources_budget(
     })
 }
 
+fn render_read(
+    release: &ReleaseHash,
+    items: &[ReadItem],
+    omitted_ids: &[String],
+    next_required_bytes: Option<usize>,
+    use_json: bool,
+    max_bytes: usize,
+    used_bytes: usize,
+) -> Result<String, ClecError> {
+    let data = ReadData {
+        release,
+        items,
+        budget: ReadDeliveryBudget {
+            size: ReadBudgetReport {
+                max_bytes,
+                used_bytes,
+                omitted_count: omitted_ids.len(),
+            },
+            omitted_ids,
+            next_required_bytes,
+        },
+    };
+    if use_json {
+        serialize_envelope("read", &data)
+    } else {
+        Ok(format_read_text(&data))
+    }
+}
+
 fn fit_read_budget(
-    mut data: ReadData,
+    release: &ReleaseHash,
+    items: &[ReadItem],
+    ids: &[String],
     use_json: bool,
     max_bytes: usize,
 ) -> Result<String, ClecError> {
-    let all_items = std::mem::take(&mut data.items);
-    let total = all_items.len();
-    fit_list_budget(total, 1, max_bytes, |keep, used_bytes| {
-        data.items = all_items[..keep].to_vec();
-        data.budget = ReadBudgetReport {
-            max_bytes,
-            used_bytes,
-            omitted_count: total - keep,
-        };
-        if use_json {
-            serialize_envelope("read", &data)
+    let total = items.len();
+    let single_required = |index| {
+        required_budget(|cap, used| {
+            render_read(
+                release,
+                &items[index..index + 1],
+                &[],
+                None,
+                use_json,
+                cap,
+                used,
+            )
+        })
+    };
+    for keep in (1..=total).rev() {
+        let next_required = if keep < total {
+            Some(single_required(keep)?)
         } else {
-            Ok(format_read_text(&data))
+            None
+        };
+        let output = converge_rendered_bytes(keep, &mut |_, used| {
+            render_read(
+                release,
+                &items[..keep],
+                &ids[keep..],
+                next_required,
+                use_json,
+                max_bytes,
+                used,
+            )
+        })?;
+        if output.len() <= max_bytes {
+            return Ok(output);
         }
-    })
+    }
+    let required = if total == 1 {
+        single_required(0)?
+    } else {
+        let next = Some(single_required(1)?);
+        required_budget(|cap, used| {
+            render_read(release, &items[..1], &ids[1..], next, use_json, cap, used)
+        })?
+    };
+    Err(budget_error(required, max_bytes))
 }
 
 fn emit_error(err: &ClecError, command: Option<&str>) {
@@ -1218,7 +1526,7 @@ fn build_schema_data(default_configured: bool) -> SchemaData {
         "syncDryRun": schema_for!(SuccessEnvelope<SyncDryRunData>),
         "status": schema_for!(SuccessEnvelope<StatusData>),
         "search": schema_for!(SuccessEnvelope<SearchOutput>),
-        "read": schema_for!(SuccessEnvelope<ReadData>),
+        "read": schema_for!(SuccessEnvelope<ReadData<'_>>),
         "sources": schema_for!(SuccessEnvelope<SourcesData>),
         "error": schema_for!(ErrorEnvelope),
     });
@@ -1320,40 +1628,55 @@ fn format_sync_dry_run_text(d: &SyncDryRunData) -> String {
 }
 
 fn format_search_text(d: &SearchData) -> String {
+    let next_part = d
+        .next_offset
+        .map_or_else(String::new, |next| format!("; Next offset: {next}"));
     let mut out = format!(
-        "Release: {}\nCandidates: {}; Returned: {}; Omitted by budget: {}\n\n",
+        "Release: {}\nCandidates: {}; Offset: {}; Returned: {}; Omitted by budget: {}{}\n\n",
         d.release,
         d.total_candidates,
+        d.offset,
         d.hits.len(),
-        d.budget.omitted_count
+        d.budget.omitted_count,
+        next_part
     );
     for hit in &d.hits {
         out.push_str(&format!(
             "[{}] {} ({}) score={:.6}\n{}\n\n",
-            hit.passage_id, hit.source.title, hit.source.source_id, hit.rrf_score, hit.text
+            hit.passage_id,
+            hit.source.title,
+            hit.source.source_id,
+            hit.rrf_score.unwrap_or_default(),
+            hit.excerpt
         ));
     }
     out
 }
 
-fn format_sag2_search_text(d: &Sag2SearchData) -> String {
+fn format_sag2_search_text(d: &Sag2SearchOutput) -> String {
     let mut out = format!(
         "Mode: sag2 ({})\nRelease: {}\nStop: {:?}; Rounds: {}; HTTP attempts: {}; Returned: {}; Omitted by budget: {}\n\n",
         d.algorithm,
-        d.release,
+        d.search.release,
         d.stop_reason,
         d.rounds_completed,
         d.calls.http_attempts,
-        d.hits.len(),
-        d.budget.omitted_count
+        d.search.hits.len(),
+        d.search.budget.omitted_count
     );
-    for hit in &d.hits {
+    for hit in &d.search.hits {
         let rrf = hit
+            .lead
             .rrf_score
             .map_or_else(|| "none".to_owned(), |v| format!("{v:.6}"));
         out.push_str(&format!(
             "[{}] {} ({}) jev={:.6} rrf={}\n{}\n\n",
-            hit.passage_id, hit.source.title, hit.source.source_id, hit.jev_score, rrf, hit.text
+            hit.lead.passage_id,
+            hit.lead.source.title,
+            hit.lead.source.source_id,
+            hit.jev_score,
+            rrf,
+            hit.lead.excerpt
         ));
     }
     out
@@ -1380,9 +1703,9 @@ fn format_sources_text(d: &SourcesData) -> String {
     out
 }
 
-fn format_read_text(d: &ReadData) -> String {
+fn format_read_text(d: &ReadData<'_>) -> String {
     let mut out = format!("Release: {}\n\n", d.release);
-    for item in &d.items {
+    for item in d.items {
         match item {
             ReadItem::Passage(p) => {
                 out.push_str(&format!(
@@ -1403,6 +1726,12 @@ fn format_read_text(d: &ReadData) -> String {
                 ));
             }
         }
+    }
+    if let Some(bytes) = d.budget.next_required_bytes {
+        out.push_str(&format!(
+            "Omitted IDs: {}\nRead the first omitted ID with the same read options, --release {} and --max-bytes {bytes}.\n",
+            d.budget.omitted_ids.join(" "), d.release
+        ));
     }
     out
 }
@@ -1496,9 +1825,8 @@ mod tests {
 
     #[test]
     fn budget_used_bytes_converges_to_exact_stdout_len_across_decimal_and_escaping_boundaries() {
-        use crate::domain::{Attribution, ByteSpan, EquivalenceBasis, ProjectionKind};
-        use crate::retrieval::{SearchHit, SearchQueryTerms};
-        use crate::store::WorkRecord;
+        use crate::domain::{Attribution, ByteSpan, EquivalenceBasis};
+        use crate::retrieval::{SearchSource, SearchWork};
 
         let release = ReleaseHash::parse(&"a".repeat(64)).unwrap();
         let wid = WorkId::from_work_key("demo").unwrap();
@@ -1562,41 +1890,27 @@ mod tests {
             assert_eq!(too_tight.code, ErrorCode::OutputBudgetTooSmall);
         }
 
-        let make_hit = |pid: &PassageId, text: String| SearchHit {
+        let make_hit = |pid: &PassageId, text: String| SearchLead {
             passage_id: pid.clone(),
-            work: WorkRecord {
+            work: SearchWork {
                 work_id: wid.clone(),
                 work_key: "demo".to_owned(),
-                title: "Demo".to_owned(),
+                family_key: None,
             },
-            source: crate::store::SourceRecord {
+            source: SearchSource {
                 source_id: sid.clone(),
-                work_id: wid.clone(),
-                path: "a.txt".to_owned(),
                 title: "Demo".to_owned(),
                 role: SourceRole::Document,
                 attribution: Attribution::AuthoredFixture,
-                quality: "fixture".to_owned(),
                 date: None,
                 date_basis: None,
-                origin: None,
-                content_hash: "c".repeat(64),
-                canonical_source_id: sid.clone(),
-                equivalence_basis: EquivalenceBasis::UniqueInWorkRole,
-                projection_kind: ProjectionKind::PlainText,
-                equivalence_hash: "d".repeat(64),
             },
-            ordinal: 0,
-            spans: vec![ByteSpan::new(0, 10, None).unwrap()],
-            cues: Vec::new(),
-            diagnostics: Vec::new(),
-            previous: None,
-            next: None,
+            excerpt_span: ByteSpan::new(0, text.len(), None).unwrap(),
+            excerpt: text,
+            time_range: None,
             continued_from: None,
             continued_to: None,
-            text,
-            rrf_score: 0.5,
-            matched_queries: vec!["alpha".to_owned()],
+            rrf_score: Some(0.5),
         };
 
         let search_data = SearchData {
@@ -1607,6 +1921,10 @@ mod tests {
                 terms: vec!["alpha".to_owned()],
             }],
             total_candidates: 2,
+            offset: 0,
+            limit: 2,
+            has_more: false,
+            next_offset: None,
             hits: vec![
                 make_hit(&pid1, "a".repeat(8600)),
                 make_hit(&pid2, "b".repeat(800)),
@@ -1618,7 +1936,8 @@ mod tests {
                 omitted_ids: Vec::new(),
             },
         };
-        let full_search = fit_search_budget(search_data.clone(), true, 65_536).unwrap();
+        let full_search =
+            fit_search_budget(SearchOutput::Local(search_data.clone()), true, 65_536).unwrap();
         let full_parsed: serde_json::Value = serde_json::from_str(&full_search).unwrap();
         assert!(full_search.len() > 10_000);
         assert_eq!(
@@ -1626,22 +1945,45 @@ mod tests {
             full_search.len()
         );
 
-        let tight_one_hit =
-            fit_search_budget(search_data.clone(), true, full_search.len() - 1).unwrap();
-        let tight_parsed: serde_json::Value = serde_json::from_str(&tight_one_hit).unwrap();
-        assert_eq!(tight_parsed["data"]["budget"]["omittedCount"], 1);
+        let truncated = fit_search_budget(
+            SearchOutput::Local(search_data.clone()),
+            true,
+            full_search.len() - 1,
+        )
+        .unwrap();
+        assert!(truncated.len() <= full_search.len() - 1);
+        let trunc_parsed: serde_json::Value = serde_json::from_str(&truncated).unwrap();
+        assert_eq!(trunc_parsed["data"]["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(trunc_parsed["data"]["budget"]["omittedCount"], 1);
         assert_eq!(
-            tight_parsed["data"]["budget"]["omittedIds"],
+            trunc_parsed["data"]["budget"]["omittedIds"],
             serde_json::json!([pid2.as_str()])
         );
+        assert_eq!(trunc_parsed["data"]["hasMore"], true);
+        assert_eq!(trunc_parsed["data"]["nextOffset"], 1);
         assert_eq!(
-            tight_parsed["data"]["budget"]["usedBytes"]
-                .as_u64()
-                .unwrap() as usize,
-            tight_one_hit.len()
+            trunc_parsed["data"]["budget"]["usedBytes"].as_u64().unwrap() as usize,
+            truncated.len()
         );
 
-        let plain_search = fit_search_budget(search_data, false, full_search.len()).unwrap();
+        let re_fit =
+            fit_search_budget(SearchOutput::Local(search_data.clone()), true, truncated.len())
+                .unwrap();
+        let too_small = fit_search_budget(
+            SearchOutput::Local(search_data.clone()),
+            true,
+            re_fit.len() - 1,
+        )
+        .unwrap_err();
+        assert_eq!(too_small.code, ErrorCode::OutputBudgetTooSmall);
+        let required = too_small.required_bytes.unwrap();
+        assert_eq!(required, re_fit.len());
+        let exact =
+            fit_search_budget(SearchOutput::Local(search_data.clone()), true, required).unwrap();
+        assert_eq!(exact.len(), required);
+
+        let plain_search =
+            fit_search_budget(SearchOutput::Local(search_data), false, full_search.len()).unwrap();
         assert!(plain_search.contains(&"a".repeat(8600)));
     }
 
@@ -1664,7 +2006,20 @@ mod tests {
                     "search",
                     "valid",
                     "--limit",
-                    "6",
+                    "51",
+                ],
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                &[
+                    "clec",
+                    "--data-dir",
+                    &dir_arg,
+                    "search",
+                    "valid",
+                    "--sag2",
+                    "--offset",
+                    "1",
                 ],
                 ErrorCode::InvalidArgument,
             ),
@@ -2068,6 +2423,7 @@ mod tests {
             queries: vec!["anchor".to_owned()],
             match_mode: MatchMode::Any,
             limit: DEFAULT_SEARCH_LIMIT,
+            offset: 0,
             per_work: DEFAULT_PER_WORK,
             work_filter: None,
             source_filter: None,
@@ -2081,6 +2437,45 @@ mod tests {
         for use_json in [false, true] {
             let min_b =
                 minimum_sag2_search_envelope_bytes(&prepared, use_json, DEFAULT_MAX_BYTES).unwrap();
+            use crate::sag2::{Sag2Limits, effective_dpp_top_k, jev::JevAdmissionPolicy};
+
+            for policy in [
+                JevAdmissionPolicy::CalibratedJev114BodyBounded,
+                JevAdmissionPolicy::UncalibratedConservativeByteBound,
+            ] {
+                for (stop_reason, actual_model) in [
+                    (Sag2StopReason::Completed, Some("typesafe/jev-1.14")),
+                    (Sag2StopReason::NoCandidates, None),
+                    (Sag2StopReason::NoQualifiedSeeds, Some("typesafe/jev-1.14")),
+                    (Sag2StopReason::NoExpansionTerms, Some("typesafe/jev-1.14")),
+                    (
+                        Sag2StopReason::NoExpansionCandidates,
+                        Some("typesafe/jev-1.14"),
+                    ),
+                ] {
+                    for has_more in [false, true] {
+                        let mut data = minimum_sag2_search_data(&prepared, DEFAULT_MAX_BYTES);
+                        data.queries.clear();
+                        data.requested_model = "typesafe/jev-1.14".to_owned();
+                        data.actual_model = actual_model.map(str::to_owned);
+                        data.stop_reason = stop_reason;
+                        data.has_more = has_more;
+                        data.limits =
+                            Sag2Limits::for_policy(policy, effective_dpp_top_k(prepared.limit));
+                        data.consumption.token_estimate_basis =
+                            policy.token_estimate_basis().to_owned();
+                        let output = SearchOutput::Sag2(Box::new(
+                            Sag2SearchOutput::project(data, prepared.normalization).unwrap(),
+                        ));
+                        let rendered_bytes = format_search(&output, use_json).unwrap().len();
+                        assert!(
+                            min_b <= rendered_bytes,
+                            "{policy:?}, {stop_reason:?}, has_more={has_more}, use_json={use_json}, min_b={min_b}, rendered={rendered_bytes}"
+                        );
+                    }
+                }
+            }
+
             let at_min = minimum_sag2_search_envelope_bytes(&prepared, use_json, min_b).unwrap();
             assert!(at_min <= min_b, "use_json={use_json}");
 

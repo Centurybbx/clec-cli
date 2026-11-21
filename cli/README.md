@@ -21,9 +21,15 @@ No public corpus manifest endpoint is configured (`defaultConfigured: false`, `p
 clec sync --manifest /absolute/path/to/release/manifest.json
 clec search '退休 提領' --offline
 clec sources '退休' --canonical-only
-clec read '<PassageId>' --context 1
+clec read '<PassageId>' '<PassageId>' --release '<SearchRelease>' --context 1
 clec read '<SourceId>' --original --find '每年提領'
 ```
+
+## Search leads and read evidence
+
+Search returns 20 leads by default, accepts `--limit 1..50`, and supports `--offset <N>` pagination (`totalCandidates`, `hasMore`, `nextOffset`) for local search. Each lead has a passage ID, work and source identity, and a short excerpt from one original byte range. Subtitle leads give a time range. Use `read` and the search response's release for full passages and citation coordinates. Search may shorten display fields, omit a long query echo, and gracefully trim trailing leads under `--max-bytes` (reporting `budget.omittedCount`, `budget.omittedIds`, and an adjusted `nextOffset`).
+
+Read preserves request order, defaults to zero adjacent passages, and includes detailed subtitle cues with `--cues`. A partial read returns whole items and the remaining IDs in `budget.omittedIds`. Use `budget.nextRequiredBytes` to retry the first omitted ID by itself with the same options and release. If even a single search lead or the first read item exceeds the requested budget, the CLI returns `OUTPUT_BUDGET_TOO_SMALL` with `requiredBytes` to retry with a larger cap.
 
 ## Cache directory ownership
 

@@ -252,7 +252,7 @@ def main() -> int:
                         hits = data["hits"]
                         total_candidates = int(data.get("totalCandidates", 0))
                         returned_hits = len(hits)
-                        work_keys = sorted({h["work"]["workKey"] for h in hits})
+                        work_keys = sorted({h["work"].get("workKey", h["work"].get("workId")) for h in hits})
                     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                         ok = False
                 cli_records[mode].append(

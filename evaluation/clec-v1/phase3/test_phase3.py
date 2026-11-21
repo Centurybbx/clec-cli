@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -187,10 +188,15 @@ class Phase3HarnessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.repo_root = Path(__file__).resolve().parents[3]
-        cls.clec_bin = cls.repo_root / "native" / "target" / "release" / "clec"
-        cls.pub_bin = cls.repo_root / "native" / "target" / "release" / "clec-publish"
+        default_clec = cls.repo_root / "native" / "target" / "release" / "clec"
+        cls.clec_bin = Path(os.environ.get("CLEC_PHASE3_LEGACY_BIN", default_clec)).resolve()
+        default_publish = cls.repo_root / "native" / "target" / "release" / "clec-publish"
+        cls.pub_bin = Path(os.environ.get("CLEC_PHASE3_LEGACY_PUBLISH", default_publish)).resolve()
         if not cls.clec_bin.is_file() or not cls.pub_bin.is_file():
             raise unittest.SkipTest("Release binaries clec / clec-publish are not built")
+        help_text = subprocess.check_output([str(cls.clec_bin), "search", "--help"], text=True)
+        if "passage leads" in help_text:
+            raise unittest.SkipTest("Full-hit Phase 3 fixtures require CLEC_PHASE3_LEGACY_BIN")
 
         cls.tmp_ctx = tempfile.TemporaryDirectory(prefix="clec-phase3-test-")
         cls.tmp = Path(cls.tmp_ctx.name)

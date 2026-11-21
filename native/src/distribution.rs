@@ -8,9 +8,8 @@ use reqwest::header::LOCATION;
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    CORPUS_FORMAT, ClecError, DICTIONARY_REVISION, EQUIVALENCE_REVISION, ErrorCode,
-    NORMALIZATION_REVISION, SCHEMA_VERSION, SEGMENTATION_REVISION, TOKENIZATION_REVISION,
-    hex_encode,
+    CORPUS_FORMAT, ClecError, DICTIONARY_REVISION, EQUIVALENCE_REVISION, ErrorCode, SCHEMA_VERSION,
+    SEGMENTATION_REVISION, TOKENIZATION_REVISION, hex_encode,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::http_transport::current_test_hooks;
@@ -337,7 +336,7 @@ pub(crate) fn validate_manifest_fields(m: &ReleaseManifest) -> Result<(), ClecEr
             "Unsupported tokenizationRevision in manifest.",
         ));
     }
-    if m.normalization_revision != NORMALIZATION_REVISION {
+    if crate::lexical::Normalization::parse(&m.normalization_revision).is_err() {
         return Err(ClecError::new(
             ErrorCode::InvalidPackage,
             "Unsupported normalizationRevision in manifest.",

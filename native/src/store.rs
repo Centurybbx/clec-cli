@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     Attribution, BoundaryKind, ByteSpan, CORPUS_FORMAT, CanonicalCandidate, ClecError,
-    DICTIONARY_REVISION, DateYmd, EQUIVALENCE_REVISION, EquivalenceBasis, ErrorCode,
-    NORMALIZATION_REVISION, PassageId, ProjectionKind, ReleaseHash, SEGMENTATION_REVISION,
-    SourceId, SourceRole, TOKENIZATION_REVISION, WorkId, select_canonical_index, sha256_hex,
+    DICTIONARY_REVISION, DateYmd, EQUIVALENCE_REVISION, EquivalenceBasis, ErrorCode, PassageId,
+    ProjectionKind, ReleaseHash, SEGMENTATION_REVISION, SourceId, SourceRole,
+    TOKENIZATION_REVISION, WorkId, select_canonical_index, sha256_hex,
 };
 use crate::ingest::{
     SubtitleCue, compute_equivalence_projection, extract_source, is_subtitle_path,
     reconstruct_passage_text, segment_source,
 };
-use crate::lexical::{encode_fts_token, index_tokens_string, normalize_for_search};
+use crate::lexical::{Normalization, encode_fts_token};
 
 pub(crate) const SCHEMA_SQL: &str = "
 PRAGMA journal_mode=DELETE;
@@ -126,11 +126,58 @@ pub struct CorpusCounts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkFamily {
+    pub key: String,
+    pub provenance: String,
+}
+
+impl WorkFamily {
+    pub(crate) fn validate(&self) -> Result<(), ClecError> {
+        if self.key.is_empty()
+            || self.key.len() > 64
+            || !self
+                .key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+            || self.provenance.trim().is_empty()
+            || self.provenance.len() > 512
+            || self.provenance.chars().any(char::is_control)
+        {
+            return Err(ClecError::new(
+                ErrorCode::InvalidManifest,
+                "Work family requires a 1..64 character identifier and nonempty provenance up to 512 UTF-8 bytes.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn from_metadata(value: &str) -> Result<Self, ClecError> {
+        let invalid = |_| {
+            ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Invalid work family provenance in corpus metadata.",
+            )
+        };
+        let family: Self = serde_json::from_str(value).map_err(invalid)?;
+        family.validate().map_err(|_| {
+            ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Invalid work family provenance in corpus metadata.",
+            )
+        })?;
+        Ok(family)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkRecord {
     pub work_id: WorkId,
     pub work_key: String,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<WorkFamily>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -176,6 +223,7 @@ pub(crate) struct PassageContext {
     pub boundary: BoundaryKind,
     pub is_continuation: bool,
     pub spans: Vec<ByteSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cues: Vec<SubtitleCue>,
     pub text: String,
 }
@@ -202,6 +250,7 @@ pub(crate) struct PassageReadItem {
     pub previous: Option<PassageId>,
     pub next: Option<PassageId>,
     pub spans: Vec<ByteSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cues: Vec<SubtitleCue>,
     pub diagnostics: Vec<String>,
     pub text: String,
@@ -269,6 +318,23 @@ pub(crate) struct DiagnosticsSummary {
     pub total_diagnostics: usize,
 }
 
+pub(crate) struct SearchPassage {
+    pub source: SourceRecord,
+    pub work: WorkRecord,
+    pub text: String,
+    pub spans: Vec<ByteSpan>,
+    pub continued_from: Option<PassageId>,
+    pub continued_to: Option<PassageId>,
+    pub time_range: Option<(u64, u64)>,
+}
+
+pub(crate) struct PassageDedupInfo {
+    pub text: String,
+    pub role: SourceRole,
+    pub attribution: Attribution,
+    pub has_family: bool,
+}
+
 pub(crate) struct VerifiedPassageCore {
     pub context: PassageContext,
     pub source: SourceRecord,
@@ -294,6 +360,7 @@ pub(crate) struct CandidateFilter<'a> {
 pub(crate) struct CorpusStore {
     conn: Connection,
     pub release: ReleaseHash,
+    pub normalization: Normalization,
 }
 
 pub(crate) struct ReadSnapshotGuard<'a> {
@@ -307,6 +374,24 @@ impl Drop for ReadSnapshotGuard<'_> {
 }
 
 impl CorpusStore {
+    fn from_connection(conn: Connection, release: ReleaseHash) -> Result<Self, ClecError> {
+        let normalization = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='normalization_revision'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map_or(Ok(Normalization::Current), |revision| {
+                Normalization::parse(&revision)
+            })?;
+        Ok(Self {
+            conn,
+            release,
+            normalization,
+        })
+    }
+
     pub(crate) fn open_readonly(path: &Path, release: ReleaseHash) -> Result<Self, ClecError> {
         let conn = Connection::open_with_flags(
             path,
@@ -327,7 +412,7 @@ impl CorpusStore {
                 )
             })?;
 
-        let store = Self { conn, release };
+        let store = Self::from_connection(conn, release)?;
         store.verify_format_header()?;
         Ok(store)
     }
@@ -356,7 +441,7 @@ impl CorpusStore {
                 )
             })?;
 
-        let store = Self { conn, release };
+        let store = Self::from_connection(conn, release)?;
         store.validate_full(
             path.parent().unwrap_or_else(|| Path::new(".")),
             expected_counts,
@@ -540,7 +625,7 @@ impl CorpusStore {
         )?;
         expect_meta(
             "normalization_revision",
-            NORMALIZATION_REVISION,
+            self.normalization.revision(),
             "Unsupported corpus normalization revision.",
         )?;
         expect_meta(
@@ -646,6 +731,7 @@ impl CorpusStore {
         }
 
         self.verify_format_header()?;
+        self.validate_work_families()?;
         self.run_native_fts5_integrity_check()?;
 
         let actual_counts = self.counts()?;
@@ -1238,7 +1324,7 @@ impl CorpusStore {
                 ));
             }
 
-            let title_tokens = index_tokens_string(&source.title);
+            let title_tokens = self.normalization.index_tokens(&source.title);
             for (idx, (stored, draft)) in stored_passages
                 .iter()
                 .zip(expected_drafts.iter())
@@ -1302,7 +1388,7 @@ impl CorpusStore {
                     seen_terms.insert(tok);
                     title_count += 1;
                 }
-                let body_tokens = index_tokens_string(text);
+                let body_tokens = self.normalization.index_tokens(text);
                 let mut body_count = 0usize;
                 for (offset, tok) in body_tokens.split_ascii_whitespace().enumerate() {
                     expected_buckets.push(*rowid, 1, offset as u32, tok.as_bytes())?;
@@ -1645,24 +1731,49 @@ impl CorpusStore {
         Ok(())
     }
 
+    fn validate_work_families(&self) -> Result<(), ClecError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.id, m.value FROM metadata m LEFT JOIN works w ON w.id=substr(m.key, length('work_family:')+1)
+             WHERE m.key GLOB 'work_family:*'",
+        ).map_err(map_sql_pkg)?;
+        let mut rows = stmt.query([]).map_err(map_sql_pkg)?;
+        while let Some(row) = rows.next().map_err(map_sql_pkg)? {
+            let work_id: Option<String> = row.get(0).map_err(map_sql_pkg)?;
+            if work_id.is_none() || self.normalization == Normalization::Legacy {
+                return Err(ClecError::new(
+                    ErrorCode::InvalidPackage,
+                    "Work family metadata references an unknown work or unsupported revision.",
+                ));
+            }
+            WorkFamily::from_metadata(&row.get::<_, String>(1).map_err(map_sql_pkg)?)?;
+        }
+        Ok(())
+    }
+
     pub fn load_work(&self, work_id: &WorkId) -> Result<WorkRecord, ClecError> {
         self.conn
             .query_row(
-                "SELECT id, work_key, title FROM works WHERE id=?",
+                "SELECT w.id, w.work_key, w.title, m.value FROM works w
+                 LEFT JOIN metadata m ON m.key='work_family:' || w.id WHERE w.id=?",
                 [work_id.as_str()],
                 |row| {
                     let id_s: String = row.get(0)?;
                     let work_key: String = row.get(1)?;
                     let title: String = row.get(2)?;
-                    Ok((id_s, work_key, title))
+                    let family: Option<String> = row.get(3)?;
+                    Ok((id_s, work_key, title, family))
                 },
             )
             .map_err(|_| ClecError::new(ErrorCode::EvidenceNotFound, "Work not found."))
-            .and_then(|(id_s, work_key, title)| {
+            .and_then(|(id_s, work_key, title, family)| {
                 Ok(WorkRecord {
                     work_id: WorkId::parse(&id_s)?,
                     work_key,
                     title,
+                    family: family
+                        .as_deref()
+                        .map(WorkFamily::from_metadata)
+                        .transpose()?,
                 })
             })
     }
@@ -1879,9 +1990,116 @@ impl CorpusStore {
         Ok(cues)
     }
 
+    pub(crate) fn load_passage_dedup_info(
+        &self,
+        passage_id: &PassageId,
+    ) -> Result<PassageDedupInfo, ClecError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT p.text, s.role, s.attribution, (m.value IS NOT NULL)
+                 FROM passages p
+                 JOIN sources s ON s.id = p.source_id
+                 LEFT JOIN metadata m ON m.key = 'work_family:' || p.work_id
+                 WHERE p.id = ?1",
+            )
+            .map_err(map_sql_pkg)?;
+        let (text, role_s, attr_s, has_family_i): (String, String, String, i64) = stmt
+            .query_row([passage_id.as_str()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(map_sql_pkg)?;
+        Ok(PassageDedupInfo {
+            text,
+            role: SourceRole::parse(&role_s)?,
+            attribution: Attribution::parse(&attr_s)?,
+            has_family: has_family_i != 0,
+        })
+    }
+
+    pub fn load_search_passage(&self, passage_id: &PassageId) -> Result<SearchPassage, ClecError> {
+        let (source_id, text, continued_from, continued_to) = self
+            .conn
+            .query_row(
+                "SELECT source_id, text, continued_from, continued_to FROM passages WHERE id=?",
+                [passage_id.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .map_err(map_sql_pkg)?;
+        let source = self.load_source(&SourceId::parse(&source_id)?)?;
+        let work = self.load_work(&source.work_id)?;
+        let spans = self.load_spans(passage_id.as_str())?;
+        let time_range = if spans.iter().any(|span| span.cue_ordinal().is_some()) {
+            let (start, end): (Option<i64>, Option<i64>) = self
+                .conn
+                .query_row(
+                    "SELECT MIN(c.start_ms), MAX(c.end_ms) FROM passage_spans p JOIN cues c
+                 ON c.source_id=? AND c.ordinal=p.cue_ordinal WHERE p.passage_id=?",
+                    params![source_id, passage_id.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(map_sql_pkg)?;
+            start
+                .zip(end)
+                .map(|(start, end)| {
+                    Ok((
+                        u64::try_from(start).map_err(|_| bad_cue())?,
+                        u64::try_from(end).map_err(|_| bad_cue())?,
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(SearchPassage {
+            source,
+            work,
+            text,
+            spans,
+            continued_from: continued_from.map(|id| PassageId::parse(&id)).transpose()?,
+            continued_to: continued_to.map(|id| PassageId::parse(&id)).transpose()?,
+            time_range,
+        })
+    }
+
+    pub fn verify_search_excerpt(
+        &self,
+        content_hash: &str,
+        span: &ByteSpan,
+        excerpt: &str,
+    ) -> Result<(), ClecError> {
+        let raw: Vec<u8> = self
+            .conn
+            .query_row(
+                "SELECT substr(raw_bytes, ?, ?) FROM blobs WHERE content_hash=?",
+                params![
+                    span.start_byte() as i64 + 1,
+                    (span.end_byte() - span.start_byte()) as i64,
+                    content_hash
+                ],
+                |r| r.get(0),
+            )
+            .map_err(map_sql_pkg)?;
+        if raw != excerpt.as_bytes() {
+            return Err(ClecError::new(
+                ErrorCode::IntegrityMismatch,
+                "Search excerpt does not match its raw source bytes.",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn load_verified_passage_core(
         &self,
         passage_id: &PassageId,
+        with_cues: bool,
     ) -> Result<VerifiedPassageCore, ClecError> {
         let row = self
             .conn
@@ -1922,7 +2140,11 @@ impl CorpusStore {
                 ),
             ));
         }
-        let cues = self.load_cues_for_spans(&source_id, &spans)?;
+        let cues = if with_cues {
+            self.load_cues_for_spans(&source_id, &spans)?
+        } else {
+            Vec::new()
+        };
         let ordinal = usize::try_from(row.1)
             .map_err(|_| ClecError::new(ErrorCode::InvalidPackage, "Negative passage ordinal."))?;
         let boundary = BoundaryKind::parse(&row.2)?;
@@ -1972,7 +2194,17 @@ impl CorpusStore {
         context_sides: usize,
         find_literal: Option<&str>,
     ) -> Result<PassageReadItem, ClecError> {
-        let verified = self.load_verified_passage_core(passage_id)?;
+        self.read_passage_with_cues(passage_id, context_sides, find_literal, true)
+    }
+
+    pub fn read_passage_with_cues(
+        &self,
+        passage_id: &PassageId,
+        context_sides: usize,
+        find_literal: Option<&str>,
+        with_cues: bool,
+    ) -> Result<PassageReadItem, ClecError> {
+        let verified = self.load_verified_passage_core(passage_id, with_cues)?;
         let core = verified.context;
         let source = verified.source;
         let work = verified.work;
@@ -2008,7 +2240,7 @@ impl CorpusStore {
                 .map_err(map_sql_pkg)?;
             while let Some(row) = rows.next().map_err(map_sql_pkg)? {
                 let adj_id = PassageId::parse(&row.get::<_, String>(0).map_err(map_sql_pkg)?)?;
-                let adj = self.load_verified_passage_core(&adj_id)?;
+                let adj = self.load_verified_passage_core(&adj_id, with_cues)?;
                 context.push(adj.context);
             }
         }
@@ -2194,7 +2426,8 @@ impl CorpusStore {
                         "Sources query must be at most 512 UTF-8 bytes without NUL.",
                     ));
                 }
-                normalize_for_search(q)
+                self.normalization
+                    .normalize(q)
                     .split_whitespace()
                     .map(ToOwned::to_owned)
                     .collect()
@@ -2258,8 +2491,9 @@ impl CorpusStore {
                 continue;
             }
             if !normalized_terms.is_empty() {
-                let haystack =
-                    normalize_for_search(&format!("{work_title}\n{work_key}\n{title}\n{path}"));
+                let haystack = self
+                    .normalization
+                    .normalize(&format!("{work_title}\n{work_key}\n{title}\n{path}"));
                 if !normalized_terms.iter().all(|t| haystack.contains(t)) {
                     continue;
                 }
@@ -2621,6 +2855,7 @@ fn postings_equal(a: &SortedPostingBucket, b: &SortedPostingBucket) -> bool {
 mod tests {
     use super::*;
     use crate::domain::ByteSpan;
+    use crate::domain::NORMALIZATION_REVISION;
     use crate::lexical::index_tokens_string;
     use crate::snapshot::publish_release;
     use std::fs;

@@ -2,14 +2,18 @@
 
 Use the native release binary, a synced full corpus, and a labeled Phase 3 development dataset that names that corpus hash. This exercise uses real CLEC text and CLI output. It measures evidence retrieval and expansion under the Agent host's 32 KiB per-call cap.
 
+## Choose the CLI contract
+
+The commands below score the original CLI's full search passages as evidence. Use the preserved Stage 0 binary for legacy and future sealed holdout baselines. Run the [Stage 1 comparison](../agent-native/phase1/VERIFICATION.md) for lightweight search. It scores lead location, excerpt visibility, and exact read evidence separately.
+
 ## Run the development checks
 
-Build the current checkout and run both profiles from the repository root. The paths below use the local full-corpus copy and the retained development dataset. Use a new output directory for each run.
+Run both profiles from the repository root with the preserved original executable. The paths below use the local full-corpus copy and the retained development dataset. Use a new output directory for each run.
 
 ```sh
-cargo build --manifest-path native/Cargo.toml --locked --release --bin clec
+clec_original=.audit/agent-native-phase0-20261120/clec-14c34a9a049770b76b51a994d3f3501748b6fe7d3af6aa9257a74dac981a12b6
 python3 evaluation/clec-v1/phase3/verify_local.py \
-  --clec native/target/release/clec \
+  --clec "$clec_original" \
   --data-dir .cache/clec-local-verification/data \
   --dataset .audit/phase3-frozen-v1/development.dataset.json \
   --output .audit/clec-local-baseline
@@ -23,7 +27,7 @@ Open `summary.json` for the input hashes, counts, and per-question changes. Each
 
 ### Compare after a change
 
-1. Rebuild `clec` and repeat the check with a new `--output` and `--baseline .audit/clec-local-baseline`. The script requires the same corpus, dataset, and profile settings. Open `baselineChanges` in the new `summary.json` to find recovered and newly missing obligations, including conditions and counterexamples.
+1. For a build that uses the original full-hit contract, repeat the check with a new `--output` and `--baseline .audit/clec-local-baseline`. The script requires the same corpus, dataset, and profile settings. Open `baselineChanges` in the new `summary.json` to find recovered and newly missing obligations, including conditions and counterexamples.
 2. For each loss, open the paired `calls.jsonl` records. Check omitted result IDs on search, inspect any read error or partial result, and probe a scoped follow-up against the source. Record the original failing command, the expected source span, and which action recovered it. If you add the case to the development set, verify its labels with `eval.py validate-dataset`.
 3. Use `eval.py score-outcomes` to check a saved result without rerunning CLEC. Pass the saved dataset, corpus hash, and the same per-call caps as in the run. Supply `--read-max-bytes 32768` for `search-read`.
 

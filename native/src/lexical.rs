@@ -7,7 +7,9 @@ use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
 use crate::domain::hex_decode;
-use crate::domain::{ClecError, ErrorCode, hex_encode};
+use crate::domain::{
+    ClecError, ErrorCode, LEGACY_NORMALIZATION_REVISION, NORMALIZATION_REVISION, hex_encode,
+};
 
 pub(crate) const MAX_QUERY_BYTES: usize = 512;
 pub(crate) const MAX_QUERY_TERMS: usize = 64;
@@ -27,10 +29,43 @@ fn engine() -> &'static LexicalEngine {
     })
 }
 
-pub(crate) fn normalize_for_search(text: &str) -> String {
-    let simplified = engine().opencc.convert(text);
-    let nfkc: String = simplified.nfkc().collect();
-    nfkc.to_lowercase()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Normalization {
+    Legacy,
+    Current,
+}
+
+impl Normalization {
+    pub(crate) fn parse(revision: &str) -> Result<Self, ClecError> {
+        match revision {
+            LEGACY_NORMALIZATION_REVISION => Ok(Self::Legacy),
+            NORMALIZATION_REVISION => Ok(Self::Current),
+            _ => Err(ClecError::new(
+                ErrorCode::InvalidPackage,
+                "Unsupported corpus normalization revision.",
+            )),
+        }
+    }
+
+    pub(crate) fn revision(self) -> &'static str {
+        match self {
+            Self::Legacy => LEGACY_NORMALIZATION_REVISION,
+            Self::Current => NORMALIZATION_REVISION,
+        }
+    }
+
+    pub(crate) fn normalize(self, text: &str) -> String {
+        let simplified = engine().opencc.convert(text);
+        let nfkc: String = simplified.nfkc().collect();
+        let normalized = nfkc.to_lowercase();
+        if self == Self::Legacy {
+            return normalized;
+        }
+
+        // OpenCC maps isolated simplified 么 to 幺, while traditional phrase
+        // conversions yield 么. Restore only known grammatical endings.
+        normalized.replace("什幺", "什么").replace("怎幺", "怎么")
+    }
 }
 
 pub(crate) fn encode_fts_token(token: &str) -> String {
@@ -128,44 +163,55 @@ fn segment_normalized(normalized: &str, for_index: bool) -> Vec<String> {
     tokens
 }
 
-pub(crate) fn tokenize_normalized(text: &str) -> Vec<String> {
-    let normalized = normalize_for_search(text);
-    segment_normalized(&normalized, false)
+impl Normalization {
+    pub(crate) fn tokenize_normalized(self, text: &str) -> Vec<String> {
+        let normalized = self.normalize(text);
+        segment_normalized(&normalized, false)
+    }
+
+    pub(crate) fn index_tokens(self, text: &str) -> String {
+        let normalized = self.normalize(text);
+        segment_normalized(&normalized, true)
+            .into_iter()
+            .map(|tok| encode_fts_token(&tok))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(crate) fn query_terms(self, query: &str) -> Result<Vec<String>, ClecError> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || query.len() > MAX_QUERY_BYTES || query.contains('\0') {
+            return Err(ClecError::new(
+                ErrorCode::InvalidQuery,
+                "Query must be 1..512 UTF-8 bytes without NUL.",
+            ));
+        }
+        let normalized = self.normalize(trimmed);
+        let raw_terms = segment_normalized(&normalized, false);
+        let mut seen = HashSet::new();
+        let mut deduped = Vec::new();
+        for term in raw_terms {
+            if seen.insert(term.clone()) {
+                deduped.push(term);
+            }
+        }
+        if deduped.is_empty() || deduped.len() > MAX_QUERY_TERMS {
+            return Err(ClecError::new(
+                ErrorCode::InvalidQuery,
+                "Query must produce 1..64 distinct lexical terms.",
+            ));
+        }
+        Ok(deduped)
+    }
 }
 
 pub(crate) fn index_tokens_string(text: &str) -> String {
-    let normalized = normalize_for_search(text);
-    segment_normalized(&normalized, true)
-        .into_iter()
-        .map(|tok| encode_fts_token(&tok))
-        .collect::<Vec<_>>()
-        .join(" ")
+    Normalization::Current.index_tokens(text)
 }
 
-pub(crate) fn query_terms(query: &str) -> Result<Vec<String>, ClecError> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() || query.len() > MAX_QUERY_BYTES || query.contains('\0') {
-        return Err(ClecError::new(
-            ErrorCode::InvalidQuery,
-            "Query must be 1..512 UTF-8 bytes without NUL.",
-        ));
-    }
-    let normalized = normalize_for_search(trimmed);
-    let raw_terms = segment_normalized(&normalized, false);
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for term in raw_terms {
-        if seen.insert(term.clone()) {
-            deduped.push(term);
-        }
-    }
-    if deduped.is_empty() || deduped.len() > MAX_QUERY_TERMS {
-        return Err(ClecError::new(
-            ErrorCode::InvalidQuery,
-            "Query must produce 1..64 distinct lexical terms.",
-        ));
-    }
-    Ok(deduped)
+#[cfg(test)]
+fn query_terms(query: &str) -> Result<Vec<String>, ClecError> {
+    Normalization::Current.query_terms(query)
 }
 
 #[cfg(test)]
@@ -197,6 +243,30 @@ mod tests {
     }
 
     #[test]
+    fn grammatical_me_variants_share_fts_terms_without_replacing_literal_yao() {
+        for spellings in [
+            ["什么", "什麼", "什幺"],
+            ["怎么", "怎麼", "怎幺"],
+            ["为什么", "為什麼", "为什幺"],
+        ] {
+            let expected = query_terms(spellings[0]).unwrap();
+            for spelling in spellings {
+                assert_eq!(query_terms(spelling).unwrap(), expected);
+                assert_eq!(
+                    index_tokens_string(spelling),
+                    index_tokens_string(spellings[0])
+                );
+            }
+        }
+        assert_eq!(query_terms("幺二").unwrap(), vec!["幺", "二"]);
+        assert_eq!(Normalization::Current.normalize("我要幺鸡"), "我要幺鸡");
+        assert_eq!(
+            Normalization::Legacy.query_terms("什么").unwrap(),
+            vec!["什幺"]
+        );
+    }
+
+    #[test]
     fn traditional_and_simplified_produce_matching_terms() {
         let trad = query_terms("資產配置 退休提領 再平衡").unwrap();
         let simp = query_terms("资产配置 退休提领 再平衡").unwrap();
@@ -214,7 +284,7 @@ mod tests {
 
         let long_passage = "0050 與 QQQ 配置 ".repeat(60);
         assert!(long_passage.len() > MAX_QUERY_BYTES);
-        let toks = tokenize_normalized(&long_passage);
+        let toks = Normalization::Current.tokenize_normalized(&long_passage);
         assert!(!toks.is_empty());
         assert_eq!(toks[0], "0050");
     }

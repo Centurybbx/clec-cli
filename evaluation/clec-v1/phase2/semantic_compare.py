@@ -308,6 +308,10 @@ def verify_validation_receipt(
             "reason": "Receipt validator binarySha256 does not match active validator binary.",
         }
     for key in IDENTITY_MATCH_KEYS:
+        if key == "normalizationRevision":
+            supported = expected_identity.get("supportedNormalizationRevisions")
+            if isinstance(supported, list) and receipt.get(key) in supported:
+                continue
         if receipt.get(key) != expected_identity.get(key):
             return {
                 **base,

@@ -699,7 +699,23 @@ fn group1_zero_api_and_pre_bootstrap_validation() {
                 "星雲指南",
                 "--sag2",
                 "--limit",
-                "6",
+                "51",
+            ],
+            &key_env,
+        ),
+        2,
+        Some("INVALID_ARGUMENT"),
+    );
+    assert_err_json(
+        &run_clec(
+            &[
+                "--data-dir",
+                &cold_s,
+                "search",
+                "星雲指南",
+                "--sag2",
+                "--offset",
+                "1",
             ],
             &key_env,
         ),
@@ -813,6 +829,45 @@ fn group1_zero_api_and_pre_bootstrap_validation() {
         "invalid args/config must not create --data-dir"
     );
     assert!(srv.logs().is_empty());
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bad_utf8 = OsStr::from_bytes(b"bad\xffvalue");
+        for var in ["JEV_MODEL", "JEV_BASE_URL", "JEV_API_KEY"] {
+            let mut cmd = Command::new(clec_bin());
+            cmd.args(["--data-dir", &cold_s, "search", "星雲指南", "--sag2"]);
+            for key in [
+                "OPENROUTER_API_KEY",
+                "JEV_API_KEY",
+                "JEV_BASE_URL",
+                "JEV_MODEL",
+                "CLEC_DATA_DIR",
+            ] {
+                cmd.env_remove(key);
+            }
+            if var != "JEV_BASE_URL" {
+                cmd.env("JEV_BASE_URL", &url);
+            }
+            if var != "JEV_API_KEY" {
+                cmd.env("JEV_API_KEY", SENTINEL_KEY);
+            }
+            cmd.env(var, bad_utf8);
+            let out = cmd.output().expect("run clec with non-UTF-8 env");
+            let err = assert_err_json(&out, 2, Some("INVALID_JEV_CONFIG"));
+            assert!(
+                err["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("valid UTF-8"),
+                "var={var}, err={err}"
+            );
+        }
+        assert!(!cold_dir.exists());
+        assert!(srv.logs().is_empty());
+    }
 }
 
 #[test]
@@ -1142,6 +1197,41 @@ fn group3_credentials_normalization_no_retry_and_no_redirect() {
     assert_eq!(logs[0].model.as_deref(), Some("custom/jev-mock"));
     assert!(logs[0].auth_present);
     assert!(logs[0].auth_matches_sentinel);
+
+    let escaped_model = format!("{}{}", "\\\"".repeat(120), "a".repeat(16));
+    assert_eq!(escaped_model.len(), 256);
+    let escaped_actual = format!("{}{}", "\\\"".repeat(120), "b".repeat(16));
+    assert_eq!(escaped_actual.len(), 256);
+    let escaped_actual_for_srv = escaped_actual.clone();
+    let srv_escaped = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(move |_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.7, &escaped_actual_for_srv),
+            delay: Duration::ZERO,
+        }),
+    );
+    let esc_res = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "search",
+            "量子錨點",
+            "--sag2",
+            "--key-file",
+            &kf_s,
+        ],
+        &[
+            ("JEV_BASE_URL", &srv_escaped.url("/decisions")),
+            ("JEV_MODEL", &escaped_model),
+        ],
+    ));
+    assert_eq!(esc_res["data"]["requestedModel"], escaped_model);
+    assert_eq!(esc_res["data"]["actualModel"], escaped_actual);
+    assert_eq!(
+        srv_escaped.logs()[0].model.as_deref(),
+        Some(escaped_model.as_str())
+    );
 
     assert_err_json(
         &run_clec(
@@ -2049,10 +2139,49 @@ fn group6_exact_evidence_integrity_errors_and_release_snapshot_pin() {
     for hit in hits {
         let pid = hit["passageId"].as_str().unwrap();
         let expected = &pre_swap_map[pid];
-        assert_eq!(hit["text"], expected["text"]);
-        assert_eq!(hit["spans"], expected["spans"]);
-        assert_eq!(hit["cues"], expected["cues"]);
-        assert_eq!(hit["source"], expected["source"]);
+        assert!(hit.get("text").is_none());
+        assert!(hit.get("spans").is_none());
+        assert!(hit.get("cues").is_none());
+        for field in ["sourceId", "title", "role", "attribution"] {
+            assert_eq!(hit["source"][field], expected["source"][field]);
+        }
+        assert_eq!(hit["work"]["workId"], expected["work"]["workId"]);
+        let excerpt = hit["excerpt"].as_str().unwrap();
+        assert!(!excerpt.is_empty());
+        assert!(expected["text"].as_str().unwrap().contains(excerpt));
+        let span = &hit["excerptSpan"];
+        let (start, end) = (
+            span["startByte"].as_u64().unwrap(),
+            span["endByte"].as_u64().unwrap(),
+        );
+        assert_eq!(end - start, excerpt.len() as u64);
+        assert!(
+            expected["spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|original| {
+                    original["startByte"].as_u64().unwrap() <= start
+                        && end <= original["endByte"].as_u64().unwrap()
+                        && original["cueOrdinal"] == span["cueOrdinal"]
+                })
+        );
+        assert_err_json(
+            &run_clec(
+                &[
+                    "--data-dir",
+                    &dir_s,
+                    "--offline",
+                    "read",
+                    pid,
+                    "--release",
+                    &corpus.release,
+                ],
+                &[],
+            ),
+            3,
+            Some("VERSION_UNAVAILABLE"),
+        );
     }
 
     let mutate_and_expect_integrity = |sql: &str| {
@@ -2954,7 +3083,7 @@ fn group7_default_local_baseline_parity_with_pre_sag2_release() {
 #[test]
 fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
     let mut sources: Vec<OwnedSourceSpec<'_>> = Vec::new();
-    for i in 0..35usize {
+    for i in 0..33usize {
         sources.push((
             Box::leak(format!("w_{i:02}").into_boxed_str()),
             Box::leak(format!("p_{i:02}.txt").into_boxed_str()),
@@ -3017,7 +3146,9 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
         full_json["data"]["calls"]["httpAttempts"].as_u64().unwrap() as usize,
         logs.len()
     );
-    assert!(logs.iter().all(|l| l.question_keys.len() <= 32));
+    let mut question_counts: Vec<_> = logs.iter().map(|log| log.question_keys.len()).collect();
+    question_counts.sort_unstable();
+    assert_eq!(question_counts, [1, 32]);
     assert!(
         proxy_srv.logs().is_empty(),
         "synthetic proxy env must be ignored"
@@ -3084,9 +3215,83 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
         ],
         &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
     );
-    let trimmed_json = assert_ok_json(&one_under);
-    assert_eq!(trimmed_json["data"]["budget"]["omittedCount"], 1);
-    assert_eq!(trimmed_json["data"]["hits"].as_array().unwrap().len(), 2);
+    let truncated_json = assert_ok_json(&one_under);
+    assert!(one_under.stdout.len() < exact_len);
+    assert_eq!(truncated_json["data"]["hits"].as_array().unwrap().len(), 2);
+    assert_eq!(truncated_json["data"]["budget"]["omittedCount"], 1);
+    assert_eq!(
+        truncated_json["data"]["budget"]["omittedIds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        truncated_json["data"]["budget"]["usedBytes"]
+            .as_u64()
+            .unwrap() as usize,
+        one_under.stdout.len()
+    );
+
+    let one_hit = run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--max-bytes",
+            &(one_under.stdout.len() - 1).to_string(),
+            "search",
+            "星海批次回合",
+            "--sag2",
+            "--limit",
+            "3",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    );
+    let one_hit_json = assert_ok_json(&one_hit);
+    assert_eq!(one_hit_json["data"]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(one_hit_json["data"]["budget"]["omittedCount"], 2);
+    let one_hit_len = one_hit.stdout.len();
+
+    let too_tight = run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--max-bytes",
+            &(one_hit_len - 1).to_string(),
+            "search",
+            "星海批次回合",
+            "--sag2",
+            "--limit",
+            "3",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    );
+    let too_tight_error = assert_err_json(&too_tight, 2, Some("OUTPUT_BUDGET_TOO_SMALL"));
+    assert!(too_tight.stdout.is_empty());
+    assert_eq!(too_tight_error["error"]["requiredBytes"], one_hit_len);
+    assert_eq!(
+        too_tight_error["error"]["sag2Stage"]["completedStage"],
+        "output_budget"
+    );
+
+    let wide_output = run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--max-bytes",
+            "32768",
+            "search",
+            "星海批次回合",
+            "--sag2",
+            "--limit",
+            "20",
+        ],
+        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+    );
+    let wide_json = assert_ok_json(&wide_output);
+    assert_eq!(wide_json["data"]["budget"]["omittedCount"], 0);
+    assert_eq!(wide_json["data"]["hits"].as_array().unwrap().len(), 20);
+    assert!(wide_output.stdout.len() <= 32_768);
 
     srv.clear_logs();
     let tiny = run_clec(
@@ -3112,7 +3317,7 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
             "--data-dir",
             &dir_s,
             "--max-bytes",
-            "1800",
+            &(one_hit_len - 10).to_string(),
             "search",
             "星海批次回合",
             "--sag2",
@@ -3138,60 +3343,6 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
         ],
     );
     assert_err_json(&shipped_tls_err, 4, Some("TRANSFER_FAILED"));
-
-    let mut heavy_sources: Vec<OwnedSourceSpec<'_>> = Vec::new();
-    for i in 0..10usize {
-        heavy_sources.push((
-            Box::leak(format!("hw_{i:02}").into_boxed_str()),
-            Box::leak(format!("h_{i:02}.txt").into_boxed_str()),
-            Box::leak(format!("Heavy {i:02}").into_boxed_str()),
-            "document",
-            format!(
-                "重載邊界測試種子{i:02} 關聯詞彙「天琴橋接{i:02}」。{}",
-                "甲".repeat(520)
-            ),
-            None,
-        ));
-    }
-    heavy_sources.push((
-        "hw_target",
-        "htarget.txt",
-        "Heavy Target",
-        "document",
-        format!("「天琴橋接00」目標長段落。{}", "乙".repeat(520)),
-        None,
-    ));
-    let heavy_refs: Vec<SourceSpec<'_>> = heavy_sources
-        .iter()
-        .map(|(w, p, t, r, b, d)| (*w, *p, *t, *r, b.as_str(), *d))
-        .collect();
-    let heavy_corpus = publish_and_sync_corpus(
-        &heavy_sources
-            .iter()
-            .map(|(w, _, t, _, _, _)| (*w, *t))
-            .collect::<Vec<_>>(),
-        &heavy_refs,
-    );
-    let heavy_dir_s = heavy_corpus.data_dir.display().to_string();
-    srv.clear_logs();
-    let heavy_res = assert_ok_json(&run_clec(
-        &[
-            "--data-dir",
-            &heavy_dir_s,
-            "search",
-            "重載邊界測試種子",
-            "--sag2",
-        ],
-        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
-    ));
-    assert!(
-        heavy_res["data"]["candidateCounts"]["contextOmittedCount"]
-            .as_u64()
-            .unwrap()
-            > 0,
-        "large seeds must trigger whole-record contextOmittedCount reduction: {}",
-        heavy_res
-    );
 
     let cap_sources: Vec<OwnedSourceSpec<'_>> = (0..100usize)
         .map(|i| {
@@ -3231,9 +3382,187 @@ fn group8_budgets_packing_max_bytes_fixed_point_tls_proxy_and_hooks() {
         ],
         &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
     );
-    let cap_err = assert_err_json(&cap_out, 2, Some("SAG2_BUDGET_EXHAUSTED"));
-    assert_eq!(cap_err["error"]["sag2Stage"]["httpAttempts"], 32);
-    assert_eq!(srv.logs().len(), 32);
+    let cap_result = assert_ok_json(&cap_out);
+    assert_eq!(cap_result["data"]["candidateCounts"]["initialPool"], 100);
+    assert_eq!(
+        cap_result["data"]["candidateCounts"]["scoredOccurrences"],
+        100
+    );
+    assert!(
+        srv.logs().len() < 32,
+        "shared-state batching should fit more candidates per batch"
+    );
+}
+
+#[test]
+fn group8_full_seed_admission_depends_on_the_requested_model() {
+    let srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.75, "typesafe/jev-1.14-20261014"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let url = srv.url("/decisions");
+    let seed_count = |log: &LoggedRequest| {
+        let request = log.parsed_json.as_ref().unwrap();
+        let state: Value = serde_json::from_str(request["state"].as_str().unwrap()).unwrap();
+        state["previously_retrieved_evidence"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let make_corpus = |padding: &str| {
+        let mut bodies: Vec<_> = (0..10)
+            .map(|i| format!("重載邊界測試種子{i:02} 關聯詞彙「天琴橋接{i:02}」。{padding}"))
+            .collect();
+        bodies.push("「天琴橋接00」目標長段落。".to_owned());
+        let paths: Vec<_> = (0..bodies.len())
+            .map(|i| format!("heavy_{i}.txt"))
+            .collect();
+        let sources: Vec<SourceSpec<'_>> = paths
+            .iter()
+            .zip(&bodies)
+            .map(|(path, body)| {
+                (
+                    "hw",
+                    path.as_str(),
+                    "Heavy",
+                    "document",
+                    body.as_str(),
+                    None,
+                )
+            })
+            .collect();
+        publish_and_sync_corpus(&[("hw", "Heavy")], &sources)
+    };
+    let run = |corpus: &PublishedCorpus, model| {
+        let mut env = vec![
+            ("JEV_BASE_URL", url.as_str()),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ];
+        if let Some(model) = model {
+            env.push(("JEV_MODEL", model));
+        }
+        srv.clear_logs();
+        run_clec(
+            &[
+                "--data-dir",
+                &corpus.data_dir.display().to_string(),
+                "search",
+                "重載邊界測試種子",
+                "--sag2",
+            ],
+            &env,
+        )
+    };
+    let heavy = make_corpus(&"甲".repeat(560));
+    let success = assert_ok_json(&run(&heavy, None));
+    let data = &success["data"];
+    assert_eq!(data["requestedModel"], "typesafe/jev-1.14");
+    assert_eq!(data["roundsCompleted"], 2);
+    assert_eq!(data["candidateCounts"]["contextOmittedCount"], 0);
+    assert_eq!(
+        data["limits"]["admissionPolicy"],
+        "calibrated_jev_1_14_body_bounded"
+    );
+    assert_eq!(
+        data["limits"].get("maxQuestionEstimatedTokens"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        data["limits"].get("maxBatchEstimatedTokens"),
+        Some(&Value::Null)
+    );
+    let logs = srv.logs();
+    let round_one: Vec<_> = logs.iter().filter(|log| seed_count(log) != 0).collect();
+    assert!(!round_one.is_empty());
+    assert!(round_one.iter().all(|log| seed_count(log) == 10));
+    assert!(logs.iter().all(|log| log.body_bytes <= 65_536));
+    let forecast: usize = logs
+        .iter()
+        .map(|log| (log.body_bytes * 2).div_ceil(5) + 42 * log.question_keys.len() + 4)
+        .sum();
+    assert_eq!(data["consumption"]["estimatedTokenUnits"], forecast);
+    assert_eq!(
+        data["consumption"]["tokenEstimateBasis"],
+        "jev_1_14_synthetic_forecast_non_blocking"
+    );
+
+    let assert_round_one_rejected = |output: &Output, limit: &str| {
+        let error = assert_err_json(output, 2, Some("SAG2_BUDGET_EXHAUSTED"));
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("full scoring context"), "{message}");
+        assert!(message.contains("Seeds: 10"), "{message}");
+        assert!(message.contains(limit), "{message}");
+        assert_eq!(error["error"]["sag2Stage"]["roundsCompleted"], 1);
+        let logs = srv.logs();
+        assert!(!logs.is_empty());
+        assert!(logs.iter().all(|log| seed_count(log) == 0));
+        assert_eq!(error["error"]["sag2Stage"]["httpAttempts"], logs.len());
+    };
+    assert_round_one_rejected(
+        &run(&heavy, Some("~typesafe/jev-latest")),
+        "uncalibrated model question estimate limit",
+    );
+    // Nested JSON escapes add seven request bytes for each control character in a seed.
+    let oversized = make_corpus(&"\u{0001}".repeat(1040));
+    let packed_oversized = assert_ok_json(&run(&oversized, None));
+    let packed_data = &packed_oversized["data"];
+    let seeds_selected = packed_data["candidateCounts"]["seedsSelected"]
+        .as_u64()
+        .unwrap() as usize;
+    let omitted = packed_data["candidateCounts"]["contextOmittedCount"]
+        .as_u64()
+        .unwrap() as usize;
+    assert!(seeds_selected > 0 && seeds_selected < 10);
+    assert_eq!(seeds_selected + omitted, 10);
+    let oversized_logs = srv.logs();
+    let r1_oversized: Vec<_> = oversized_logs
+        .iter()
+        .filter(|log| seed_count(log) > 0)
+        .collect();
+    assert!(!r1_oversized.is_empty());
+    assert!(
+        r1_oversized
+            .iter()
+            .all(|log| seed_count(log) == seeds_selected && log.body_bytes <= 65_536)
+    );
+
+    let seed_title = " s".repeat(21_000);
+    let target_title = " t".repeat(12_500);
+    let single_body_over = publish_and_sync_corpus(
+        &[("hw", "Heavy"), ("hw2", "Heavy2")],
+        &[
+            (
+                "hw",
+                "seed.txt",
+                &seed_title,
+                "document",
+                "重載邊界測試種子 關聯詞彙「天琴橋接」。",
+                None,
+            ),
+            (
+                "hw2",
+                "target.txt",
+                &target_title,
+                "document",
+                "「天琴橋接」 目標長段落。",
+                None,
+            ),
+        ],
+    );
+    let body_over_err = assert_err_json(
+        &run(&single_body_over, None),
+        2,
+        Some("SAG2_BUDGET_EXHAUSTED"),
+    );
+    let body_over_msg = body_over_err["error"]["message"].as_str().unwrap();
+    assert!(body_over_msg.contains("request body limit"), "{body_over_msg}");
+    assert!(body_over_msg.contains("Seeds: 1"), "{body_over_msg}");
+    assert_eq!(body_over_err["error"]["sag2Stage"]["roundsCompleted"], 1);
+    assert!(srv.logs().iter().all(|log| seed_count(log) == 0));
 }
 
 #[cfg(feature = "test-hooks")]
@@ -3504,7 +3833,7 @@ srv.serve_forever()
 }
 
 #[test]
-fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
+fn group8_request_packing_over_32_batches_df4097_and_token_estimates() {
     let srv = MockJevServer::start(
         SENTINEL_KEY,
         Arc::new(|_, _, req| MockReply::Json {
@@ -3514,6 +3843,11 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
         }),
     );
     let url = srv.url("/decisions");
+    let uncalibrated_env = [
+        ("JEV_BASE_URL", url.as_str()),
+        ("JEV_API_KEY", SENTINEL_KEY),
+        ("JEV_MODEL", "~typesafe/jev-latest"),
+    ];
 
     let make_body_with_q_tokens = |base_tokens_target: usize| -> String {
         let probe_corpus = publish_and_sync_corpus(
@@ -3524,7 +3858,7 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
         srv.clear_logs();
         let probe_res = assert_ok_json(&run_clec(
             &["--data-dir", &p_dir, "search", "tokprobe", "--sag2"],
-            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+            &uncalibrated_env,
         ));
         let base_est = probe_res["data"]["consumption"]["estimatedTokenUnits"]
             .as_u64()
@@ -3553,9 +3887,17 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
             "tokprobe",
             "--sag2",
         ],
-        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        &uncalibrated_env,
     ));
     assert_eq!(q_ok["data"]["consumption"]["estimatedTokenUnits"], 32_000);
+    let limits = &q_ok["data"]["limits"];
+    assert_eq!(limits["admissionPolicy"], "uncalibrated_conservative_byte_bound");
+    assert_eq!(limits["maxQuestionEstimatedTokens"], 32_000);
+    assert_eq!(limits["maxBatchEstimatedTokens"], 64_000);
+    assert_eq!(
+        q_ok["data"]["consumption"]["tokenEstimateBasis"],
+        "uncalibrated_conservative_byte_bound_shared_state_once_per_batch"
+    );
     assert_eq!(srv.logs().len(), 1);
 
     let over_q_body = format!("{exact_q_body}b");
@@ -3573,22 +3915,24 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
                 "tokprobe",
                 "--sag2",
             ],
-            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+            &uncalibrated_env,
         ),
         2,
         Some("SAG2_BUDGET_EXHAUSTED"),
     );
     assert_eq!(q_err["error"]["sag2Stage"]["httpAttempts"], 0);
+    let message = q_err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("uncalibrated model question estimate limit"));
+    assert!(message.contains("32002/32000 units"));
     assert!(srv.logs().is_empty());
 
-    let b_q21334 = make_body_with_q_tokens(21_334);
-    let b_q21332 = make_body_with_q_tokens(21_332);
+    let shared_batch_body = make_body_with_q_tokens(24_000);
     let b_exact_corpus = publish_and_sync_corpus(
         &[("wb1", "B1"), ("wb2", "B2"), ("wb3", "B3")],
         &[
-            ("wb1", "1.txt", "T", "document", &b_q21334, None),
-            ("wb2", "2.txt", "T", "document", &b_q21334, None),
-            ("wb3", "3.txt", "T", "document", &b_q21332, None),
+            ("wb1", "1.txt", "T", "document", &shared_batch_body, None),
+            ("wb2", "2.txt", "T", "document", &shared_batch_body, None),
+            ("wb3", "3.txt", "T", "document", &shared_batch_body, None),
         ],
     );
     srv.clear_logs();
@@ -3600,17 +3944,18 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
             "tokprobe",
             "--sag2",
         ],
-        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        &uncalibrated_env,
     ));
     assert_eq!(b_ok["data"]["calls"]["httpAttempts"], 1);
-    assert_eq!(b_ok["data"]["consumption"]["estimatedTokenUnits"], 64_000);
+    assert_eq!(srv.logs()[0].question_keys.len(), 3);
 
+    let larger_batch_body = make_body_with_q_tokens(31_000);
     let b_over_corpus = publish_and_sync_corpus(
         &[("wb1", "B1"), ("wb2", "B2"), ("wb3", "B3")],
         &[
-            ("wb1", "1.txt", "T", "document", &b_q21334, None),
-            ("wb2", "2.txt", "T", "document", &b_q21334, None),
-            ("wb3", "3.txt", "T", "document", &b_q21334, None),
+            ("wb1", "1.txt", "T", "document", &larger_batch_body, None),
+            ("wb2", "2.txt", "T", "document", &larger_batch_body, None),
+            ("wb3", "3.txt", "T", "document", &larger_batch_body, None),
         ],
     );
     srv.clear_logs();
@@ -3622,44 +3967,74 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
             "tokprobe",
             "--sag2",
         ],
-        &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        &uncalibrated_env,
     ));
     assert_eq!(
         b_split["data"]["calls"]["httpAttempts"], 2,
-        "64,002 batch estimate must split into 2 batches"
+        "three individually admissible questions must split when their shared batch exceeds 64,000 units"
     );
 
-    let mut att32_works: Vec<(&str, &str)> = Vec::new();
-    let mut att32_owned: Vec<(String, String, String, String)> = Vec::new();
-    let stop_pad = "的".repeat(1950);
-    for i in 0..64usize {
+    let run_calibrated_singleton = |title: &str| {
+        let corpus = publish_and_sync_corpus(
+            &[("wp", "Probe")],
+            &[("wp", "p.txt", title, "document", "tokprobe", None)],
+        );
+        srv.clear_logs();
+        run_clec(
+            &[
+                "--data-dir",
+                &corpus.data_dir.display().to_string(),
+                "search",
+                "tokprobe",
+                "--sag2",
+            ],
+            &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
+        )
+    };
+    assert_ok_json(&run_calibrated_singleton("T"));
+    let padding = 65_536 - srv.logs()[0].body_bytes;
+    let exact_title = format!("T{}{}", " a".repeat(padding / 2), "a".repeat(padding % 2));
+    assert_ok_json(&run_calibrated_singleton(&exact_title));
+    assert_eq!(srv.logs().len(), 1);
+    assert_eq!(srv.logs()[0].body_bytes, 65_536);
+    let over_body = assert_err_json(
+        &run_calibrated_singleton(&format!("{exact_title}b")),
+        2,
+        Some("SAG2_BUDGET_EXHAUSTED"),
+    );
+    let message = over_body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("request body limit"));
+    assert!(message.contains("65537/65536 bytes"));
+    assert_eq!(over_body["error"]["sag2Stage"]["httpAttempts"], 0);
+    assert!(srv.logs().is_empty());
+
+    let mut many_works: Vec<(&str, &str)> = Vec::new();
+    let mut many_sources = Vec::new();
+    for i in 0..70usize {
         let w = format!("wa_{i:02}");
-        att32_works.push((
+        many_works.push((
             Box::leak(w.clone().into_boxed_str()),
             Box::leak(format!("WA {i:02}").into_boxed_str()),
         ));
-        att32_owned.push((
-            w,
-            format!("a_{i:02}.txt"),
-            format!("Doc {i:02}"),
-            format!("att32anchor {stop_pad}"),
-        ));
+        many_sources.push((w, format!("a_{i:02}.txt")));
     }
-    let att32_srcs: Vec<SourceSpec<'_>> = att32_owned
+    let large_title = "T".repeat(16_000);
+    let many_refs: Vec<SourceSpec<'_>> = many_sources
         .iter()
-        .map(|(w, p, t, b)| {
+        .map(|(w, p)| {
             (
                 w.as_str(),
                 p.as_str(),
-                t.as_str(),
+                large_title.as_str(),
                 "document",
-                b.as_str(),
+                exact_q_body.as_str(),
                 None,
             )
         })
         .collect();
-    let att32_corpus = publish_and_sync_corpus(&att32_works, &att32_srcs);
-    let srv_response_cap = MockJevServer::start(
+    let many_corpus = publish_and_sync_corpus(&many_works, &many_refs);
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let srv_many = MockJevServer::start_with_gate(
         SENTINEL_KEY,
         Arc::new(|_, _, req| {
             let mut body = serde_json::to_vec(&score_all_answers(req, 0.8, "m")).unwrap();
@@ -3672,33 +4047,49 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
                 delay: Duration::ZERO,
             }
         }),
+        Some(Arc::clone(&gate)),
     );
-    let att32_ok = assert_ok_json(&run_clec(
-        &[
-            "--data-dir",
-            &att32_corpus.data_dir.display().to_string(),
-            "search",
-            "att32anchor",
-            "--sag2",
-        ],
-        &[
-            ("JEV_BASE_URL", &srv_response_cap.url("/decisions")),
-            ("JEV_API_KEY", SENTINEL_KEY),
-        ],
-    ));
-    assert_eq!(att32_ok["data"]["calls"]["httpAttempts"], 32);
-    assert_eq!(att32_ok["data"]["calls"]["successfulBatches"], 32);
-    assert_eq!(att32_ok["data"]["consumption"]["responseBytes"], 4_194_304);
-    let response_cap_logs = srv_response_cap.logs();
-    assert_eq!(response_cap_logs.len(), 32);
+    let endpoint = srv_many.url("/decisions");
+    let many_dir = many_corpus.data_dir.display().to_string();
+    let (initial_requests, many_run) = thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            run_clec(
+                &["--data-dir", &many_dir, "search", "tokprobe", "--sag2"],
+                &[("JEV_BASE_URL", &endpoint), ("JEV_API_KEY", SENTINEL_KEY)],
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while srv_many.logs().len() < 4 && Instant::now() < deadline && !run.is_finished() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let count = srv_many.logs().len();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        (count, run.join().unwrap())
+    });
+    let many_ok = assert_ok_json(&many_run);
+    assert_eq!(
+        initial_requests, 4,
+        "only four batches may be in flight before any reply"
+    );
+    assert_eq!(many_ok["data"]["limits"]["maxConcurrentRequests"], 4);
+    assert_eq!(many_ok["data"]["calls"]["httpAttempts"], 35);
+    assert_eq!(many_ok["data"]["calls"]["successfulBatches"], 35);
+    assert_eq!(many_ok["data"]["candidateCounts"]["scoredOccurrences"], 70);
+    assert_eq!(
+        many_ok["data"]["consumption"]["responseBytes"],
+        35 * 131_072
+    );
+    let many_logs = srv_many.logs();
+    assert_eq!(many_logs.len(), 35);
     assert!(
-        response_cap_logs
+        many_logs
             .iter()
             .all(|request| request.question_keys.len() == 2)
     );
 
     let make_3letter_token = |idx: usize| -> String {
-        const PREFIXES: &[u8] = b"bcgjkmpqvxz";
+        const PREFIXES: &[u8] = b"bcgjklnmpqryvxz";
         let p = PREFIXES[idx / (26 * 26)] as char;
         let m = (b'a' + ((idx / 26) % 26) as u8) as char;
         let l = (b'a' + (idx % 26) as u8) as char;
@@ -3707,8 +4098,8 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
     let mut df_works: Vec<(&str, &str)> = Vec::new();
     let mut df_owned: Vec<(String, String, String, String)> = Vec::new();
     let mut tok_idx = 0usize;
-    for s_idx in 0..10usize {
-        let count = if s_idx < 9 { 410 } else { 405 };
+    for s_idx in 0..20usize {
+        let count = if s_idx < 19 { 410 } else { 401 };
         let mut toks = Vec::with_capacity(count + 1);
         toks.push("dfanchor".to_owned());
         for _ in 0..count {
@@ -3727,7 +4118,7 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
             toks.join(" "),
         ));
     }
-    assert_eq!(tok_idx, 4095);
+    assert_eq!(tok_idx, 8191);
     let df_exact_srcs: Vec<SourceSpec<'_>> = df_owned
         .iter()
         .map(|(w, p, t, b)| {
@@ -3753,11 +4144,11 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
         ],
         &[("JEV_BASE_URL", &url), ("JEV_API_KEY", SENTINEL_KEY)],
     ));
-    assert_eq!(df_ok["data"]["calls"]["dfLookupsDistinct"], 4096);
+    assert_eq!(df_ok["data"]["calls"]["dfLookupsDistinct"], 8192);
 
-    df_owned[9]
+    df_owned[19]
         .3
-        .push_str(&format!(" {}", make_3letter_token(4095)));
+        .push_str(&format!(" {}", make_3letter_token(8191)));
     let df_over_srcs: Vec<SourceSpec<'_>> = df_owned
         .iter()
         .map(|(w, p, t, b)| {
@@ -3787,7 +4178,7 @@ fn group8_exact_reachable_caps_32_attempts_df4097_and_token_estimates() {
         2,
         Some("SAG2_BUDGET_EXHAUSTED"),
     );
-    assert_eq!(df_over_err["error"]["sag2Stage"]["dfLookupsDistinct"], 4096);
+    assert_eq!(df_over_err["error"]["sag2Stage"]["dfLookupsDistinct"], 8192);
 
     let mut sql_works = vec![("wsql_seed", "SQL Seed")];
     let sql_terms: String = (1..=20usize)
@@ -3942,11 +4333,16 @@ fn group10_negative_controls_fail_for_predicted_reasons() {
 
     let srv_x = MockJevServer::start(
         SENTINEL_KEY,
-        Arc::new(|seq, _, req| {
+        Arc::new(|_, _, req| {
+            let state: Value = serde_json::from_str(req["state"].as_str().unwrap()).unwrap();
+            let is_round0 = state["previously_retrieved_evidence"]
+                .as_array()
+                .unwrap()
+                .is_empty();
             let mut answers = serde_json::Map::new();
             for (k, q) in req["questions"].as_object().unwrap() {
                 let p = q["instructions"]["candidate_passage"].as_str().unwrap();
-                let s = if seq == 1 {
+                let s = if is_round0 {
                     0.90
                 } else if p.contains("candidate_x_marker") {
                     0.95
@@ -3978,11 +4374,16 @@ fn group10_negative_controls_fail_for_predicted_reasons() {
 
     let srv_y = MockJevServer::start(
         SENTINEL_KEY,
-        Arc::new(|seq, _, req| {
+        Arc::new(|_, _, req| {
+            let state: Value = serde_json::from_str(req["state"].as_str().unwrap()).unwrap();
+            let is_round0 = state["previously_retrieved_evidence"]
+                .as_array()
+                .unwrap()
+                .is_empty();
             let mut answers = serde_json::Map::new();
             for (k, q) in req["questions"].as_object().unwrap() {
                 let p = q["instructions"]["candidate_passage"].as_str().unwrap();
-                let s = if seq == 1 {
+                let s = if is_round0 {
                     0.90
                 } else if p.contains("candidate_y_marker") {
                     0.95
@@ -4098,4 +4499,247 @@ fn group10_negative_controls_fail_for_predicted_reasons() {
         5,
         Some("INTEGRITY_MISMATCH"),
     );
+}
+
+#[test]
+fn group11_seed_threshold_early_stop_and_dynamic_dpp_limit() {
+    let mut works: Vec<(&str, &str)> = Vec::new();
+    let mut owned: Vec<(String, String, String, String)> = Vec::new();
+    for i in 0..20usize {
+        let w = format!("wd_{i:02}");
+        works.push((
+            Box::leak(w.clone().into_boxed_str()),
+            Box::leak(format!("Work {i:02}").into_boxed_str()),
+        ));
+        owned.push((
+            w,
+            format!("d_{i:02}.txt"),
+            format!("Title {i:02}"),
+            format!("threshanchor distinctterm_{i:02} sharedbridge"),
+        ));
+    }
+    let srcs: Vec<SourceSpec<'_>> = owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let corpus = publish_and_sync_corpus(&works, &srcs);
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let low_srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.20, "typesafe/jev-1.14"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let low_res = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "search", "threshanchor", "--sag2"],
+        &[
+            ("JEV_BASE_URL", &low_srv.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(low_res["data"]["stopReason"], "no_qualified_seeds");
+    assert_eq!(low_res["data"]["roundsCompleted"], 1);
+    assert_eq!(low_res["data"]["calls"]["httpAttempts"], 1);
+    assert_eq!(low_res["data"]["candidateCounts"]["seedsSelected"], 0);
+    assert_eq!(low_res["data"]["hits"].as_array().unwrap().len(), 20);
+    assert_eq!(low_srv.logs().len(), 1);
+
+    let hi_srv = MockJevServer::start(
+        SENTINEL_KEY,
+        Arc::new(|_, _, req| MockReply::Json {
+            status: 200,
+            body: score_all_answers(req, 0.75, "typesafe/jev-1.14"),
+            delay: Duration::ZERO,
+        }),
+    );
+    let dpp_res = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "search",
+            "threshanchor",
+            "--sag2",
+            "--limit",
+            "18",
+        ],
+        &[
+            ("JEV_BASE_URL", &hi_srv.url("/decisions")),
+            ("JEV_API_KEY", SENTINEL_KEY),
+        ],
+    ));
+    assert_eq!(dpp_res["data"]["limits"]["dppTopK"], 18);
+    let hits = dpp_res["data"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 18);
+    let orders: Vec<u64> = hits
+        .iter()
+        .map(|h| h["dppOrder"].as_u64().expect("dppOrder set"))
+        .collect();
+    assert_eq!(orders, (1..=18).collect::<Vec<_>>());
+}
+
+#[test]
+fn group12_local_search_limit_50_offset_pagination_and_budget_truncation() {
+    let mut works: Vec<(&str, &str)> = Vec::new();
+    let mut owned: Vec<(String, String, String, String)> = Vec::new();
+    for i in 0..45usize {
+        let w = format!("wp_{i:02}");
+        works.push((
+            Box::leak(w.clone().into_boxed_str()),
+            Box::leak(format!("PageWork {i:02}").into_boxed_str()),
+        ));
+        owned.push((
+            w,
+            format!("p_{i:02}.txt"),
+            format!("PageDoc {i:02}"),
+            format!("pageanchor item_{i:02} {}", "填充".repeat(20)),
+        ));
+    }
+    let srcs: Vec<SourceSpec<'_>> = owned
+        .iter()
+        .map(|(w, p, t, b)| {
+            (
+                w.as_str(),
+                p.as_str(),
+                t.as_str(),
+                "document",
+                b.as_str(),
+                None,
+            )
+        })
+        .collect();
+    let corpus = publish_and_sync_corpus(&works, &srcs);
+    let dir_s = corpus.data_dir.display().to_string();
+
+    let all45 = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--offline",
+            "search",
+            "pageanchor",
+            "--limit",
+            "50",
+        ],
+        &[],
+    ));
+    assert_eq!(all45["data"]["totalCandidates"], 45);
+    assert_eq!(all45["data"]["limit"], 50);
+    assert_eq!(all45["data"]["offset"], 0);
+    assert_eq!(all45["data"]["hasMore"], false);
+    assert!(all45["data"].get("nextOffset").is_none());
+    let expected_ids: Vec<&str> = all45["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["passageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(expected_ids.len(), 45);
+
+    let p0 = assert_ok_json(&run_clec(
+        &["--data-dir", &dir_s, "--offline", "search", "pageanchor"],
+        &[],
+    ));
+    assert_eq!(p0["data"]["hits"].as_array().unwrap().len(), 20);
+    assert_eq!(p0["data"]["hasMore"], true);
+    assert_eq!(p0["data"]["nextOffset"], 20);
+
+    let p1 = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--offline",
+            "search",
+            "pageanchor",
+            "--offset",
+            "20",
+        ],
+        &[],
+    ));
+    assert_eq!(p1["data"]["hits"].as_array().unwrap().len(), 20);
+    assert_eq!(p1["data"]["hasMore"], true);
+    assert_eq!(p1["data"]["nextOffset"], 40);
+
+    let p2 = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--offline",
+            "search",
+            "pageanchor",
+            "--offset",
+            "40",
+        ],
+        &[],
+    ));
+    assert_eq!(p2["data"]["hits"].as_array().unwrap().len(), 5);
+    assert_eq!(p2["data"]["hasMore"], false);
+    assert!(p2["data"].get("nextOffset").is_none());
+
+    let stitched: Vec<&str> = p0["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(p1["data"]["hits"].as_array().unwrap())
+        .chain(p2["data"]["hits"].as_array().unwrap())
+        .map(|h| h["passageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(stitched, expected_ids);
+
+    // Tight byte cap truncates gracefully and sets nextOffset so continuation never skips items.
+    let tight = run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--offline",
+            "--max-bytes",
+            "5000",
+            "search",
+            "pageanchor",
+            "--limit",
+            "45",
+        ],
+        &[],
+    );
+    let tight_json = assert_ok_json(&tight);
+    assert!(tight.stdout.len() <= 5000);
+    let kept = tight_json["data"]["hits"].as_array().unwrap().len();
+    assert!(kept > 0 && kept < 45);
+    assert_eq!(tight_json["data"]["budget"]["omittedCount"], 45 - kept);
+    assert_eq!(tight_json["data"]["hasMore"], true);
+    assert_eq!(tight_json["data"]["nextOffset"], kept);
+    let next_off = tight_json["data"]["nextOffset"].as_u64().unwrap();
+    let rest = assert_ok_json(&run_clec(
+        &[
+            "--data-dir",
+            &dir_s,
+            "--offline",
+            "search",
+            "pageanchor",
+            "--offset",
+            &next_off.to_string(),
+            "--limit",
+            "45",
+        ],
+        &[],
+    ));
+    let combined: Vec<&str> = tight_json["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(rest["data"]["hits"].as_array().unwrap())
+        .map(|h| h["passageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(combined, expected_ids);
 }

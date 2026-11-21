@@ -5,7 +5,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use clec_core::domain::{
     CORPUS_FORMAT, ClecError, DICTIONARY_REVISION, EQUIVALENCE_REVISION, ErrorCode, ErrorEnvelope,
-    NORMALIZATION_REVISION, SCHEMA_VERSION, SEGMENTATION_REVISION, TOKENIZATION_REVISION,
+    LEGACY_NORMALIZATION_REVISION, NORMALIZATION_REVISION, SCHEMA_VERSION, SEGMENTATION_REVISION,
+    TOKENIZATION_REVISION,
 };
 use clec_core::snapshot::{
     SnapshotValidationReceipt, VALIDATOR_KIND, file_size_and_sha256, validate_sqlite_snapshot,
@@ -42,6 +43,7 @@ struct ValidatorIdentity {
     segmentation_revision: &'static str,
     tokenization_revision: &'static str,
     normalization_revision: &'static str,
+    supported_normalization_revisions: [&'static str; 2],
     dictionary_revision: &'static str,
     equivalence_revision: &'static str,
     binary_path: String,
@@ -136,6 +138,10 @@ fn main() -> ExitCode {
             segmentation_revision: SEGMENTATION_REVISION,
             tokenization_revision: TOKENIZATION_REVISION,
             normalization_revision: NORMALIZATION_REVISION,
+            supported_normalization_revisions: [
+                LEGACY_NORMALIZATION_REVISION,
+                NORMALIZATION_REVISION,
+            ],
             dictionary_revision: DICTIONARY_REVISION,
             equivalence_revision: EQUIVALENCE_REVISION,
             binary_path,

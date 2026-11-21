@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 pub const CORPUS_FORMAT: &str = "clec-native-v2";
 pub const SEGMENTATION_REVISION: &str = "utf8-scalar-1000-2000-v1";
 pub const TOKENIZATION_REVISION: &str = "jieba-rs-0.11-alnum-pct-v1";
-pub const NORMALIZATION_REVISION: &str = "opencc-tw2s-nfkc-lower-v1";
+pub const LEGACY_NORMALIZATION_REVISION: &str = "opencc-tw2s-nfkc-lower-v1";
+pub const NORMALIZATION_REVISION: &str = "opencc-tw2s-nfkc-lower-morphology-v2";
 pub const DICTIONARY_REVISION: &str = "jieba-rs-builtin-0.11.0+ferrous-opencc-0.4.0-tw2s";
 pub const EQUIVALENCE_REVISION: &str = "ws-fold-cue-or-archive-md-v1";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -929,6 +930,7 @@ pub struct ClecError {
     pub code: ErrorCode,
     pub message: String,
     pub input_index: Option<usize>,
+    pub required_bytes: Option<usize>,
     pub sag2_stage: Option<Box<Sag2ErrorContext>>,
 }
 
@@ -938,12 +940,18 @@ impl ClecError {
             code,
             message: message.into(),
             input_index: None,
+            required_bytes: None,
             sag2_stage: None,
         }
     }
 
     pub fn with_input_index(mut self, index: usize) -> Self {
         self.input_index = Some(index);
+        self
+    }
+
+    pub(crate) fn with_required_bytes(mut self, bytes: usize) -> Self {
+        self.required_bytes = Some(bytes);
         self
     }
 
@@ -962,6 +970,8 @@ pub struct ErrorBody {
     pub next: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sag2_stage: Option<Sag2ErrorContext>,
 }
@@ -985,8 +995,12 @@ impl ErrorEnvelope {
                 code: err.code,
                 message: err.message.clone(),
                 remedy: err.code.remedy().to_owned(),
-                next: err.code.next_action().to_owned(),
+                next: err.required_bytes.map_or_else(
+                    || err.code.next_action().to_owned(),
+                    |bytes| format!("Repeat this command with --max-bytes {bytes}."),
+                ),
                 input_index: err.input_index,
+                required_bytes: err.required_bytes,
                 sag2_stage: err.sag2_stage.as_deref().cloned(),
             },
         }

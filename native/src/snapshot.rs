@@ -25,7 +25,7 @@ use crate::ingest::{
     segment_source,
 };
 use crate::lexical::index_tokens_string;
-use crate::store::{CorpusCounts, CorpusStore, DiagnosticsSummary, SCHEMA_SQL};
+use crate::store::{CorpusCounts, CorpusStore, DiagnosticsSummary, SCHEMA_SQL, WorkFamily};
 
 pub(crate) const MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -34,6 +34,7 @@ pub(crate) const MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 struct IntakeWork {
     pub key: String,
     pub title: String,
+    pub family: Option<WorkFamily>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,7 +214,8 @@ pub fn publish_release_with_artifact_url(
         ));
     }
 
-    let mut work_map: HashMap<String, (WorkId, String)> = HashMap::new();
+    let mut work_map: HashMap<String, (WorkId, &IntakeWork)> = HashMap::new();
+    let mut work_ids = HashSet::new();
     for w in &intake.works {
         let wid = WorkId::from_work_key(&w.key)?;
         if w.title.trim().is_empty() || w.title.contains('\0') {
@@ -222,10 +224,10 @@ pub fn publish_release_with_artifact_url(
                 format!("Work '{}' has empty or invalid title.", w.key),
             ));
         }
-        if work_map
-            .insert(w.key.clone(), (wid, w.title.clone()))
-            .is_some()
-        {
+        if let Some(family) = &w.family {
+            family.validate()?;
+        }
+        if !work_ids.insert(wid.clone()) || work_map.insert(w.key.clone(), (wid, w)).is_some() {
             return Err(ClecError::new(
                 ErrorCode::InvalidManifest,
                 format!("Duplicate work key '{}'.", w.key),
@@ -273,7 +275,7 @@ pub fn publish_release_with_artifact_url(
 fn build_in_staging(
     canonical_workspace: &Path,
     intake: &IntakeDocument,
-    work_map: &HashMap<String, (WorkId, String)>,
+    work_map: &HashMap<String, (WorkId, &IntakeWork)>,
     staging: &Path,
     artifact_url: Option<String>,
 ) -> Result<ReleaseManifest, ClecError> {
@@ -343,7 +345,7 @@ fn build_in_staging(
         .map_err(|e| ClecError::new(ErrorCode::InternalError, format!("TX start failed: {e}")))?;
 
     for src in sorted_sources {
-        let Some((work_id, work_title)) = work_map.get(&src.work) else {
+        let Some((work_id, work)) = work_map.get(&src.work) else {
             return Err(ClecError::new(
                 ErrorCode::InvalidManifest,
                 format!(
@@ -484,11 +486,29 @@ fn build_in_staging(
         if inserted_works.insert(work_id.as_str().to_owned()) {
             tx.execute(
                 "INSERT INTO works VALUES(?,?,?)",
-                params![work_id.as_str(), src.work, work_title],
+                params![work_id.as_str(), src.work, work.title],
             )
             .map_err(|e| {
                 ClecError::new(ErrorCode::InternalError, format!("Work insert failed: {e}"))
             })?;
+            if let Some(family) = &work.family {
+                let value = serde_json::to_string(family).map_err(|e| {
+                    ClecError::new(
+                        ErrorCode::InternalError,
+                        format!("Work family serialization failed: {e}"),
+                    )
+                })?;
+                tx.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                    params![format!("work_family:{work_id}"), value],
+                )
+                .map_err(|e| {
+                    ClecError::new(
+                        ErrorCode::InternalError,
+                        format!("Work family insert failed: {e}"),
+                    )
+                })?;
+            }
             counts.works += 1;
         }
 
@@ -930,6 +950,7 @@ pub fn validate_sqlite_snapshot(db_path: &Path) -> Result<SnapshotValidationRece
     let (db_bytes, db_sha256_str) = copy_and_hash_readonly(&canonical_path, &staging_sqlite)?;
     let db_sha256 = ReleaseHash::parse(&db_sha256_str)?;
 
+    let mut actual_normalization_revision = NORMALIZATION_REVISION;
     let validation_res = (|| -> Result<CorpusCounts, ClecError> {
         if db_bytes == 0 || db_bytes > MAX_ARTIFACT_BYTES {
             return Err(ClecError::new(
@@ -938,6 +959,7 @@ pub fn validate_sqlite_snapshot(db_path: &Path) -> Result<SnapshotValidationRece
             ));
         }
         let store = CorpusStore::open_readonly(&staging_sqlite, db_sha256.clone())?;
+        actual_normalization_revision = store.normalization.revision();
         let counts = store.counts()?;
         drop(store);
         CorpusStore::validate_staging_db(&staging_sqlite, db_sha256.clone(), &counts)?;
@@ -956,7 +978,7 @@ pub fn validate_sqlite_snapshot(db_path: &Path) -> Result<SnapshotValidationRece
         corpus_format: CORPUS_FORMAT.to_owned(),
         segmentation_revision: SEGMENTATION_REVISION.to_owned(),
         tokenization_revision: TOKENIZATION_REVISION.to_owned(),
-        normalization_revision: NORMALIZATION_REVISION.to_owned(),
+        normalization_revision: actual_normalization_revision.to_owned(),
         dictionary_revision: DICTIONARY_REVISION.to_owned(),
         equivalence_revision: EQUIVALENCE_REVISION.to_owned(),
         db_path: canonical_path.display().to_string(),
@@ -1122,6 +1144,19 @@ pub(crate) fn ensure_current_store(
     res
 }
 
+fn require_manifest_normalization(
+    store: &CorpusStore,
+    manifest: &ReleaseManifest,
+) -> Result<(), ClecError> {
+    if store.normalization.revision() != manifest.normalization_revision {
+        return Err(ClecError::new(
+            ErrorCode::InvalidPackage,
+            "Manifest normalizationRevision differs from the snapshot metadata.",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn sync_dry_run(
     data_dir: &Path,
     manifest_arg: Option<&str>,
@@ -1139,6 +1174,10 @@ pub(crate) fn sync_dry_run(
         .as_ref()
         .is_some_and(|s| s.release == loaded.manifest.sha256)
         && active_db.is_file();
+    if is_active {
+        let active = CorpusStore::open_readonly(&active_db, loaded.manifest.sha256.clone())?;
+        require_manifest_normalization(&active, &loaded.manifest)?;
+    }
     Ok(SyncDryRunData {
         dry_run: true,
         manifest_path: loaded.persistent_origin,
@@ -1319,9 +1358,12 @@ where
         .as_ref()
         .is_some_and(|state| state.release == manifest.sha256)
         && existing_path.is_file()
-        && CorpusStore::open_readonly(&existing_path, manifest.sha256.clone())
-            .is_ok_and(|existing| existing.counts().ok().as_ref() == Some(&manifest.counts))
-    {
+        && CorpusStore::open_readonly(&existing_path, manifest.sha256.clone()).is_ok_and(
+            |existing| {
+                existing.normalization.revision() == manifest.normalization_revision
+                    && existing.counts().ok().as_ref() == Some(&manifest.counts)
+            },
+        ) {
         file_size_and_sha256(&existing_path)
             .ok()
             .filter(|(bytes, sha)| *bytes == manifest.bytes && sha == manifest.sha256.as_str())
@@ -1381,6 +1423,9 @@ where
         drop(dst_file);
         drop(acquired);
 
+        let staged = CorpusStore::open_readonly(&staging_db, manifest.sha256.clone())?;
+        require_manifest_normalization(&staged, &manifest)?;
+        drop(staged);
         CorpusStore::validate_staging_db(&staging_db, manifest.sha256.clone(), &manifest.counts)?;
 
         fs::rename(&staging_db, &final_db).map_err(map_io)?;

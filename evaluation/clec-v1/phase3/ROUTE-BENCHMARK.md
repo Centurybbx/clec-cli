@@ -10,6 +10,9 @@ Review and freeze the questions, necessary claims, acceptable evidence alternati
 
 ## Replay retrieval
 
+The replay scorer consumes the original full-hit search contract. Use the preserved original CLI or its recorded outputs. For Stage 1 outputs, use the [delivery comparison](../agent-native/phase1/VERIFICATION.md) to measure leads separately from evidence.
+
+
 `score_routes.py` scores a necessary evidence obligation when all anchors in at least one alternative route are present. The scorer reuses the Phase 3 checks for source identity, UTF-8 bytes, and verified format equivalents. It reports mean evidence recall and complete evidence counts for the first search, at k = 1, 2, and 5, plus all observed search and read outputs. Failed tool calls remain visible. Unanswerable cases stay in the schedule and have no retrieval coverage score.
 
 Run from the repository root. Use a new output path.

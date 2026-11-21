@@ -7,6 +7,7 @@ import argparse
 import collections
 import datetime as dt
 import hashlib
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
@@ -131,6 +132,40 @@ def read_title_from_saved_body(path: Path, fallback: str) -> str:
     if re.match(r"^\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2}$", first) and len(lines) > 1:
         return " ".join(lines[:2])[:1000]
     return first[:1000]
+
+
+def clec_wisdom_family(workspace: Path) -> dict[str, dict[str, str]]:
+    """Use the captured publisher navigation as explicit chapter membership."""
+    root = "/docs/clec-wisdom"
+    html_path = "collection/web/clec168/html/docs/clec-wisdom.html"
+    saved = workspace / html_path
+    if not saved.is_file():
+        return {}
+
+    class BookLinks(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.paths: set[str] = set()
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag != "a":
+                return
+            href = dict(attrs).get("href") or ""
+            link = urlparse(href)
+            if (link.netloc in ("", "clec168.com") and link.scheme in ("", "https")
+                    and re.fullmatch(re.escape(root) + r"/[a-z0-9-]+/?", link.path)):
+                self.paths.add(link.path.rstrip("/"))
+
+    source = saved.read_bytes()
+    links = BookLinks()
+    links.feed(source.decode("utf-8"))
+    if not links.paths:
+        return {}
+    family = {
+        "key": "clec168:clec-wisdom",
+        "provenance": f"Publisher book navigation {html_path} sha256={hashlib.sha256(source).hexdigest()}",
+    }
+    return {f"clec168:{path.strip('/')}": family for path in (links.paths | {root})}
 
 
 def prepare_intake(workspace: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -589,7 +624,11 @@ def prepare_intake(workspace: Path) -> tuple[dict[str, Any], list[dict[str, Any]
 
     resolved_sources.sort(key=lambda s: (s["work"], s["path"]))
     used_works = {s["work"] for s in resolved_sources}
-    works_list = [{"key": k, "title": works[k]} for k in sorted(used_works)]
+    families = clec_wisdom_family(workspace)
+    works_list = [
+        {"key": key, "title": works[key], **({"family": families[key]} if key in families else {})}
+        for key in sorted(used_works)
+    ]
 
     return {"schemaVersion": 1, "works": works_list, "sources": resolved_sources}, [
         {k: v for k, v in item.items()} for item in resolved_sources

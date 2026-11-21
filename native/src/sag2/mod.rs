@@ -10,33 +10,39 @@ use crate::domain::{
     ByteSpan, ClecError, ErrorCode, PassageId, ReleaseHash, Sag2ErrorContext, Sag2Stage, WorkId,
 };
 use crate::ingest::SubtitleCue;
-use crate::lexical::{encode_fts_token, tokenize_normalized};
+use crate::lexical::{Normalization, encode_fts_token};
 use crate::retrieval::{
     BudgetReport, MatchMode, PreparedSearch, RankedCandidate, SearchQueryTerms,
-    apply_work_diversity_indices, collect_rrf_candidates, materialize_passage_hit,
+    apply_work_diversity_indices, collect_rrf_candidates, diversify_ranked_candidates,
+    is_near_duplicate, materialize_passage_hit, passage_shingles,
 };
 use crate::store::{CandidateFilter, CorpusStore, SourceRecord, WorkRecord};
 
 use self::jev::{
-    CandidateRecord, JEV_CONNECT_TIMEOUT, JEV_REQUEST_TIMEOUT, JevClient, MAX_HTTP_ATTEMPTS,
-    MAX_QUESTION_ESTIMATED_TOKENS, MAX_QUESTIONS_PER_BATCH, MAX_REQUEST_BODY_BYTES,
-    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BYTES, MAX_RUN_ESTIMATED_TOKENS,
-    MAX_TOTAL_REQUEST_BYTES, MAX_TOTAL_RESPONSE_BYTES, SAG2_RUN_DEADLINE, SeedEvidence,
-    UsageStatus, ValidatedJevConfig,
+    CandidateRecord, JEV_CONNECT_TIMEOUT, JEV_REQUEST_TIMEOUT, JevAdmissionPolicy, JevClient,
+    MAX_CONCURRENT_REQUESTS, MAX_QUESTIONS_PER_BATCH, MAX_REQUEST_BODY_BYTES,
+    MAX_REQUEST_HEADER_BYTES, MAX_RESPONSE_BYTES, SAG2_RUN_DEADLINE, SeedEvidence, UsageStatus,
+    ValidatedJevConfig,
 };
 
 pub(crate) const ALGORITHM_NAME: &str = "sag2_native_v1";
-pub(crate) const ALGORITHM_REVISION: &str = "sag2-native-v1";
+pub(crate) const ALGORITHM_REVISION: &str = "sag2-native-v1-batched-full-context";
 pub(crate) const MAX_INITIAL_POOL: usize = 100;
 pub(crate) const MAX_EXPANSION_ROUNDS: usize = 1;
 pub(crate) const SEED_K: usize = 10;
+pub(crate) const MIN_SEED_SCORE: f64 = 0.25;
+pub(crate) const SEED_CONTEXT_MAX_BYTES: usize = 40_960;
 pub(crate) const EXPANSION_TERM_LIMIT: usize = 20;
 pub(crate) const MAX_EXPANSION_NEW: usize = 100;
 pub(crate) const MAX_SECOND_POOL: usize = 115;
 pub(crate) const MAX_SCORED_OCCURRENCES: usize = 215;
 pub(crate) const MAX_SQL_CANDIDATE_QUERIES: usize = 24;
-pub(crate) const MAX_DF_LOOKUPS: usize = 4096;
-pub(crate) const DPP_TOP_K: usize = 10;
+pub(crate) const MAX_DF_LOOKUPS: usize = 8192;
+pub(crate) const DPP_MIN_K: usize = 10;
+
+pub(crate) fn effective_dpp_top_k(limit: usize) -> usize {
+    limit.max(DPP_MIN_K)
+}
 
 const STOPWORDS: &[&str] = &[
     "的",
@@ -106,6 +112,7 @@ const STOPWORDS: &[&str] = &[
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Sag2StopReason {
     NoCandidates,
+    NoQualifiedSeeds,
     NoExpansionTerms,
     NoExpansionCandidates,
     Completed,
@@ -134,55 +141,59 @@ pub(crate) struct Sag2CallStats {
     pub df_lookups_distinct: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Sag2Limits {
     pub max_initial_pool: usize,
     pub max_expansion_rounds: usize,
     pub max_seed_k: usize,
+    pub min_seed_score: f64,
+    pub seed_context_max_bytes: usize,
     pub max_expansion_terms: usize,
     pub max_expansion_new: usize,
     pub max_second_pool: usize,
     pub max_scored_occurrences: usize,
     pub max_sql_candidate_queries: usize,
     pub max_df_lookups: usize,
-    pub max_http_attempts: usize,
+    pub dpp_top_k: usize,
+    pub max_concurrent_requests: usize,
     pub max_questions_per_batch: usize,
     pub max_request_header_bytes: usize,
     pub max_request_body_bytes: usize,
-    pub max_total_request_bytes: usize,
     pub max_response_bytes: usize,
-    pub max_total_response_bytes: usize,
-    pub max_question_estimated_tokens: usize,
-    pub max_batch_estimated_tokens: usize,
-    pub max_run_estimated_tokens: usize,
+    pub admission_policy: JevAdmissionPolicy,
+    pub max_question_estimated_tokens: Option<usize>,
+    pub max_batch_estimated_tokens: Option<usize>,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub run_deadline_secs: u64,
 }
 
 impl Sag2Limits {
-    pub(crate) fn shipped() -> Self {
+    pub(crate) fn for_policy(admission_policy: JevAdmissionPolicy, dpp_top_k: usize) -> Self {
+        let (max_question_estimated_tokens, max_batch_estimated_tokens) =
+            admission_policy.estimated_token_caps();
         Self {
             max_initial_pool: MAX_INITIAL_POOL,
             max_expansion_rounds: MAX_EXPANSION_ROUNDS,
             max_seed_k: SEED_K,
+            min_seed_score: MIN_SEED_SCORE,
+            seed_context_max_bytes: SEED_CONTEXT_MAX_BYTES,
             max_expansion_terms: EXPANSION_TERM_LIMIT,
             max_expansion_new: MAX_EXPANSION_NEW,
             max_second_pool: MAX_SECOND_POOL,
             max_scored_occurrences: MAX_SCORED_OCCURRENCES,
             max_sql_candidate_queries: MAX_SQL_CANDIDATE_QUERIES,
             max_df_lookups: MAX_DF_LOOKUPS,
-            max_http_attempts: MAX_HTTP_ATTEMPTS,
+            dpp_top_k,
+            max_concurrent_requests: MAX_CONCURRENT_REQUESTS,
             max_questions_per_batch: MAX_QUESTIONS_PER_BATCH,
             max_request_header_bytes: MAX_REQUEST_HEADER_BYTES,
             max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
-            max_total_request_bytes: MAX_TOTAL_REQUEST_BYTES,
             max_response_bytes: MAX_RESPONSE_BYTES,
-            max_total_response_bytes: MAX_TOTAL_RESPONSE_BYTES,
-            max_question_estimated_tokens: MAX_QUESTION_ESTIMATED_TOKENS,
-            max_batch_estimated_tokens: self::jev::MAX_BATCH_ESTIMATED_TOKENS,
-            max_run_estimated_tokens: MAX_RUN_ESTIMATED_TOKENS,
+            admission_policy,
+            max_question_estimated_tokens,
+            max_batch_estimated_tokens,
             connect_timeout_secs: JEV_CONNECT_TIMEOUT.as_secs(),
             request_timeout_secs: JEV_REQUEST_TIMEOUT.as_secs(),
             run_deadline_secs: SAG2_RUN_DEADLINE.as_secs(),
@@ -267,6 +278,9 @@ pub(crate) struct Sag2SearchData {
     pub consumption: Sag2Consumption,
     pub usage: Sag2UsageProvenance,
     pub total_candidates: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
     pub hits: Vec<Sag2SearchHit>,
     pub budget: BudgetReport,
 }
@@ -503,8 +517,19 @@ fn run_sag2_pinned(
         ));
     }
 
-    let initial_candidates: Vec<RankedCandidate> =
-        initial_ranked.into_iter().take(MAX_INITIAL_POOL).collect();
+    let enable_dedup = req.work_filter.is_none() && req.source_filter.is_none();
+    let ordered_initial = map_err_stage!(diversify_ranked_candidates(
+        store,
+        req.normalization,
+        &initial_ranked,
+        usize::MAX,
+        enable_dedup,
+    ));
+    let initial_candidates: Vec<RankedCandidate> = ordered_initial
+        .into_iter()
+        .take(MAX_INITIAL_POOL)
+        .map(|idx| initial_ranked[idx].clone())
+        .collect();
     let initial_pool_len = initial_candidates.len();
 
     let mut pool0 = Vec::with_capacity(initial_pool_len);
@@ -569,184 +594,227 @@ fn run_sag2_pinned(
             .then_with(|| a.passage_id.cmp(&b.passage_id))
     });
 
-    let seed_indices: Vec<usize> = r0_sorted_indices.into_iter().take(SEED_K).collect();
-    let seeds_selected = seed_indices.len();
+    let qualified_seed_indices: Vec<usize> = r0_sorted_indices
+        .iter()
+        .copied()
+        .filter(|&i| pool0[i].jev_score >= MIN_SEED_SCORE)
+        .take(SEED_K)
+        .collect();
 
-    let mut original_terms: HashSet<String> = HashSet::new();
-    for pq in &req.queries {
-        for term in &pq.terms {
-            original_terms.insert(term.clone());
-        }
-    }
-
-    map_err_stage!(check_deadline(run_deadline));
-    let seeds_for_terms: Vec<&PoolCandidate> = seed_indices.iter().map(|&i| &pool0[i]).collect();
-    let derived_terms = map_err_stage!(derive_expansion_terms(
-        store,
-        &mut df_cache,
-        total_passages,
-        &original_terms,
-        &seeds_for_terms,
-        run_deadline,
-    ));
-    stage = Sag2Stage::ExpansionTerms;
-
-    let mut expansion_terms_selected = derived_terms.len();
+    let mut seeds_selected = 0usize;
+    let mut expansion_terms_selected = 0usize;
     let mut expansion_new_candidates = 0usize;
     let mut second_pool_len = 0usize;
     let mut context_omitted_count = 0usize;
 
-    let (mut active_pool, stop_reason) = if derived_terms.is_empty() {
-        (pool0, Sag2StopReason::NoExpansionTerms)
+    let (mut active_pool, stop_reason) = if qualified_seed_indices.is_empty() {
+        (pool0, Sag2StopReason::NoQualifiedSeeds)
     } else {
-        let seen_ids: Vec<PassageId> = pool0.iter().map(|c| c.passage_id.clone()).collect();
-        let filter = CandidateFilter {
-            work_filter: req.work_filter.as_ref(),
-            source_filter: req.source_filter.as_ref(),
-            role_filter: req.role_filter,
-            date_from: req.date_from.as_ref(),
-            date_to: req.date_to.as_ref(),
-        };
-
-        let mut term_lists = Vec::with_capacity(derived_terms.len());
-        for dterm in &derived_terms {
-            map_err_stage!(check_deadline(run_deadline));
-            let fts_query = format!("\"{}\"", encode_fts_token(&dterm.term));
-            sql_candidate_queries += 1;
-            let list = map_err_stage!(store.query_bm25_candidates_excluding(
-                &fts_query,
-                &filter,
-                &seen_ids,
-                MAX_INITIAL_POOL,
+        let mut selected_seed_indices = Vec::with_capacity(qualified_seed_indices.len());
+        let mut seed_context = Vec::with_capacity(qualified_seed_indices.len());
+        for &idx in &qualified_seed_indices {
+            let cand = &pool0[idx];
+            let entry = SeedEvidence {
+                title: cand.title.clone(),
+                passage: cand.text.clone(),
+                previous_jev_score: Some(cand.jev_score),
+            };
+            let mut trial_context = seed_context.clone();
+            trial_context.push(entry.clone());
+            let shared_bytes = map_err_stage!(jev::shared_state_json_bytes(
+                jev.requested_model(),
+                original_question,
+                &trial_context,
             ));
-            term_lists.push(list);
-        }
-        stage = Sag2Stage::ExpansionRetrieval;
-
-        let mut seen_exp: HashSet<PassageId> = seen_ids.iter().cloned().collect();
-        let mut merged_new: Vec<(PassageId, Vec<String>)> = Vec::new();
-        'outer: for rank in 0..MAX_INITIAL_POOL {
-            for (t_idx, list) in term_lists.iter().enumerate() {
-                let Some(cand) = list.get(rank) else {
-                    continue;
-                };
-                if seen_exp.insert(cand.passage_id.clone()) {
-                    merged_new.push((
-                        cand.passage_id.clone(),
-                        vec![derived_terms[t_idx].term.clone()],
-                    ));
-                    if merged_new.len() == MAX_EXPANSION_NEW {
-                        break 'outer;
-                    }
-                }
+            if shared_bytes <= SEED_CONTEXT_MAX_BYTES {
+                selected_seed_indices.push(idx);
+                seed_context.push(entry);
+            } else if selected_seed_indices.is_empty() {
+                selected_seed_indices.push(idx);
+                seed_context.push(entry);
+                break;
+            } else {
+                break;
             }
         }
-        expansion_new_candidates = merged_new.len();
+        seeds_selected = selected_seed_indices.len();
+        let seed_budget_omitted = qualified_seed_indices.len().saturating_sub(seeds_selected);
+        let selected_seed_ids: Vec<PassageId> = selected_seed_indices
+            .iter()
+            .map(|&i| pool0[i].passage_id.clone())
+            .collect();
 
-        if merged_new.is_empty() {
-            (pool0, Sag2StopReason::NoExpansionCandidates)
+        let mut original_terms: HashSet<String> = HashSet::new();
+        for pq in &req.queries {
+            for term in &pq.terms {
+                original_terms.insert(term.clone());
+            }
+        }
+
+        map_err_stage!(check_deadline(run_deadline));
+        let seeds_for_terms: Vec<&PoolCandidate> =
+            selected_seed_indices.iter().map(|&i| &pool0[i]).collect();
+        let derived_terms = map_err_stage!(derive_expansion_terms(
+            store,
+            &mut df_cache,
+            total_passages,
+            &original_terms,
+            &seeds_for_terms,
+            run_deadline,
+        ));
+        stage = Sag2Stage::ExpansionTerms;
+        expansion_terms_selected = derived_terms.len();
+
+        if derived_terms.is_empty() {
+            context_omitted_count = seed_budget_omitted;
+            (pool0, Sag2StopReason::NoExpansionTerms)
         } else {
-            let mut pool0_by_id: BTreeMap<PassageId, PoolCandidate> = pool0
-                .into_iter()
-                .map(|c| (c.passage_id.clone(), c))
-                .collect();
+            let seen_ids: Vec<PassageId> = pool0.iter().map(|c| c.passage_id.clone()).collect();
+            let filter = CandidateFilter {
+                work_filter: req.work_filter.as_ref(),
+                source_filter: req.source_filter.as_ref(),
+                role_filter: req.role_filter,
+                date_from: req.date_from.as_ref(),
+                date_to: req.date_to.as_ref(),
+            };
 
-            let mut ordered_carry_ids = Vec::new();
-            let mut carried_set = BTreeSet::new();
-
-            let mut r0_by_rank: Vec<PassageId> = pool0_by_id.keys().cloned().collect();
-            r0_by_rank.sort_by_key(|pid| pool0_by_id[pid].retrieval_rank);
-            for pid in r0_by_rank.iter().take(5) {
-                if carried_set.insert(pid.clone()) {
-                    ordered_carry_ids.push(pid.clone());
-                }
-            }
-
-            let mut seed_ids_ordered: Vec<PassageId> = pool0_by_id.keys().cloned().collect();
-            seed_ids_ordered.sort_by(|a, b| {
-                let ca = &pool0_by_id[a];
-                let cb = &pool0_by_id[b];
-                cb.jev_score
-                    .total_cmp(&ca.jev_score)
-                    .then_with(|| ca.retrieval_rank.cmp(&cb.retrieval_rank))
-                    .then_with(|| ca.passage_id.cmp(&cb.passage_id))
-            });
-            seed_ids_ordered.truncate(SEED_K);
-
-            let seed_context: Vec<SeedEvidence> = seed_ids_ordered
-                .iter()
-                .map(|pid| {
-                    let s = &pool0_by_id[pid];
-                    SeedEvidence {
-                        title: s.title.clone(),
-                        passage: s.text.clone(),
-                        previous_jev_score: Some(s.jev_score),
-                    }
-                })
-                .collect();
-
-            for pid in &seed_ids_ordered {
-                if carried_set.insert(pid.clone()) {
-                    ordered_carry_ids.push(pid.clone());
-                }
-            }
-
-            let mut pool1 = Vec::with_capacity(ordered_carry_ids.len() + merged_new.len());
-            for pid in ordered_carry_ids {
-                if let Some(existing) = pool0_by_id.remove(&pid) {
-                    pool1.push(existing);
-                }
-            }
-            for (exp_rank, (pid, exp_terms)) in merged_new.into_iter().enumerate() {
+            let mut term_lists = Vec::with_capacity(derived_terms.len());
+            for dterm in &derived_terms {
                 map_err_stage!(check_deadline(run_deadline));
-                let hit = map_err_stage!(materialize_passage_hit(store, &pid, 0.0, Vec::new()));
-                pool1.push(PoolCandidate {
-                    passage_id: hit.passage_id,
-                    work_id: hit.work.work_id,
-                    title: hit.source.title,
-                    text: hit.text,
-                    genuine_rrf_score: None,
-                    matched_queries: Vec::new(),
-                    found_in_round: 1,
-                    retrieval_rank: exp_rank,
-                    jev_score: 0.0,
-                    expansion_terms: exp_terms,
-                    dpp_order: None,
-                });
+                let fts_query = format!("\"{}\"", encode_fts_token(&dterm.term));
+                sql_candidate_queries += 1;
+                let list = map_err_stage!(store.query_bm25_candidates_excluding(
+                    &fts_query,
+                    &filter,
+                    &seen_ids,
+                    MAX_INITIAL_POOL,
+                ));
+                term_lists.push(list);
             }
+            stage = Sag2Stage::ExpansionRetrieval;
 
-            second_pool_len = pool1.len();
-            let r1_records: Vec<CandidateRecord> = pool1
-                .iter()
-                .map(|c| CandidateRecord {
-                    passage_id: c.passage_id.clone(),
-                    title: c.title.clone(),
-                    passage: c.text.clone(),
-                })
-                .collect();
-
-            let r1_outcome =
-                map_err_stage!(jev.score_round(original_question, &seed_context, &r1_records));
-            context_omitted_count = r1_outcome.context_omitted_count;
-
-            for cand in &mut pool1 {
-                cand.jev_score = *r1_outcome.scores.get(&cand.passage_id).ok_or_else(|| {
-                    attach_stage(
-                        ClecError::new(
-                            ErrorCode::JevInvalidResponse,
-                            "Missing Jev score for Round 1 candidate.",
-                        ),
-                        stage,
-                        rounds_completed,
-                        sql_candidate_queries,
-                        &df_cache,
-                        &jev,
-                    )
-                })?;
+            let mut seen_exp: HashSet<PassageId> = seen_ids.iter().cloned().collect();
+            let mut seen_shingles: Vec<Vec<u64>> = if enable_dedup {
+                pool0
+                    .iter()
+                    .map(|c| passage_shingles(req.normalization, &c.text))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut merged_new: Vec<(PassageId, Vec<String>)> = Vec::new();
+            'outer: for rank in 0..MAX_INITIAL_POOL {
+                for (t_idx, list) in term_lists.iter().enumerate() {
+                    let Some(cand) = list.get(rank) else {
+                        continue;
+                    };
+                    if seen_exp.insert(cand.passage_id.clone()) {
+                        if enable_dedup {
+                            let info =
+                                map_err_stage!(store.load_passage_dedup_info(&cand.passage_id));
+                            let shingles = passage_shingles(req.normalization, &info.text);
+                            if seen_shingles
+                                .iter()
+                                .any(|prev| is_near_duplicate(&shingles, prev))
+                            {
+                                continue;
+                            }
+                            seen_shingles.push(shingles);
+                        }
+                        merged_new.push((
+                            cand.passage_id.clone(),
+                            vec![derived_terms[t_idx].term.clone()],
+                        ));
+                        if merged_new.len() == MAX_EXPANSION_NEW {
+                            break 'outer;
+                        }
+                    }
+                }
             }
-            rounds_completed = 2;
-            stage = Sag2Stage::ExpansionScoring;
-            (pool1, Sag2StopReason::Completed)
+            expansion_new_candidates = merged_new.len();
+
+            if merged_new.is_empty() {
+                context_omitted_count = seed_budget_omitted;
+                (pool0, Sag2StopReason::NoExpansionCandidates)
+            } else {
+                let mut pool0_by_id: BTreeMap<PassageId, PoolCandidate> = pool0
+                    .into_iter()
+                    .map(|c| (c.passage_id.clone(), c))
+                    .collect();
+
+                let mut ordered_carry_ids = Vec::new();
+                let mut carried_set = BTreeSet::new();
+
+                let mut r0_by_rank: Vec<PassageId> = pool0_by_id.keys().cloned().collect();
+                r0_by_rank.sort_by_key(|pid| pool0_by_id[pid].retrieval_rank);
+                for pid in r0_by_rank.iter().take(5) {
+                    if carried_set.insert(pid.clone()) {
+                        ordered_carry_ids.push(pid.clone());
+                    }
+                }
+                for pid in &selected_seed_ids {
+                    if carried_set.insert(pid.clone()) {
+                        ordered_carry_ids.push(pid.clone());
+                    }
+                }
+
+                let mut pool1 = Vec::with_capacity(ordered_carry_ids.len() + merged_new.len());
+                for pid in ordered_carry_ids {
+                    if let Some(existing) = pool0_by_id.remove(&pid) {
+                        pool1.push(existing);
+                    }
+                }
+                for (exp_rank, (pid, exp_terms)) in merged_new.into_iter().enumerate() {
+                    map_err_stage!(check_deadline(run_deadline));
+                    let hit = map_err_stage!(materialize_passage_hit(store, &pid, 0.0, Vec::new()));
+                    pool1.push(PoolCandidate {
+                        passage_id: hit.passage_id,
+                        work_id: hit.work.work_id,
+                        title: hit.source.title,
+                        text: hit.text,
+                        genuine_rrf_score: None,
+                        matched_queries: Vec::new(),
+                        found_in_round: 1,
+                        retrieval_rank: exp_rank,
+                        jev_score: 0.0,
+                        expansion_terms: exp_terms,
+                        dpp_order: None,
+                    });
+                }
+
+                second_pool_len = pool1.len();
+                let r1_records: Vec<CandidateRecord> = pool1
+                    .iter()
+                    .map(|c| CandidateRecord {
+                        passage_id: c.passage_id.clone(),
+                        title: c.title.clone(),
+                        passage: c.text.clone(),
+                    })
+                    .collect();
+
+                let r1_outcome =
+                    map_err_stage!(jev.score_round(original_question, &seed_context, &r1_records));
+                context_omitted_count = seed_budget_omitted + r1_outcome.context_omitted_count;
+
+                for cand in &mut pool1 {
+                    cand.jev_score = *r1_outcome.scores.get(&cand.passage_id).ok_or_else(|| {
+                        attach_stage(
+                            ClecError::new(
+                                ErrorCode::JevInvalidResponse,
+                                "Missing Jev score for Round 1 candidate.",
+                            ),
+                            stage,
+                            rounds_completed,
+                            sql_candidate_queries,
+                            &df_cache,
+                            &jev,
+                        )
+                    })?;
+                }
+                rounds_completed = 2;
+                stage = Sag2Stage::ExpansionScoring;
+                (pool1, Sag2StopReason::Completed)
+            }
         }
     };
 
@@ -764,7 +832,8 @@ fn run_sag2_pinned(
             .then_with(|| a.passage_id.cmp(&b.passage_id))
     });
 
-    let dpp_len = active_pool.len().min(DPP_TOP_K);
+    let dpp_top_k = effective_dpp_top_k(req.limit);
+    let dpp_len = active_pool.len().min(dpp_top_k);
     let dpp_order = map_err_stage!(rank_dpp_indices(
         store,
         &mut df_cache,
@@ -850,6 +919,7 @@ pub(crate) fn minimum_sag2_search_data(
     prepared: &PreparedSearch,
     max_bytes: usize,
 ) -> Sag2SearchData {
+    let policy = JevAdmissionPolicy::CalibratedJev114BodyBounded;
     let min_release = ReleaseHash::parse(&"0".repeat(64)).expect("64 zero hex digits valid");
     Sag2SearchData {
         release: min_release,
@@ -879,12 +949,12 @@ pub(crate) fn minimum_sag2_search_data(
             sql_candidate_queries: 0,
             df_lookups_distinct: 0,
         },
-        limits: Sag2Limits::shipped(),
+        limits: Sag2Limits::for_policy(policy, effective_dpp_top_k(prepared.limit)),
         consumption: Sag2Consumption {
             request_bytes: 0,
             response_bytes: 0,
             estimated_token_units: 0,
-            token_estimate_basis: "conditional_byte_upper_bound_not_tokenizer".to_owned(),
+            token_estimate_basis: policy.token_estimate_basis().to_owned(),
         },
         usage: Sag2UsageProvenance {
             status: Sag2MetadataStatus::Unknown,
@@ -894,6 +964,9 @@ pub(crate) fn minimum_sag2_search_data(
             cost_usd: Some(0.0),
         },
         total_candidates: 0,
+        offset: 0,
+        limit: prepared.limit,
+        has_more: true,
         hits: Vec::new(),
         budget: BudgetReport {
             max_bytes,
@@ -916,8 +989,10 @@ fn build_sag2_search_data(
     df_lookups_distinct: usize,
     hits: Vec<Sag2SearchHit>,
 ) -> Sag2SearchData {
+    let policy = jev.admission_policy();
     let acct = jev.accounting();
     let total_candidates = candidate_counts.final_pool;
+    let has_more = hits.len() < total_candidates;
     Sag2SearchData {
         release: store.release.clone(),
         match_mode: req.match_mode,
@@ -936,12 +1011,12 @@ fn build_sag2_search_data(
             sql_candidate_queries,
             df_lookups_distinct,
         },
-        limits: Sag2Limits::shipped(),
+        limits: Sag2Limits::for_policy(policy, effective_dpp_top_k(req.limit)),
         consumption: Sag2Consumption {
             request_bytes: acct.request_bytes,
             response_bytes: acct.response_bytes,
             estimated_token_units: acct.estimated_token_units,
-            token_estimate_basis: "conditional_byte_upper_bound_not_tokenizer".to_owned(),
+            token_estimate_basis: policy.token_estimate_basis().to_owned(),
         },
         usage: Sag2UsageProvenance {
             status: acct.usage_status.into(),
@@ -951,6 +1026,9 @@ fn build_sag2_search_data(
             cost_usd: acct.cost_usd,
         },
         total_candidates,
+        offset: req.offset,
+        limit: req.limit,
+        has_more,
         hits,
         budget: BudgetReport {
             max_bytes: 0,
@@ -965,8 +1043,9 @@ fn is_stopword(term: &str) -> bool {
     STOPWORDS.contains(&term)
 }
 
-fn tokenize_non_stop(text: &str) -> Vec<String> {
-    tokenize_normalized(text)
+fn tokenize_non_stop(normalization: Normalization, text: &str) -> Vec<String> {
+    normalization
+        .tokenize_normalized(text)
         .into_iter()
         .filter(|t| !is_stopword(t))
         .collect()
@@ -1103,7 +1182,7 @@ fn derive_expansion_terms(
         let mut context_scores: BTreeMap<String, f64> = BTreeMap::new();
 
         for sentence in sentences {
-            let tokens = tokenize_non_stop(sentence);
+            let tokens = tokenize_non_stop(store.normalization, sentence);
             if tokens.is_empty() {
                 continue;
             }
@@ -1218,7 +1297,7 @@ fn rank_dpp_indices(
     for cand in candidates {
         check_deadline(run_deadline)?;
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for tok in tokenize_non_stop(&cand.text) {
+        for tok in tokenize_non_stop(store.normalization, &cand.text) {
             *counts.entry(tok).or_insert(0) += 1;
         }
         let mut sparse = Vec::with_capacity(counts.len());
@@ -1473,6 +1552,7 @@ mod tests {
             queries: vec!["星辰協議".to_owned()],
             match_mode: MatchMode::Any,
             limit: 5,
+            offset: 0,
             per_work: 2,
             work_filter: None,
             source_filter: None,
@@ -1558,6 +1638,7 @@ mod tests {
             queries: vec!["zzqyxwvutnonexistent".to_owned()],
             match_mode: MatchMode::Any,
             limit: 5,
+            offset: 0,
             per_work: 2,
             work_filter: None,
             source_filter: None,
@@ -1676,5 +1757,194 @@ mod tests {
             let order = rank_dpp_indices(&store, &mut df_cache, 5, &candidates, deadline).unwrap();
             assert_eq!(order, baseline, "DPP order drifted at run {run}");
         }
+    }
+
+    #[test]
+    fn low_score_round0_stops_early_with_no_qualified_seeds() {
+        let (_dir, mut store) = build_sag2_test_store(&[
+            (
+                "w_a",
+                "Alpha",
+                "a.txt",
+                "lowscoreanchor bridgeword_only_in_seed",
+            ),
+            (
+                "w_b",
+                "Beta",
+                "b.txt",
+                "bridgeword_only_in_seed target_that_would_expand",
+            ),
+        ]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_len = 0usize;
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+            let req_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let mut answers = serde_json::Map::new();
+            for k in req_json["questions"].as_object().unwrap().keys() {
+                answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": 0.20}));
+            }
+            let resp_body = serde_json::to_vec(&serde_json::json!({
+                "model": "typesafe/jev-1.14",
+                "answers": answers,
+            }))
+            .unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                resp_body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&resp_body).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "JEV_BASE_URL",
+            format!("http://127.0.0.1:{}/decisions", addr.port()),
+        );
+        env_map.insert("JEV_API_KEY", "dummy-sentinel".to_owned());
+        let cfg = ValidatedJevConfig::from_lookup(None, |k| env_map.get(k).cloned()).unwrap();
+
+        let req = PreparedSearch::prepare(SearchRequest {
+            queries: vec!["lowscoreanchor".to_owned()],
+            match_mode: MatchMode::Any,
+            limit: 5,
+            offset: 0,
+            per_work: 2,
+            work_filter: None,
+            source_filter: None,
+            role_filter: None,
+            date_from: None,
+            date_to: None,
+            release_pin: None,
+        })
+        .unwrap();
+
+        let res = run_sag2(&mut store, &req, cfg).unwrap();
+        srv.join().unwrap();
+        assert_eq!(res.stop_reason, Sag2StopReason::NoQualifiedSeeds);
+        assert_eq!(res.rounds_completed, 1);
+        assert_eq!(res.calls.http_attempts, 1);
+        assert_eq!(res.candidate_counts.seeds_selected, 0);
+        assert_eq!(res.candidate_counts.expansion_terms_selected, 0);
+        assert_eq!(res.candidate_counts.expansion_new_candidates, 0);
+        assert_eq!(res.candidate_counts.second_pool, 0);
+        assert_eq!(res.hits.len(), 1);
+        assert_eq!(res.hits[0].work.work_key, "w_a");
+        assert!(res.hits[0].dpp_order.is_some());
+    }
+
+    #[test]
+    fn dpp_window_scales_with_limit_beyond_ten() {
+        let mut docs: Vec<(String, String, String, String)> = (0..15usize)
+            .map(|i| {
+                (
+                    format!("w_{i:02}"),
+                    format!("Title {i:02}"),
+                    format!("{i:02}.txt"),
+                    format!("dppanchor distinct_{i:02}"),
+                )
+            })
+            .collect();
+        for j in 0..6usize {
+            docs.push((
+                format!("w_exp_{j:02}"),
+                format!("Title Exp {j:02}"),
+                format!("exp_{j:02}.txt"),
+                format!("distinct_00 extra_hop_target_{j:02}"),
+            ));
+        }
+        let doc_refs: Vec<(&str, &str, &str, &str)> = docs
+            .iter()
+            .map(|(w, t, p, b)| (w.as_str(), t.as_str(), p.as_str(), b.as_str()))
+            .collect();
+        let (_dir, mut store) = build_sag2_test_store(&doc_refs);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_len];
+                reader.read_exact(&mut body).unwrap();
+                let req_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let mut answers = serde_json::Map::new();
+                for k in req_json["questions"].as_object().unwrap().keys() {
+                    answers.insert(k.clone(), serde_json::json!({"type": "noul", "noul": 0.65}));
+                }
+                let resp_body = serde_json::to_vec(&serde_json::json!({
+                    "model": "typesafe/jev-1.14",
+                    "answers": answers,
+                }))
+                .unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    resp_body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(&resp_body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "JEV_BASE_URL",
+            format!("http://127.0.0.1:{}/decisions", addr.port()),
+        );
+        env_map.insert("JEV_API_KEY", "dummy-sentinel".to_owned());
+        let cfg = ValidatedJevConfig::from_lookup(None, |k| env_map.get(k).cloned()).unwrap();
+
+        let req = PreparedSearch::prepare(SearchRequest {
+            queries: vec!["dppanchor".to_owned()],
+            match_mode: MatchMode::Any,
+            limit: 15,
+            offset: 0,
+            per_work: 2,
+            work_filter: None,
+            source_filter: None,
+            role_filter: None,
+            date_from: None,
+            date_to: None,
+            release_pin: None,
+        })
+        .unwrap();
+
+        let res = run_sag2(&mut store, &req, cfg).unwrap();
+        srv.join().unwrap();
+        assert_eq!(res.limits.dpp_top_k, 15);
+        assert_eq!(res.hits.len(), 15);
+        let dpp_orders: Vec<usize> = res
+            .hits
+            .iter()
+            .map(|h| h.dpp_order.expect("all 15 hits must be DPP-ranked"))
+            .collect();
+        assert_eq!(dpp_orders, (1..=15).collect::<Vec<_>>());
     }
 }
