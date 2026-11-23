@@ -710,9 +710,7 @@ pub(crate) fn diversify_ranked_candidates(
     }
 
     for idx in win..ranked.len() {
-        let count = work_counts
-            .entry(ranked[idx].work_id.as_str())
-            .or_insert(0);
+        let count = work_counts.entry(ranked[idx].work_id.as_str()).or_insert(0);
         if *count < per_work {
             *count += 1;
             used[idx] = true;
@@ -761,18 +759,18 @@ mod tests {
         build_rich_test_store(&rich)
     }
 
-    fn build_rich_test_store(
-        docs: &[(
-            &str,
-            &str,
-            &str,
-            SourceRole,
-            Attribution,
-            bool,
-            &str,
-            Option<&str>,
-        )],
-    ) -> (tempfile::TempDir, CorpusStore) {
+    type RichDoc<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        SourceRole,
+        Attribution,
+        bool,
+        &'a str,
+        Option<&'a str>,
+    );
+
+    fn build_rich_test_store(docs: &[RichDoc<'_>]) -> (tempfile::TempDir, CorpusStore) {
         use crate::store::WorkFamily;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("corpus.sqlite");
@@ -842,7 +840,15 @@ mod tests {
             }
             let date_ymd = date.map(|d| DateYmd::parse(d).unwrap());
             let date_basis = date.map(|_| "fixture");
-            let sid = SourceId::derive(&wid, path, role, attr, &chash, date_ymd.as_ref(), date_basis);
+            let sid = SourceId::derive(
+                &wid,
+                path,
+                role,
+                attr,
+                &chash,
+                date_ymd.as_ref(),
+                date_basis,
+            );
             conn.execute(
                 "INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![

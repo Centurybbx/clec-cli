@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use reqwest::Url;
 use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{ClecError, ErrorCode, PassageId};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -631,8 +631,7 @@ impl JevClient {
         let (state_str, shared_bytes) =
             prepare_round_context(&self.config.model, original_question, seeds, candidates)?;
 
-        let batches_vec =
-            pack_batches(&self.config.model, &state_str, shared_bytes, candidates)?;
+        let batches_vec = pack_batches(&self.config.model, &state_str, shared_bytes, candidates)?;
         for batch in &batches_vec {
             let header_bytes = canonical_http1_header_block_bytes(
                 &self.config.endpoint,

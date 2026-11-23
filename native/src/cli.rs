@@ -1951,7 +1951,7 @@ mod tests {
             full_search.len() - 1,
         )
         .unwrap();
-        assert!(truncated.len() <= full_search.len() - 1);
+        assert!(truncated.len() < full_search.len());
         let trunc_parsed: serde_json::Value = serde_json::from_str(&truncated).unwrap();
         assert_eq!(trunc_parsed["data"]["hits"].as_array().unwrap().len(), 1);
         assert_eq!(trunc_parsed["data"]["budget"]["omittedCount"], 1);
@@ -1962,13 +1962,18 @@ mod tests {
         assert_eq!(trunc_parsed["data"]["hasMore"], true);
         assert_eq!(trunc_parsed["data"]["nextOffset"], 1);
         assert_eq!(
-            trunc_parsed["data"]["budget"]["usedBytes"].as_u64().unwrap() as usize,
+            trunc_parsed["data"]["budget"]["usedBytes"]
+                .as_u64()
+                .unwrap() as usize,
             truncated.len()
         );
 
-        let re_fit =
-            fit_search_budget(SearchOutput::Local(search_data.clone()), true, truncated.len())
-                .unwrap();
+        let re_fit = fit_search_budget(
+            SearchOutput::Local(search_data.clone()),
+            true,
+            truncated.len(),
+        )
+        .unwrap();
         let too_small = fit_search_budget(
             SearchOutput::Local(search_data.clone()),
             true,

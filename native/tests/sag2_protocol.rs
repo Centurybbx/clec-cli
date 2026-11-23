@@ -3559,7 +3559,10 @@ fn group8_full_seed_admission_depends_on_the_requested_model() {
         Some("SAG2_BUDGET_EXHAUSTED"),
     );
     let body_over_msg = body_over_err["error"]["message"].as_str().unwrap();
-    assert!(body_over_msg.contains("request body limit"), "{body_over_msg}");
+    assert!(
+        body_over_msg.contains("request body limit"),
+        "{body_over_msg}"
+    );
     assert!(body_over_msg.contains("Seeds: 1"), "{body_over_msg}");
     assert_eq!(body_over_err["error"]["sag2Stage"]["roundsCompleted"], 1);
     assert!(srv.logs().iter().all(|log| seed_count(log) == 0));
@@ -3891,7 +3894,10 @@ fn group8_request_packing_over_32_batches_df4097_and_token_estimates() {
     ));
     assert_eq!(q_ok["data"]["consumption"]["estimatedTokenUnits"], 32_000);
     let limits = &q_ok["data"]["limits"];
-    assert_eq!(limits["admissionPolicy"], "uncalibrated_conservative_byte_bound");
+    assert_eq!(
+        limits["admissionPolicy"],
+        "uncalibrated_conservative_byte_bound"
+    );
     assert_eq!(limits["maxQuestionEstimatedTokens"], 32_000);
     assert_eq!(limits["maxBatchEstimatedTokens"], 64_000);
     assert_eq!(
