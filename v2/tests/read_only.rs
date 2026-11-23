@@ -12,6 +12,10 @@ struct Scratch(PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::set_permissions(self.0.join("index"), fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(
+            self.0.join("index/index"),
+            fs::Permissions::from_mode(0o700),
+        );
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -61,9 +65,11 @@ fn eight_queries_can_read_an_immutable_snapshot_without_creating_locks() {
             .status
             .success()
     );
-    fs::remove_file(index.join(".tantivy-meta.lock")).unwrap();
+    fs::remove_file(index.join("index/.tantivy-meta.lock")).unwrap();
     fs::set_permissions(&index, fs::Permissions::from_mode(0o555)).unwrap();
-    let before = snapshot(&index);
+    let files = index.join("index");
+    fs::set_permissions(&files, fs::Permissions::from_mode(0o555)).unwrap();
+    let before = snapshot(&files);
     let processes: Vec<_> = (0..8)
         .map(|i| {
             Command::new(binary)
@@ -84,7 +90,8 @@ fn eight_queries_can_read_an_immutable_snapshot_without_creating_locks() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let hits: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hits = page["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 2);
         for hit in hits {
             let expected = match hit["doc_id"].as_str().unwrap() {
@@ -95,5 +102,5 @@ fn eight_queries_can_read_an_immutable_snapshot_without_creating_locks() {
             assert_eq!(hit["highlights"], serde_json::json!([expected]));
         }
     }
-    assert_eq!(snapshot(&index), before);
+    assert_eq!(snapshot(&files), before);
 }

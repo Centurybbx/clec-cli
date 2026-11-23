@@ -138,3 +138,36 @@ fn decimals_codes_and_percentages_preserve_terms_and_exact_offsets() {
         expected.map(|(raw, normalized)| (raw, normalized.to_owned()))
     );
 }
+
+#[test]
+fn decimals_and_percentages_take_priority_over_adjacent_letters() {
+    for (text, expected) in [
+        ("about20.4%", &[("about", 0, 5), ("20.4%", 5, 10)][..]),
+        ("about20%", &[("about", 0, 5), ("20%", 5, 8)]),
+        ("about4%", &[("about", 0, 5), ("4%", 5, 7)]),
+        ("about4.5%", &[("about", 0, 5), ("4.5%", 5, 9)]),
+        ("about0.03", &[("about", 0, 5), ("0.03", 5, 9)]),
+        ("Ａ２０．４％", &[("a", 0, 3), ("20.4%", 3, 18)]),
+        ("0050", &[("0050", 0, 4)]),
+        ("00864B", &[("00864b", 0, 6)]),
+        ("QQQ", &[("qqq", 0, 3)]),
+        ("4%", &[("4%", 0, 2)]),
+        ("4.5%", &[("4.5%", 0, 4)]),
+        ("0.03", &[("0.03", 0, 4)]),
+        ("3.5", &[("3.5", 0, 3)]),
+    ] {
+        let mut tokenizer = CjkNorm;
+        let mut stream = tokenizer.token_stream(text);
+        for &(term, start, end) in expected {
+            let token = stream
+                .next()
+                .unwrap_or_else(|| panic!("missing token in {text:?}"));
+            assert_eq!(
+                (token.text.as_str(), token.offset_from, token.offset_to),
+                (term, start, end),
+                "{text:?}"
+            );
+        }
+        assert!(stream.next().is_none(), "extra token in {text:?}");
+    }
+}

@@ -23,10 +23,6 @@ const PREVIOUS: [[(usize, f64); 2]; 4] = [
 ];
 static EMISSIONS: &[(char, [u64; 4])] = include!(concat!(env!("OUT_DIR"), "/jieba_emissions.rs"));
 
-pub fn initialize() {
-    LazyLock::force(&DICTIONARY);
-}
-
 pub fn cut(text: &str, mut token: impl FnMut(usize, &str)) {
     let mut offsets: Vec<_> = text.char_indices().map(|(offset, _)| offset).collect();
     let len = offsets.len();

@@ -11,13 +11,11 @@ use crate::jieba;
 
 pub const NAME: &str = "cjk_norm";
 
-// Match decimals and percentages before plain numbers and alphanumeric codes.
-static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-        r"[0-9０-９]+(?:[.．][0-9０-９]+[%％]?|[%％])",
-        r"|[A-Za-zＡ-Ｚａ-ｚ0-9０-９]*[0-9０-９][A-Za-zＡ-Ｚａ-ｚ0-9０-９]*"
-    ))
-    .unwrap()
+// Find decimals and percentages before looking for codes in the intervening text.
+static DECIMAL_OR_PERCENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[0-9０-９]+(?:[.．][0-9０-９]+[%％]?|[%％])").unwrap());
+static CODE_OR_INTEGER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[A-Za-zＡ-Ｚａ-ｚ0-9０-９]*[0-9０-９][A-Za-zＡ-Ｚａ-ｚ0-9０-９]*").unwrap()
 });
 
 #[derive(Clone, Default)]
@@ -78,15 +76,27 @@ fn segment(text: &str, from: usize, to: usize, han: bool, tokens: &mut Vec<Token
         }
     } else {
         let mut cursor = from;
-        for number in NUMERIC.find_iter(run) {
+        for number in DECIMAL_OR_PERCENT.find_iter(run) {
             let start = from + number.start();
             let end = from + number.end();
-            segment_words(text, cursor, start, tokens);
+            segment_codes(text, cursor, start, tokens);
             push(text, start, end, fold(number.as_str()).into_owned(), tokens);
             cursor = end;
         }
-        segment_words(text, cursor, to, tokens);
+        segment_codes(text, cursor, to, tokens);
     }
+}
+
+fn segment_codes(text: &str, from: usize, to: usize, tokens: &mut Vec<Token>) {
+    let mut cursor = from;
+    for code in CODE_OR_INTEGER.find_iter(&text[from..to]) {
+        let start = from + code.start();
+        let end = from + code.end();
+        segment_words(text, cursor, start, tokens);
+        push(text, start, end, fold(code.as_str()).into_owned(), tokens);
+        cursor = end;
+    }
+    segment_words(text, cursor, to, tokens);
 }
 
 fn segment_words(text: &str, from: usize, to: usize, tokens: &mut Vec<Token>) {
@@ -193,15 +203,6 @@ fn push(original: &str, from: usize, to: usize, text: String, tokens: &mut Vec<T
     });
 }
 
-pub fn initialize_for_timing() -> (f64, f64) {
-    let start = std::time::Instant::now();
-    jieba::initialize();
-    let jieba_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let start = std::time::Instant::now();
-    assert_eq!(zhconv::zhconv("體", zhconv::Variant::ZhHans), "体");
-    (jieba_ms, start.elapsed().as_secs_f64() * 1000.0)
-}
-
 impl TokenStream for CjkStream {
     fn advance(&mut self) -> bool {
         if let Some(next) = self.tokens.next() {
@@ -221,45 +222,21 @@ impl TokenStream for CjkStream {
     }
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-pub enum StopWords {
-    Compact,
-    Expanded,
-    None,
-}
-
-impl StopWords {
-    pub const DEFAULT: Self = Self::Compact;
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
+    CjkNorm
+        .token_stream(text)
+        .tokens
+        .map(|token| token.text)
+        .collect()
 }
 
 pub fn query_terms(text: &str) -> Vec<String> {
-    query_terms_with_stopwords(text, StopWords::DEFAULT)
-}
-
-pub(crate) fn query_terms_with_stopwords(text: &str, stop_words: StopWords) -> Vec<String> {
-    static COMPACT: LazyLock<HashSet<&'static str>> =
+    static STOP_WORDS: LazyLock<HashSet<&'static str>> =
         LazyLock::new(|| include_str!("stopwords.txt").split_whitespace().collect());
-    static EXPANDED: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-        COMPACT
-            .iter()
-            .copied()
-            .chain(
-                "什么 怎么 怎样 如何 为何 为什么 多少 哪里 哪儿 哪个 哪些 是否 能否 有没有"
-                    .split_whitespace(),
-            )
-            .collect()
-    });
 
-    let mut tokenizer = CjkNorm;
-    let stream = tokenizer.token_stream(text);
-    let mut terms: Vec<_> = stream.tokens.map(|token| token.text).collect();
-    let stop = match stop_words {
-        StopWords::Compact => &*COMPACT,
-        StopWords::Expanded => &*EXPANDED,
-        StopWords::None => return terms,
-    };
-    if terms.iter().any(|term| !stop.contains(term.as_str())) {
-        terms.retain(|term| !stop.contains(term.as_str()));
+    let mut terms = tokenize(text);
+    if terms.iter().any(|term| !STOP_WORDS.contains(term.as_str())) {
+        terms.retain(|term| !STOP_WORDS.contains(term.as_str()));
     }
     terms
 }
