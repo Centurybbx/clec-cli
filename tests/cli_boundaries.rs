@@ -20,6 +20,7 @@ fn build_fixture(index: &Path) {
         "doc_id": "one", "work_id": "work", "source_id": "source", "ordinal": 0,
         "kind": "transcript", "quality": 2, "title": "Fixture", "body": "Transcript",
         "start_sec": 20, "end_sec": 400, "other_kinds": ["qa"],
+        "origin_url": "https://example.com/fixture",
     });
     builder::build(input.to_string().as_bytes(), index, 1).unwrap();
 }
@@ -105,4 +106,23 @@ fn read_accepts_short_time_ranges_and_trimmed_stdin_ids() {
     assert_eq!(body["passages"].as_array().unwrap().len(), 1);
     assert_eq!(body["passages"][0]["passage"]["doc_id"], "one");
     assert_eq!(body["passages"][0]["passage"]["other_kinds"], json!(["qa"]));
+}
+
+#[test]
+fn search_outline_and_read_expose_origin_url() {
+    let scratch = tempdir().unwrap();
+    let index = scratch.path().join("snapshot");
+    build_fixture(&index);
+    let url = "https://example.com/fixture";
+    let run = |args: &[&str]| {
+        let output = cli(&index).args(args).output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let search = run(&["search", "Transcript"]);
+    assert_eq!(search["hits"][0]["origin_url"], url);
+    let outline = run(&["outline", "work"]);
+    assert_eq!(outline["sources"][0]["origin_url"], url);
+    let read = run(&["read", "one", "--context", "0"]);
+    assert_eq!(read["passages"][0]["passage"]["origin_url"], url);
 }

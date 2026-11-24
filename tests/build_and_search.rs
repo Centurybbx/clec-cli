@@ -190,3 +190,34 @@ fn read_respects_restricted_licenses_for_targets_and_neighbors() {
     assert!(reading.passage.body.len() <= 550);
     assert!(reading.before.is_empty() && reading.after.is_empty());
 }
+
+#[test]
+fn origin_url_is_exposed_by_search_outline_and_read() {
+    let scratch = tempdir().unwrap();
+    let index = scratch.path().join("index");
+    let url = "https://example.com/watch?v=1";
+    let input = json!({
+        "doc_id": "one", "work_id": "work", "source_id": "source", "ordinal": 0,
+        "kind": "doc", "quality": 1, "title": "标题", "body": "正文", "origin_url": url,
+    })
+    .to_string();
+    schema::build(input.as_bytes(), &index, 1).unwrap();
+    let search = Search::open(&index).unwrap();
+    let options = Options {
+        kinds: &[],
+        from: None,
+        to: None,
+        work: None,
+        limit: 5,
+        offset: 0,
+        per_work: 5,
+        exclude_suspect: false,
+    };
+    let hits = search.page(&["正文".into()], &options, false).unwrap().hits;
+    assert_eq!(hits[0].info.origin_url, url);
+    let snapshot = clec::reader::Snapshot::open(&index).unwrap();
+    let outline = snapshot.outline("work", &[]).unwrap().unwrap();
+    assert_eq!(outline.sources[0].origin_url, url);
+    let reading = snapshot.read_id("one", 0).unwrap().unwrap();
+    assert_eq!(reading.passage.info.origin_url, url);
+}

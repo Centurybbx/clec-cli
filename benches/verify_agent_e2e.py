@@ -80,12 +80,16 @@ def decode_output(argv, stdout, docs):
         raise ValueError("expected a JSON object")
 
     if command == "search":
-        hits = object_rows(payload, "hits", {"doc_id", "work_id"})
+        hits = object_rows(payload, "hits", {"doc_id", "work_id", "origin_url"})
         if not all(map(id_record, hits)):
             raise ValueError("search hit lacks string IDs")
+        if any(not isinstance(row["origin_url"], str) for row in hits):
+            raise ValueError("search hit origin_url is not a string")
     elif command == "outline":
-        object_rows(payload, "sources", {"source_id", "kind"})
+        sources = object_rows(payload, "sources", {"source_id", "kind", "origin_url"})
         object_rows(payload, "passages", {"doc_id", "kind"})
+        if any(not isinstance(row["origin_url"], str) for row in sources):
+            raise ValueError("outline source origin_url is not a string")
         if not isinstance(payload.get("work_id"), str):
             raise ValueError("outline lacks work_id")
     elif command == "stats":
@@ -100,12 +104,13 @@ def decode_output(argv, stdout, docs):
         for row in readings:
             passages.extend([
                 row["passage"],
-                *object_rows(row, "before", {"doc_id", "work_id", "kind", "body"}),
-                *object_rows(row, "after", {"doc_id", "work_id", "kind", "body"}),
+                *object_rows(row, "before", {"doc_id", "work_id", "kind", "body", "origin_url"}),
+                *object_rows(row, "after", {"doc_id", "work_id", "kind", "body", "origin_url"}),
             ])
         if any(
             not isinstance(row, dict) or not id_record(row)
             or not isinstance(row.get("body"), str) or not isinstance(row.get("kind"), str)
+            or not isinstance(row.get("origin_url"), str)
             for row in passages
         ):
             raise ValueError("invalid read passage")

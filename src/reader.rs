@@ -88,6 +88,7 @@ impl Snapshot {
                 .then_some(TimeRange { start_sec, end_sec }),
             title: self.text(doc, "title")?.into(),
             heading: self.text(doc, "heading")?.into(),
+            origin_url: self.text(doc, "origin_url")?.into(),
             other_kinds: doc
                 .get_all(self.field("other_kinds"))
                 .filter_map(|value| value.as_str().map(str::to_owned))
@@ -130,25 +131,28 @@ impl Snapshot {
         if docs.is_empty() {
             return Ok(None);
         }
-        let mut passages = Vec::new();
+        let mut entries = Vec::new();
         for doc in docs {
             let info = self.info(&doc)?;
             if !kinds.is_empty() && !kinds.iter().any(|kind| kind.as_str() == info.kind) {
                 continue;
             }
-            passages.push(Preview {
-                doc_id: info.doc_id,
-                source_id: info.source_id,
-                kind: info.kind,
-                ordinal: self.number(&doc, "ordinal")?,
-                heading: info.heading,
-                time_range: info.time_range,
-                preview: prefix(self.text(&doc, "body")?, 220).into(),
-            });
+            entries.push((
+                Preview {
+                    doc_id: info.doc_id,
+                    source_id: info.source_id,
+                    kind: info.kind,
+                    ordinal: self.number(&doc, "ordinal")?,
+                    heading: info.heading,
+                    time_range: info.time_range,
+                    preview: prefix(self.text(&doc, "body")?, 220).into(),
+                },
+                info.origin_url,
+            ));
         }
-        passages.sort_by(|a, b| (&a.source_id, a.ordinal).cmp(&(&b.source_id, b.ordinal)));
+        entries.sort_by(|(a, _), (b, _)| (&a.source_id, a.ordinal).cmp(&(&b.source_id, b.ordinal)));
         let mut sources: Vec<Source> = Vec::new();
-        for passage in &passages {
+        for (passage, origin_url) in &entries {
             if let Some(source) = sources.last_mut().filter(|source| {
                 source.source_id == passage.source_id && source.kind == passage.kind
             }) {
@@ -158,13 +162,14 @@ impl Snapshot {
                     source_id: passage.source_id.clone(),
                     kind: passage.kind.clone(),
                     passages: 1,
+                    origin_url: origin_url.clone(),
                 });
             }
         }
         Ok(Some(Outline {
             work_id: work_id.into(),
             sources,
-            passages,
+            passages: entries.into_iter().map(|(passage, _)| passage).collect(),
         }))
     }
 
@@ -219,7 +224,6 @@ impl Snapshot {
         Ok(ReadPassage {
             info,
             ordinal: self.number(doc, "ordinal")?,
-            origin_url: self.text(doc, "origin_url")?.into(),
             quality_note,
             license_mode: if snippet_only { "snippet_only" } else { "full" },
             body: if snippet_only {
@@ -305,6 +309,7 @@ pub struct Info {
     pub time_range: Option<TimeRange>,
     pub title: String,
     pub heading: String,
+    pub origin_url: String,
     pub other_kinds: Vec<String>,
 }
 
@@ -320,6 +325,7 @@ pub struct Source {
     pub source_id: String,
     pub kind: String,
     pub passages: usize,
+    pub origin_url: String,
 }
 
 #[derive(Serialize)]
@@ -345,7 +351,6 @@ pub struct ReadPassage {
     #[serde(flatten)]
     pub info: Info,
     pub ordinal: u64,
-    pub origin_url: String,
     pub quality_note: &'static str,
     pub license_mode: &'static str,
     pub body: String,

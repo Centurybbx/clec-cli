@@ -10,10 +10,10 @@ export CLEC_INDEX_DIR=/tmp/clec-real/index
 
 "$clec" stats | jq '{counts, known_gaps, disclaimer}'
 "$clec" search '退休 提領' '退休 提领' '4% 法則' '現金流' --limit 5 |
-  jq '.hits[] | {doc_id, work_id, kind, quality, title, snippet}'
+  jq '.hits[] | {doc_id, work_id, kind, quality, title, origin_url, snippet}'
 "$clec" search 'QQQ' --kind transcript,doc --from 2024-01-01 --exclude-suspect --limit 5 |
-  jq '.hits[] | {title, highlights, date, kind, quality}'
-"$clec" search '定期定額' '定投' 'DCA' --limit 3 | jq '.hits[] | {title, highlights}'
+  jq '.hits[] | {title, highlights, date, kind, quality, origin_url}'
+"$clec" search '定期定額' '定投' 'DCA' --limit 3 | jq '.hits[] | {title, highlights, origin_url}'
 ```
 
 第一条检索混用繁简关键词并融合四路结果。第二条可从 `highlights` 检查 QQQ 的配置同义词（如「納指 100」），并按类型、日期和质量过滤。管道下默认输出紧凑 JSON。直接在终端运行可看人类可读格式，或加 `--json` 强制 JSON。
@@ -28,11 +28,13 @@ test ! -e "$HOME/.local/share/clec/index" && mkdir -p "$HOME/.local/share/clec" 
 
 ```sh
 work=ep-00123
-"$clec" outline "$work" | jq '{sources, first_passages: .passages[:3]}'
+"$clec" outline "$work" |
+  jq '{sources: [.sources[] | {source_id, kind, passages, origin_url}], first_passages: .passages[:3]}'
 doc=$("$clec" outline "$work" --kind transcript | jq -er '.passages[0].doc_id')
-"$clec" read "$doc" --context 1 | jq '.passages[] | {passage, before, after}'
+"$clec" read "$doc" --context 1 |
+  jq '.passages[] | {passage: (.passage | {doc_id, heading, origin_url, body}), before, after}'
 "$clec" read --work "$work" --range 02:00-03:00 --context 0 |
-  jq '.passages[].passage | {doc_id, kind, time_range, body}'
+  jq '.passages[].passage | {doc_id, kind, time_range, origin_url, body}'
 (
   set -o pipefail
   "$clec" search '定期定額' --kind transcript,doc --limit 2 --ids-only |
@@ -41,7 +43,7 @@ doc=$("$clec" outline "$work" --kind transcript | jq -er '.passages[0].doc_id')
 )
 ```
 
-`read --range` 返回与所给时间窗口重叠的完整段落，`time_range` 显示段落时间。发现 `summary` 时先看 `other_kinds`，再用 `outline` 找逐字稿或讲义。看到 `quality: 4` 时回看原片或另找来源核对。
+`read --range` 返回与所给时间窗口重叠的完整段落，`time_range` 显示段落时间。`sources[].origin_url` 与段落级 `origin_url` 可直接回查原始网页；为空表示离线本地文档或书籍。发现 `summary` 时先看 `other_kinds`，再用 `outline` 找逐字稿或讲义。看到 `quality: 4` 时回看原片或另找来源核对。
 
 ## 验证退出码
 
