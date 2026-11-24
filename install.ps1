@@ -19,6 +19,7 @@ $stagedExe = $null
 $stagedSkill = $null
 $backupSkill = $null
 $lockDir = $null
+$lockOwner = "$PID-" + [guid]::NewGuid().ToString("N")
 $keepBackup = $false
 
 try {
@@ -67,18 +68,11 @@ try {
 
     $lockCandidate = Join-Path $skillDir ".clec-lock"
     if (Test-Path -LiteralPath $lockCandidate) {
-        $otherPid = Get-Content (Join-Path $lockCandidate "pid") -ErrorAction SilentlyContinue
-        if (-not $otherPid) {
-            throw "clec install lock exists without a pid; remove $lockCandidate if stale"
-        }
-        if (Get-Process -Id $otherPid -ErrorAction SilentlyContinue) {
-            throw "another clec install is running (pid $otherPid)"
-        }
-        Remove-Item -LiteralPath $lockCandidate -Recurse -Force -ErrorAction SilentlyContinue
+        throw "install lock exists at $lockCandidate; if no installer is running, remove it and retry"
     }
     New-Item -ItemType Directory -Path $lockCandidate -ErrorAction Stop | Out-Null
+    Set-Content -LiteralPath (Join-Path $lockCandidate "owner") -Value $lockOwner
     $lockDir = $lockCandidate
-    Set-Content -LiteralPath (Join-Path $lockDir "pid") -Value $PID
 
     $nullString = [System.Management.Automation.Language.NullString]::Value
     $skillExisted = Test-Path -LiteralPath $skill
@@ -121,7 +115,10 @@ try {
         Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
     }
     if ($lockDir -and (Test-Path -LiteralPath $lockDir)) {
-        Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+        $owner = Get-Content (Join-Path $lockDir "owner") -ErrorAction SilentlyContinue
+        if ($owner -eq $lockOwner) {
+            Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
         $lockDir = $null
     }
 } finally {
@@ -134,7 +131,10 @@ try {
         Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
     }
     if ($lockDir -and (Test-Path -LiteralPath $lockDir)) {
-        Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+        $owner = Get-Content (Join-Path $lockDir "owner") -ErrorAction SilentlyContinue
+        if ($owner -eq $lockOwner) {
+            Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

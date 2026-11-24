@@ -69,6 +69,7 @@ staged_bin=""
 staged_skill=""
 backup_skill=""
 lock_dir=""
+lock_owner="$$-$(date +%s)"
 committed=0
 skill_replaced=0
 skill_existed=0
@@ -92,7 +93,9 @@ cleanup() {
     if [ "$committed" = "1" ] && [ -n "$backup_skill" ]; then
         rm -f "$backup_skill"
     fi
-    [ -z "$lock_dir" ] || rm -rf "$lock_dir"
+    if [ -n "$lock_dir" ] && [ "$(cat "$lock_dir/pid" 2>/dev/null || true)" = "$lock_owner" ]; then
+        rm -rf "$lock_dir"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -141,21 +144,11 @@ staged_skill="$skill_dir/.SKILL.md.tmp.$$"
 cp "$tmpdir/SKILL.md" "$staged_skill"
 
 lock_candidate="$skill_dir/.clec-lock"
-if mkdir "$lock_candidate" 2>/dev/null; then
-    lock_dir="$lock_candidate"
-else
-    other=$(cat "$lock_candidate/pid" 2>/dev/null || true)
-    if [ -z "$other" ]; then
-        fail "install lock exists without a pid; remove $lock_candidate if stale"
-    fi
-    if kill -0 "$other" 2>/dev/null; then
-        fail "another clec install is running (pid $other)"
-    fi
-    rm -rf "$lock_candidate"
-    mkdir "$lock_candidate" || fail "could not acquire $lock_candidate"
-    lock_dir="$lock_candidate"
+if ! mkdir "$lock_candidate" 2>/dev/null; then
+    fail "install lock exists at $lock_candidate; if no installer is running, remove it and retry"
 fi
-printf '%s\n' "$$" > "$lock_dir/pid"
+lock_dir="$lock_candidate"
+printf '%s\n' "$lock_owner" > "$lock_dir/pid"
 
 if [ -e "$skill_dir/SKILL.md" ] || [ -L "$skill_dir/SKILL.md" ]; then
     skill_existed=1
@@ -176,7 +169,9 @@ if [ -n "$backup_skill" ]; then
     backup_skill=""
 fi
 if [ -n "$lock_dir" ]; then
-    rm -rf "$lock_dir"
+    if [ "$(cat "$lock_dir/pid" 2>/dev/null || true)" = "$lock_owner" ]; then
+        rm -rf "$lock_dir"
+    fi
     lock_dir=""
 fi
 
