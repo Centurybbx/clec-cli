@@ -12,13 +12,14 @@ use clec::{
     reader::{Reading, Snapshot},
     schema::{Kind, parse_date},
     search::{Options, Search},
+    sync::{self, SyncOptions},
     tokenizer::query_terms,
 };
 use serde::Serialize;
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(version, about = "Build and query a local, offline passage index", color = clap::ColorChoice::Never, after_help = "\
+#[command(version, about = "Build, query, and sync a local offline passage index", color = clap::ColorChoice::Never, after_help = "\
 Examples:
   clec search 'asset allocation' --kind doc,qa --limit 5
   clec search 'retirement' --ids-only | clec read --stdin
@@ -29,6 +30,7 @@ Exit codes:
   2  Invalid arguments, query, or build input
   3  Missing or invalid index
   4  Unknown work or passage ID
+  5  Sync, network, or checksum failure
 
 Color is disabled in all modes (including when NO_COLOR is set).")]
 struct Cli {
@@ -87,6 +89,8 @@ Input schema (one UTF-8 JSON object per line):
     },
     /// Read passages by ID or by a time range within a work
     Read(ReadArgs),
+    /// Download or update the offline index pack
+    Sync(SyncArgs),
     /// Show corpus metadata and coverage
     Stats,
 }
@@ -145,6 +149,24 @@ struct ReadArgs {
     stdin: bool,
 }
 
+#[derive(Args)]
+struct SyncArgs {
+    /// Manifest URL to fetch
+    #[arg(
+        long,
+        env = "CLEC_MANIFEST_URL",
+        default_value = sync::DEFAULT_MANIFEST_URL,
+        value_name = "URL"
+    )]
+    manifest_url: String,
+    /// Re-download and replace the index even when it is up to date
+    #[arg(long)]
+    force: bool,
+    /// Report whether an update is available without downloading it
+    #[arg(long)]
+    check: bool,
+}
+
 fn date_arg(input: &str) -> Result<i64, String> {
     parse_date(input).map_err(|error| format!("{error:#}"))
 }
@@ -188,6 +210,10 @@ impl Failure {
 
     fn missing(kind: &str, id: &str) -> Self {
         Self(4, anyhow::anyhow!("{kind} {id:?} does not exist"))
+    }
+
+    fn sync(error: anyhow::Error) -> Self {
+        Self(5, error)
     }
 }
 
@@ -334,6 +360,19 @@ fn execute(cli: Cli, output: &mut Output<impl Write>) -> CliResult {
                         outline.sources.len(),
                         outline.passages.len()
                     )?;
+                    for source in &outline.sources {
+                        writeln!(
+                            out,
+                            "  {}  {}  {} passages",
+                            source.source_id, source.kind, source.passages
+                        )?;
+                        if !source.origin_url.is_empty() {
+                            writeln!(out, "    {}", source.origin_url)?;
+                        }
+                    }
+                    if !outline.sources.is_empty() {
+                        writeln!(out)?;
+                    }
                     for passage in &outline.passages {
                         writeln!(
                             out,
@@ -350,6 +389,20 @@ fn execute(cli: Cli, output: &mut Output<impl Write>) -> CliResult {
                 .map_err(Failure::invalid_input)
         }
         Command::Read(args) => read(&path, args, output),
+        Command::Sync(args) => {
+            let human = output.human;
+            sync::run(
+                &SyncOptions {
+                    manifest_url: &args.manifest_url,
+                    index_dir: &path,
+                    force: args.force,
+                    check: args.check,
+                },
+                &mut output.writer,
+                human,
+            )
+            .map_err(Failure::sync)
+        }
         Command::Stats => {
             Snapshot::open(&path).map_err(Failure::invalid_index)?;
             let stats = Metadata::load(&path.join("meta.json")).map_err(Failure::invalid_index)?;
@@ -437,6 +490,9 @@ fn search(path: &Path, args: SearchArgs, output: &mut Output<impl Write>) -> Cli
                     "{}  {}  {}",
                     hit.info.doc_id, hit.info.kind, hit.info.title
                 )?;
+                if !hit.info.origin_url.is_empty() {
+                    writeln!(out, "  {}", hit.info.origin_url)?;
+                }
                 writeln!(out, "  {}", hit.snippet)?;
             }
             Ok(())
@@ -498,8 +554,8 @@ fn read(path: &Path, mut args: ReadArgs, output: &mut Output<impl Write>) -> Cli
                     if let Some(range) = &passage.info.time_range {
                         writeln!(out, "{range}")?;
                     }
-                    if !passage.origin_url.is_empty() {
-                        writeln!(out, "{}", passage.origin_url)?;
+                    if !passage.info.origin_url.is_empty() {
+                        writeln!(out, "{}", passage.info.origin_url)?;
                     }
                     writeln!(out, "{}\n", passage.body)?;
                 }

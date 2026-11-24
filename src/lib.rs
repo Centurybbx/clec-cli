@@ -5,5 +5,6 @@ pub mod metadata;
 pub mod reader;
 pub mod schema;
 pub mod search;
+pub mod sync;
 mod synonyms;
 pub mod tokenizer;
