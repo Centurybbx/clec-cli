@@ -18,8 +18,7 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 $stagedExe = $null
 $stagedSkill = $null
 $backupSkill = $null
-$lockFile = $null
-$lockOwner = "$PID-" + [guid]::NewGuid().ToString("N")
+$lockStream = $null
 $keepBackup = $false
 
 try {
@@ -68,18 +67,13 @@ try {
 
     $lockPath = Join-Path $skillDir ".clec-lock"
     try {
-        $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
     } catch [System.IO.IOException] {
         throw "install lock exists at $lockPath; if no installer is running, remove it and retry"
     }
-    try {
-        $lockBytes = [System.Text.Encoding]::UTF8.GetBytes($lockOwner)
-        $lockStream.Write($lockBytes, 0, $lockBytes.Length)
-        $lockStream.Flush()
-    } finally {
-        $lockStream.Close()
-    }
-    $lockFile = $lockPath
+    $lockBytes = [System.Text.Encoding]::UTF8.GetBytes("$PID")
+    $lockStream.Write($lockBytes, 0, $lockBytes.Length)
+    $lockStream.Flush()
 
     $nullString = [System.Management.Automation.Language.NullString]::Value
     $skillExisted = Test-Path -LiteralPath $skill
@@ -121,12 +115,9 @@ try {
     if ($backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
         Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
     }
-    if ($lockFile -and (Test-Path -LiteralPath $lockFile)) {
-        $owner = Get-Content -LiteralPath $lockFile -ErrorAction SilentlyContinue
-        if ($owner -eq $lockOwner) {
-            Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue
-        }
-        $lockFile = $null
+    if ($lockStream) {
+        $lockStream.Close()
+        $lockStream = $null
     }
 } finally {
     foreach ($path in @($stagedExe, $stagedSkill)) {
@@ -137,11 +128,9 @@ try {
     if (-not $keepBackup -and $backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
         Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
     }
-    if ($lockFile -and (Test-Path -LiteralPath $lockFile)) {
-        $owner = Get-Content -LiteralPath $lockFile -ErrorAction SilentlyContinue
-        if ($owner -eq $lockOwner) {
-            Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue
-        }
+    if ($lockStream) {
+        $lockStream.Close()
+        $lockStream = $null
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
