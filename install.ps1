@@ -15,6 +15,7 @@ $target = "x86_64-pc-windows-msvc"
 $archiveName = "clec-$target.zip"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("clec-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
+$staged = $null
 
 try {
     $archive = Join-Path $tmp $archiveName
@@ -37,20 +38,38 @@ try {
     $exeSource = Join-Path $dist "clec.exe"
     if (-not (Test-Path $exeSource)) { throw "archive did not contain clec.exe" }
 
-    $installDir = Join-Path $env:LOCALAPPDATA "clec\bin"
+    $installDir = $env:CLEC_INSTALL_DIR
+    if (-not $installDir) { $installDir = Join-Path $env:LOCALAPPDATA "clec\bin" }
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     $exe = Join-Path $installDir "clec.exe"
-    Copy-Item -Force $exeSource $exe
+    $staged = Join-Path $installDir (".clec.tmp.$PID.exe")
+    Copy-Item -Force $exeSource $staged
+    try {
+        Move-Item -LiteralPath $staged -Destination $exe -Force
+    } catch {
+        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $staged -Destination $exe -Force
+    }
 
     $skillDir = Join-Path $HOME ".agents\skills\clec"
     New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
-    $skill = Join-Path $skillDir "SKILL.md"
-    try {
-        Invoke-WebRequest -UseBasicParsing -Uri "$base/SKILL.md" -OutFile $skill
-    } catch {
-        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/$repo/main/skills/clec/SKILL.md" -OutFile $skill
+    $skillSource = Join-Path $tmp "SKILL.md"
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/SKILL.md" -OutFile $skillSource
+    $skillPattern = "\s\*?SKILL\.md$"
+    $skillLine = Get-Content $sums | Where-Object { $_ -match $skillPattern } | Select-Object -First 1
+    if (-not $skillLine) { throw "no checksum for SKILL.md in SHA256SUMS.txt" }
+    $skillExpected = ($skillLine -split '\s+')[0].ToUpperInvariant()
+    $skillActual = (Get-FileHash -Algorithm SHA256 -Path $skillSource).Hash.ToUpperInvariant()
+    if ($skillActual -ne $skillExpected) {
+        throw "checksum mismatch for SKILL.md (expected $skillExpected, got $skillActual)"
     }
+    $skill = Join-Path $skillDir "SKILL.md"
+    Remove-Item -LiteralPath $skill -Force -ErrorAction SilentlyContinue
+    Copy-Item -Force $skillSource $skill
 } finally {
+    if ($staged -and (Test-Path -LiteralPath $staged)) {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 

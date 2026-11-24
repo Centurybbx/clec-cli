@@ -84,7 +84,8 @@ jobs:
           set -euo pipefail
           cd artifacts
           shopt -s nullglob
-          files=(*.tar.gz *.zip)
+          cp ../skills/clec/SKILL.md SKILL.md
+          files=(*.tar.gz *.zip SKILL.md)
           sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 

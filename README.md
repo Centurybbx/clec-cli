@@ -2,21 +2,29 @@
 
 极简、极速、离线、通用的本地知识库检索 CLI（基于 Tantivy + 编译期 FST Jieba + `zhconv`），面向 AI Agent 一等公民设计。
 
+## 让 Agent 安装
+
+把这句话发给你的 agent：
+
+> 安装 clec：https://raw.githubusercontent.com/Centurybbx/clec-cli/main/skills/clec/SKILL.md
+
+Agent 会读取该文件里的 Bootstrap，按操作系统安装、同步索引，并跑一条真实检索验证。
+
 ## 安装
 
 macOS / Linux：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Centurybbx/clec-cli/main/install.sh | sh
+tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Centurybbx/clec-cli/main/install.sh -o "$tmp" && sh "$tmp"
 ```
 
 Windows PowerShell：
 
 ```powershell
-irm https://raw.githubusercontent.com/Centurybbx/clec-cli/main/install.ps1 | iex
+$tmp = Join-Path $env:TEMP "clec-install.ps1"; Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/Centurybbx/clec-cli/main/install.ps1" -OutFile $tmp; & $tmp
 ```
 
-安装脚本会下载当前平台的二进制、校验 SHA-256，安装到 `~/.local/bin/clec`（macOS/Linux）或 `%LOCALAPPDATA%\clec\bin\clec.exe`（Windows），安装 Agent Skill，并自动运行 `clec sync` 准备索引。设置 `CLEC_SKIP_SYNC=1` 可跳过同步，`CLEC_INSTALL_DIR=/path` 可自定义安装目录，`CLEC_VERSION=v0.2.0` 可固定版本。
+安装脚本会下载当前平台的二进制、校验 SHA-256，安装到 `~/.local/bin/clec`（macOS/Linux）或 `%LOCALAPPDATA%\clec\bin\clec.exe`（Windows），安装 Agent Skill 到 `~/.agents/skills/clec`，并自动运行 `clec sync` 准备索引。设置 `CLEC_SKIP_SYNC=1` 可跳过同步，`CLEC_INSTALL_DIR=/path` 可自定义安装目录，`CLEC_VERSION=v0.1.0` 可固定版本。
 
 ## 同步索引
 
