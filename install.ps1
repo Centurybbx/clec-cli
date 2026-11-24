@@ -17,6 +17,7 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("clec-install-" + [guid]::Ne
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $stagedExe = $null
 $stagedSkill = $null
+$backupSkill = $null
 
 try {
     $archive = Join-Path $tmp $archiveName
@@ -62,18 +63,36 @@ try {
     $stagedSkill = Join-Path $skillDir (".SKILL.md.tmp.$PID")
     Copy-Item -Force $skillSource $stagedSkill
 
-    if (Test-Path -LiteralPath $exe) {
-        [System.IO.File]::Replace($stagedExe, $exe, $null)
-    } else {
-        [System.IO.File]::Move($stagedExe, $exe)
-    }
-    if (Test-Path -LiteralPath $skill) {
-        [System.IO.File]::Replace($stagedSkill, $skill, $null)
+    $nullString = [System.Management.Automation.Language.NullString]::Value
+    $skillExisted = Test-Path -LiteralPath $skill
+    if ($skillExisted) {
+        $backupSkill = Join-Path $skillDir (".SKILL.md.old.$PID")
+        Copy-Item -Force $skill $backupSkill
+        [System.IO.File]::Replace($stagedSkill, $skill, $nullString)
     } else {
         [System.IO.File]::Move($stagedSkill, $skill)
     }
+
+    try {
+        if (Test-Path -LiteralPath $exe) {
+            [System.IO.File]::Replace($stagedExe, $exe, $nullString)
+        } else {
+            [System.IO.File]::Move($stagedExe, $exe)
+        }
+    } catch {
+        if ($skillExisted -and $backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
+            Copy-Item -Force $backupSkill $skill
+        } elseif (-not $skillExisted) {
+            Remove-Item -LiteralPath $skill -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+
+    if ($backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
+        Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
+    }
 } finally {
-    foreach ($path in @($stagedExe, $stagedSkill)) {
+    foreach ($path in @($stagedExe, $stagedSkill, $backupSkill)) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         }

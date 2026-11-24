@@ -67,11 +67,27 @@ sha256_of() {
 
 staged_bin=""
 staged_skill=""
+backup_skill=""
+committed=0
+skill_replaced=0
+skill_existed=0
+skill_dir=""
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/clec-install.XXXXXX") || fail "could not create a temporary directory"
 cleanup() {
     rm -rf "$tmpdir"
     [ -z "$staged_bin" ] || rm -f "$staged_bin"
     [ -z "$staged_skill" ] || rm -f "$staged_skill"
+    if [ "$committed" != "1" ] && [ "$skill_replaced" = "1" ]; then
+        if [ "$skill_existed" = "1" ] && [ -n "$backup_skill" ]; then
+            mv -f "$backup_skill" "$skill_dir/SKILL.md" 2>/dev/null || true
+            backup_skill=""
+        elif [ "$skill_existed" = "0" ]; then
+            rm -f "$skill_dir/SKILL.md"
+        fi
+    fi
+    if [ "$committed" = "1" ] && [ -n "$backup_skill" ]; then
+        rm -f "$backup_skill"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -119,10 +135,24 @@ chmod 755 "$staged_bin"
 staged_skill="$skill_dir/.SKILL.md.tmp.$$"
 cp "$tmpdir/SKILL.md" "$staged_skill"
 
-mv -f "$staged_bin" "$install_dir/clec"
-staged_bin=""
+if [ -e "$skill_dir/SKILL.md" ] || [ -L "$skill_dir/SKILL.md" ]; then
+    skill_existed=1
+    old_skill="$skill_dir/.SKILL.md.old.$$"
+    cp -pP "$skill_dir/SKILL.md" "$old_skill"
+    backup_skill="$old_skill"
+fi
+
+skill_replaced=1
 mv -f "$staged_skill" "$skill_dir/SKILL.md"
 staged_skill=""
+
+mv -f "$staged_bin" "$install_dir/clec"
+staged_bin=""
+committed=1
+if [ -n "$backup_skill" ]; then
+    rm -f "$backup_skill"
+    backup_skill=""
+fi
 
 if [ "${CLEC_SKIP_SYNC:-0}" != "1" ]; then
     say "Downloading the latest index ..."

@@ -10,21 +10,26 @@ Install and verify with one resolved executable path. Use that path for every `c
 **macOS / Linux**
 
 ```sh
-tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Centurybbx/clec-cli/v0.1.0/install.sh -o "$tmp" && CLEC_SKIP_SYNC=1 CLEC_VERSION=v0.1.0 sh "$tmp"
-CLEC="${CLEC_INSTALL_DIR:-$HOME/.local/bin}/clec"
-"$CLEC" --version   # expect: clec 0.1.x
-"$CLEC" stats       # exit 0 = ready
+tmp=$(mktemp) &&
+curl -fsSL https://raw.githubusercontent.com/Centurybbx/clec-cli/v0.1.0/install.sh -o "$tmp" &&
+CLEC_SKIP_SYNC=1 CLEC_VERSION=v0.1.0 sh "$tmp" &&
+CLEC="${CLEC_INSTALL_DIR:-$HOME/.local/bin}/clec" &&
+"$CLEC" --version &&
+"$CLEC" stats
 ```
 
 **Windows PowerShell**
 
 ```powershell
 $tmp = Join-Path $env:TEMP "clec-install.ps1"
-Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/Centurybbx/clec-cli/v0.1.0/install.ps1" -OutFile $tmp
-$env:CLEC_SKIP_SYNC = "1"; $env:CLEC_VERSION = "v0.1.0"; & $tmp
+Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri "https://raw.githubusercontent.com/Centurybbx/clec-cli/v0.1.0/install.ps1" -OutFile $tmp
+$env:CLEC_SKIP_SYNC = "1"; $env:CLEC_VERSION = "v0.1.0"
+& $tmp
+if (-not $?) { throw "clec install failed" }
 $clec = if ($env:CLEC_INSTALL_DIR) { Join-Path $env:CLEC_INSTALL_DIR "clec.exe" } else { Join-Path $env:LOCALAPPDATA "clec\bin\clec.exe" }
-& $clec --version   # expect: clec 0.1.x
-& $clec stats       # exit 0 = ready
+& $clec --version
+if (-not $?) { throw "clec --version failed" }
+& $clec stats
 ```
 
 - Exit `3`: index missing or invalid. Run the resolved executable with `sync` (about 42 MB; allow several minutes). If `stats` still exits `3`, run `sync --force` once.
