@@ -18,6 +18,8 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 $stagedExe = $null
 $stagedSkill = $null
 $backupSkill = $null
+$lockDir = $null
+$keepBackup = $false
 
 try {
     $archive = Join-Path $tmp $archiveName
@@ -63,6 +65,21 @@ try {
     $stagedSkill = Join-Path $skillDir (".SKILL.md.tmp.$PID")
     Copy-Item -Force $skillSource $stagedSkill
 
+    $lockCandidate = Join-Path $skillDir ".clec-lock"
+    if (Test-Path -LiteralPath $lockCandidate) {
+        $otherPid = Get-Content (Join-Path $lockCandidate "pid") -ErrorAction SilentlyContinue
+        if (-not $otherPid) {
+            throw "clec install lock exists without a pid; remove $lockCandidate if stale"
+        }
+        if (Get-Process -Id $otherPid -ErrorAction SilentlyContinue) {
+            throw "another clec install is running (pid $otherPid)"
+        }
+        Remove-Item -LiteralPath $lockCandidate -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $lockCandidate -ErrorAction Stop | Out-Null
+    $lockDir = $lockCandidate
+    Set-Content -LiteralPath (Join-Path $lockDir "pid") -Value $PID
+
     $nullString = [System.Management.Automation.Language.NullString]::Value
     $skillExisted = Test-Path -LiteralPath $skill
     if ($skillExisted) {
@@ -80,22 +97,44 @@ try {
             [System.IO.File]::Move($stagedExe, $exe)
         }
     } catch {
-        if ($skillExisted -and $backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
-            Copy-Item -Force $backupSkill $skill
-        } elseif (-not $skillExisted) {
-            Remove-Item -LiteralPath $skill -Force -ErrorAction SilentlyContinue
+        $installError = $_
+        $rollbackError = $null
+        try {
+            if ($skillExisted -and $backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
+                Copy-Item -Force $backupSkill $skill -ErrorAction Stop
+            } elseif (-not $skillExisted -and (Test-Path -LiteralPath $skill)) {
+                Remove-Item -LiteralPath $skill -Force -ErrorAction Stop
+            }
+        } catch {
+            $rollbackError = $_
+            $keepBackup = $true
         }
-        throw
+        if ($rollbackError) {
+            [Console]::Error.WriteLine("clec install failed: $($installError.Exception.Message)")
+            [Console]::Error.WriteLine("rollback also failed: $($rollbackError.Exception.Message)")
+            if ($backupSkill) { [Console]::Error.WriteLine("previous skill backup kept at: $backupSkill") }
+        }
+        throw $installError
     }
 
     if ($backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
         Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
     }
+    if ($lockDir -and (Test-Path -LiteralPath $lockDir)) {
+        Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+        $lockDir = $null
+    }
 } finally {
-    foreach ($path in @($stagedExe, $stagedSkill, $backupSkill)) {
+    foreach ($path in @($stagedExe, $stagedSkill)) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         }
+    }
+    if (-not $keepBackup -and $backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
+        Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
+    }
+    if ($lockDir -and (Test-Path -LiteralPath $lockDir)) {
+        Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

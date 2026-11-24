@@ -68,12 +68,16 @@ sha256_of() {
 staged_bin=""
 staged_skill=""
 backup_skill=""
+lock_dir=""
 committed=0
 skill_replaced=0
 skill_existed=0
 skill_dir=""
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/clec-install.XXXXXX") || fail "could not create a temporary directory"
 cleanup() {
+    if [ "$committed" != "1" ] && [ -n "$staged_bin" ] && [ ! -e "$staged_bin" ]; then
+        committed=1
+    fi
     rm -rf "$tmpdir"
     [ -z "$staged_bin" ] || rm -f "$staged_bin"
     [ -z "$staged_skill" ] || rm -f "$staged_skill"
@@ -88,6 +92,7 @@ cleanup() {
     if [ "$committed" = "1" ] && [ -n "$backup_skill" ]; then
         rm -f "$backup_skill"
     fi
+    [ -z "$lock_dir" ] || rm -rf "$lock_dir"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -135,6 +140,23 @@ chmod 755 "$staged_bin"
 staged_skill="$skill_dir/.SKILL.md.tmp.$$"
 cp "$tmpdir/SKILL.md" "$staged_skill"
 
+lock_candidate="$skill_dir/.clec-lock"
+if mkdir "$lock_candidate" 2>/dev/null; then
+    lock_dir="$lock_candidate"
+else
+    other=$(cat "$lock_candidate/pid" 2>/dev/null || true)
+    if [ -z "$other" ]; then
+        fail "install lock exists without a pid; remove $lock_candidate if stale"
+    fi
+    if kill -0 "$other" 2>/dev/null; then
+        fail "another clec install is running (pid $other)"
+    fi
+    rm -rf "$lock_candidate"
+    mkdir "$lock_candidate" || fail "could not acquire $lock_candidate"
+    lock_dir="$lock_candidate"
+fi
+printf '%s\n' "$$" > "$lock_dir/pid"
+
 if [ -e "$skill_dir/SKILL.md" ] || [ -L "$skill_dir/SKILL.md" ]; then
     skill_existed=1
     old_skill="$skill_dir/.SKILL.md.old.$$"
@@ -147,11 +169,15 @@ mv -f "$staged_skill" "$skill_dir/SKILL.md"
 staged_skill=""
 
 mv -f "$staged_bin" "$install_dir/clec"
-staged_bin=""
 committed=1
+staged_bin=""
 if [ -n "$backup_skill" ]; then
     rm -f "$backup_skill"
     backup_skill=""
+fi
+if [ -n "$lock_dir" ]; then
+    rm -rf "$lock_dir"
+    lock_dir=""
 fi
 
 if [ "${CLEC_SKIP_SYNC:-0}" != "1" ]; then
