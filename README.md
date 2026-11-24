@@ -24,7 +24,7 @@ Windows PowerShell：
 $tmp = Join-Path $env:TEMP "clec-install.ps1"; Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/Centurybbx/clec-cli/main/install.ps1" -OutFile $tmp; & $tmp
 ```
 
-安装脚本会下载当前平台的二进制、校验 SHA-256，安装到 `~/.local/bin/clec`（macOS/Linux）或 `%LOCALAPPDATA%\clec\bin\clec.exe`（Windows），安装 Agent Skill 到 `~/.agents/skills/clec`，并自动运行 `clec sync` 准备索引。设置 `CLEC_SKIP_SYNC=1` 可跳过同步，`CLEC_INSTALL_DIR=/path` 可自定义安装目录，`CLEC_VERSION=v0.1.0` 可固定版本。
+安装脚本会下载当前平台的二进制、校验 SHA-256，安装到 `~/.local/bin/clec`（macOS/Linux）或 `%LOCALAPPDATA%\clec\bin\clec.exe`（Windows），安装 Agent Skill 到 `~/.agents/skills/clec`，并自动运行 `clec sync` 准备索引。设置 `CLEC_SKIP_SYNC=1` 可跳过同步；`CLEC_INSTALL_DIR=/path`（Windows 为 `$env:CLEC_INSTALL_DIR`）可自定义安装目录；`CLEC_VERSION=v0.1.0` 可固定版本。
 
 ## 同步索引
 

@@ -5,12 +5,15 @@ description: Research CLEC investing materials offline with clec. 检索 CLEC �
 
 ## Bootstrap
 
-Install with the absolute binary path. Do not rely on `clec` from `PATH` until it reports `clec 0.1.x`.
+Install and verify with one resolved executable path. Use that path for every `clec` command below; do not rely on `clec` from `PATH`.
 
 **macOS / Linux**
 
 ```sh
 tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Centurybbx/clec-cli/v0.1.0/install.sh -o "$tmp" && CLEC_SKIP_SYNC=1 CLEC_VERSION=v0.1.0 sh "$tmp"
+CLEC="${CLEC_INSTALL_DIR:-$HOME/.local/bin}/clec"
+"$CLEC" --version   # expect: clec 0.1.x
+"$CLEC" stats       # exit 0 = ready
 ```
 
 **Windows PowerShell**
@@ -19,28 +22,25 @@ tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Centurybbx/clec-cl
 $tmp = Join-Path $env:TEMP "clec-install.ps1"
 Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/Centurybbx/clec-cli/v0.1.0/install.ps1" -OutFile $tmp
 $env:CLEC_SKIP_SYNC = "1"; $env:CLEC_VERSION = "v0.1.0"; & $tmp
+$clec = if ($env:CLEC_INSTALL_DIR) { Join-Path $env:CLEC_INSTALL_DIR "clec.exe" } else { Join-Path $env:LOCALAPPDATA "clec\bin\clec.exe" }
+& $clec --version   # expect: clec 0.1.x
+& $clec stats       # exit 0 = ready
 ```
 
-Then verify:
-
-```sh
-~/.local/bin/clec --version   # expect: clec 0.1.x
-~/.local/bin/clec stats       # exit 0 = ready
-```
-
-- If `~/.local/bin/clec --version` already prints `clec 0.1.x`, skip the install and use that binary.
-- If `clec --version` (the command on `PATH`) does not print `clec 0.1.x`, use the absolute path for every command below.
-- Exit `3`: index missing or invalid. Run `~/.local/bin/clec sync` (about 42 MB; allow several minutes). If `stats` still exits `3`, run `~/.local/bin/clec sync --force` once.
+- Exit `3`: index missing or invalid. Run the resolved executable with `sync` (about 42 MB; allow several minutes). If `stats` still exits `3`, run `sync --force` once.
 - Exit `5`: network or checksum failure. Report the stderr and retry `sync`.
-- On Windows, use `%LOCALAPPDATA%\clec\bin\clec.exe` instead of `~/.local/bin/clec`.
 
-Finally, prove first use with a real query. Require at least one hit:
+Finally, prove first use with a real query and require at least one hit:
 
 ```sh
-~/.local/bin/clec search '资产配置' --limit 1
+CLEC="${CLEC_INSTALL_DIR:-$HOME/.local/bin}/clec"; "$CLEC" search '资产配置' --limit 1
 ```
 
-If the result has no hits, run `~/.local/bin/clec stats`, check `known_gaps`, and report the coverage gap instead of claiming success.
+```powershell
+$clec = if ($env:CLEC_INSTALL_DIR) { Join-Path $env:CLEC_INSTALL_DIR "clec.exe" } else { Join-Path $env:LOCALAPPDATA "clec\bin\clec.exe" }; & $clec search '资产配置' --limit 1
+```
+
+If there are no hits, run `stats`, check `known_gaps`, and report the coverage gap instead of claiming success.
 
 Set `CLEC_INDEX_DIR` or pass `--index <DIR>` (overrides env). The default is `~/.local/share/clec/index`. 非 TTY 默认输出紧凑 JSON。用 `--json` 强制 JSON，`--ids-only` 输出逐行 ID。首次使用，或查询以退出码 `3` 提示索引缺失时，运行 `clec sync` 下载索引包；`clec sync --check` 只检查更新，`clec sync --force` 强制重新下载。同步是唯一联网命令。
 

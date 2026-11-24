@@ -65,11 +65,13 @@ sha256_of() {
     fi
 }
 
-staged=""
+staged_bin=""
+staged_skill=""
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/clec-install.XXXXXX") || fail "could not create a temporary directory"
 cleanup() {
     rm -rf "$tmpdir"
-    [ -z "$staged" ] || rm -f "$staged"
+    [ -z "$staged_bin" ] || rm -f "$staged_bin"
+    [ -z "$staged_skill" ] || rm -f "$staged_skill"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -93,17 +95,9 @@ actual=$(sha256_of "$tmpdir/$archive")
 [ "$expected" = "$actual" ] || fail "checksum mismatch for $archive (expected $expected, got $actual)"
 
 install_dir=${CLEC_INSTALL_DIR:-"$HOME/.local/bin"}
-mkdir -p "$tmpdir/dist" "$install_dir"
-tar -xzf "$tmpdir/$archive" -C "$tmpdir/dist"
-[ -f "$tmpdir/dist/clec" ] || fail "archive did not contain the clec binary"
-staged="$install_dir/.clec.tmp.$$"
-cp "$tmpdir/dist/clec" "$staged"
-chmod 755 "$staged"
-mv -f "$staged" "$install_dir/clec"
-staged=""
-
 skill_dir="$HOME/.agents/skills/clec"
-mkdir -p "$skill_dir"
+mkdir -p "$tmpdir/dist" "$install_dir" "$skill_dir"
+
 download "$base/SKILL.md" "$tmpdir/SKILL.md"
 expected_skill=$(awk -v name="SKILL.md" '{
     file = $2
@@ -116,10 +110,19 @@ expected_skill=$(awk -v name="SKILL.md" '{
 [ -n "$expected_skill" ] || fail "no checksum for SKILL.md in SHA256SUMS.txt"
 actual_skill=$(sha256_of "$tmpdir/SKILL.md")
 [ "$expected_skill" = "$actual_skill" ] || fail "checksum mismatch for SKILL.md (expected $expected_skill, got $actual_skill)"
-staged="$skill_dir/.SKILL.md.tmp.$$"
-cp "$tmpdir/SKILL.md" "$staged"
-mv -f "$staged" "$skill_dir/SKILL.md"
-staged=""
+
+tar -xzf "$tmpdir/$archive" -C "$tmpdir/dist"
+[ -f "$tmpdir/dist/clec" ] || fail "archive did not contain the clec binary"
+staged_bin="$install_dir/.clec.tmp.$$"
+cp "$tmpdir/dist/clec" "$staged_bin"
+chmod 755 "$staged_bin"
+staged_skill="$skill_dir/.SKILL.md.tmp.$$"
+cp "$tmpdir/SKILL.md" "$staged_skill"
+
+mv -f "$staged_bin" "$install_dir/clec"
+staged_bin=""
+mv -f "$staged_skill" "$skill_dir/SKILL.md"
+staged_skill=""
 
 if [ "${CLEC_SKIP_SYNC:-0}" != "1" ]; then
     say "Downloading the latest index ..."

@@ -15,7 +15,8 @@ $target = "x86_64-pc-windows-msvc"
 $archiveName = "clec-$target.zip"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("clec-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
-$staged = $null
+$stagedExe = $null
+$stagedSkill = $null
 
 try {
     $archive = Join-Path $tmp $archiveName
@@ -40,19 +41,13 @@ try {
 
     $installDir = $env:CLEC_INSTALL_DIR
     if (-not $installDir) { $installDir = Join-Path $env:LOCALAPPDATA "clec\bin" }
-    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-    $exe = Join-Path $installDir "clec.exe"
-    $staged = Join-Path $installDir (".clec.tmp.$PID.exe")
-    Copy-Item -Force $exeSource $staged
-    try {
-        Move-Item -LiteralPath $staged -Destination $exe -Force
-    } catch {
-        Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
-        Move-Item -LiteralPath $staged -Destination $exe -Force
-    }
-
     $skillDir = Join-Path $HOME ".agents\skills\clec"
-    New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $installDir, $skillDir | Out-Null
+
+    $exe = Join-Path $installDir "clec.exe"
+    $stagedExe = Join-Path $installDir (".clec.tmp.$PID.exe")
+    Copy-Item -Force $exeSource $stagedExe
+
     $skillSource = Join-Path $tmp "SKILL.md"
     Invoke-WebRequest -UseBasicParsing -Uri "$base/SKILL.md" -OutFile $skillSource
     $skillPattern = "\s\*?SKILL\.md$"
@@ -64,11 +59,24 @@ try {
         throw "checksum mismatch for SKILL.md (expected $skillExpected, got $skillActual)"
     }
     $skill = Join-Path $skillDir "SKILL.md"
-    Remove-Item -LiteralPath $skill -Force -ErrorAction SilentlyContinue
-    Copy-Item -Force $skillSource $skill
+    $stagedSkill = Join-Path $skillDir (".SKILL.md.tmp.$PID")
+    Copy-Item -Force $skillSource $stagedSkill
+
+    if (Test-Path -LiteralPath $exe) {
+        [System.IO.File]::Replace($stagedExe, $exe, $null)
+    } else {
+        [System.IO.File]::Move($stagedExe, $exe)
+    }
+    if (Test-Path -LiteralPath $skill) {
+        [System.IO.File]::Replace($stagedSkill, $skill, $null)
+    } else {
+        [System.IO.File]::Move($stagedSkill, $skill)
+    }
 } finally {
-    if ($staged -and (Test-Path -LiteralPath $staged)) {
-        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    foreach ($path in @($stagedExe, $stagedSkill)) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
@@ -83,7 +91,8 @@ if ($env:CLEC_SKIP_SYNC -ne "1") {
 
 Write-Host "Installed clec to $exe"
 Write-Host "Installed agent skill to $skill"
+Write-Host "Verify with: $exe stats"
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (-not (($userPath -split ';') -contains $installDir)) {
+if ($userPath -and (-not (($userPath -split ';') -contains $installDir))) {
     Write-Host "Add $installDir to PATH to run clec from any terminal."
 }
