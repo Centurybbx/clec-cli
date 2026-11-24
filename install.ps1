@@ -72,7 +72,8 @@ try {
         if ([System.IO.Directory]::Exists($lockPath)) {
             throw "clec lock path is a directory: $lockPath"
         }
-        if ($_.Exception -is [System.IO.IOException] -and [System.IO.File]::Exists($lockPath)) {
+        $baseError = $_.Exception.GetBaseException()
+        if ($baseError -is [System.IO.IOException] -and [System.IO.File]::Exists($lockPath)) {
             throw "install lock exists at $lockPath; if no installer is running, remove it and retry"
         }
         throw
@@ -126,6 +127,10 @@ try {
         $lockStream = $null
     }
 } finally {
+    if ($lockStream) {
+        $lockStream.Close()
+        $lockStream = $null
+    }
     foreach ($path in @($stagedExe, $stagedSkill)) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
@@ -133,10 +138,6 @@ try {
     }
     if (-not $keepBackup -and $backupSkill -and (Test-Path -LiteralPath $backupSkill)) {
         Remove-Item -LiteralPath $backupSkill -Force -ErrorAction SilentlyContinue
-    }
-    if ($lockStream) {
-        $lockStream.Close()
-        $lockStream = $null
     }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
