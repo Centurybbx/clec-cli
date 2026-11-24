@@ -67,9 +67,15 @@ try {
 
     $lockPath = Join-Path $skillDir ".clec-lock"
     try {
-        $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
-    } catch [System.IO.IOException] {
-        throw "install lock exists at $lockPath; if no installer is running, remove it and retry"
+        $lockStream = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
+    } catch {
+        if ([System.IO.Directory]::Exists($lockPath)) {
+            throw "clec lock path is a directory: $lockPath"
+        }
+        if ($_.Exception -is [System.IO.IOException] -and [System.IO.File]::Exists($lockPath)) {
+            throw "install lock exists at $lockPath; if no installer is running, remove it and retry"
+        }
+        throw
     }
     $lockBytes = [System.Text.Encoding]::UTF8.GetBytes("$PID")
     $lockStream.Write($lockBytes, 0, $lockBytes.Length)
